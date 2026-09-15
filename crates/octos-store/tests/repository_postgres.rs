@@ -815,3 +815,124 @@ async fn pg_k17_pod_failover_drill_takeover_recovery_audit() {
     assert!(audit_b.counts.iter().any(|(t, _)| t == "run_checkpoints"));
     assert!(audit_b.counts.iter().any(|(t, _)| t == "run_leases"));
 }
+
+// --- c5 K18: cron durable firing across pods (K10 + K17) -----------------
+//
+// These tests exercise the GREEN path of specs/task-c5-cron-durable-firing:
+// two independent `PgStore` connections join the same schema (real cluster
+// topology) and contend on (schedule_id, scheduled_at). The unique
+// (scope, schedule_id, scheduled_at) PRIMARY KEY on schedule_firings makes
+// the loser fail with Conflict; the same PRIMARY KEY enforces single-claim
+// on `claim_firing`. Together they cover K10 (durable cron firing) and
+// K17 (cron takeover by a surviving pod).
+
+#[tokio::test]
+async fn pg_k18_cron_durable_fires_only_one_pod_acks() {
+    use octos_store::repository::{
+        CronScheduleStore, FiringState, MisfirePolicy, Schedule, ScheduleFiring,
+    };
+
+    let schema_tag = "k18cron";
+    let pod_a = _pg_store_in_schema(schema_tag, "a").await;
+    let pod_b = _pg_store_in_schema(schema_tag, "b").await;
+
+    let scope = scope("t-k18cron", "sess-k18cron-1");
+    pod_a
+        .create_schedule(
+            &scope,
+            Schedule {
+                schedule_id: "cron-1".into(),
+                expression: "every 30m".into(),
+                timezone: None,
+                next_fire_at_ms: None,
+                misfire_policy: MisfirePolicy::RunOnce,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("create_schedule a");
+    pod_b
+        .create_schedule(
+            &scope,
+            Schedule {
+                schedule_id: "cron-1".into(),
+                expression: "every 30m".into(),
+                timezone: None,
+                next_fire_at_ms: None,
+                misfire_policy: MisfirePolicy::RunOnce,
+                enabled: true,
+            },
+        )
+        .await
+        .expect_err("duplicate schedule must conflict on PK");
+
+    let fire = ScheduleFiring {
+        schedule_id: "cron-1".into(),
+        scheduled_at_ms: 1_700_000_000_000,
+        firing_id: "f-1".into(),
+        claimed_by: None,
+        state: FiringState::Intent,
+        run_id: None,
+    };
+
+    let a = pod_a.clone();
+    let sa = scope.clone();
+    let fa = fire.clone();
+    let h_a = tokio::spawn(async move { a.record_firing(&sa, fa).await });
+
+    let b = pod_b.clone();
+    let sb = scope.clone();
+    let fb = fire.clone();
+    let h_b = tokio::spawn(async move { b.record_firing(&sb, fb).await });
+
+    let ra = h_a.await.expect("join a");
+    let rb = h_b.await.expect("join b");
+
+    let winners = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+    let conflicts = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, Err(RepositoryError::Conflict)))
+        .count();
+    assert_eq!(winners, 1, "exactly one pod wins K10 single-firing");
+    assert_eq!(conflicts, 1, "exactly one pod gets Conflict (loser)");
+
+    // The surviving pod may now claim. The other pod's claim must Conflict.
+    let claim_a = pod_a
+        .claim_firing(&scope, "cron-1", 1_700_000_000_000, "controller-a")
+        .await
+        .expect("winner claims");
+    assert_eq!(claim_a.state, FiringState::Running);
+    let claim_b = pod_b
+        .claim_firing(&scope, "cron-1", 1_700_000_000_000, "controller-b")
+        .await
+        .expect_err("loser cannot re-claim");
+    assert!(
+        matches!(claim_b, RepositoryError::Conflict),
+        "K10 single-claim across pods"
+    );
+}
+
+#[tokio::test]
+async fn pg_k18_cron_idempotent_fire_at_unique_constraint() {
+    use octos_store::repository::{CronScheduleStore, FiringState};
+
+    let store = fresh_store("k18cron_idem").await;
+    let scope = scope("t-k18idem", "sess-k18idem-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-idem"))
+        .await
+        .unwrap();
+    let firing = pg_firing("cron-idem", 99_000);
+    store.record_firing(&scope, firing.clone()).await.unwrap();
+    let dup = store.record_firing(&scope, firing).await;
+    assert!(
+        matches!(dup, Err(RepositoryError::Conflict)),
+        "unique (scope, schedule_id, scheduled_at) enforces K10 idempotency"
+    );
+    // Sanity: state remains Intent on the single persisted row.
+    let claim = store
+        .claim_firing(&scope, "cron-idem", 99_000, "controller-x")
+        .await
+        .expect("single claim succeeds");
+    assert_eq!(claim.state, FiringState::Running);
+}
