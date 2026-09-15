@@ -1931,3 +1931,242 @@ async fn pg_k08_commit_checkpoint_with_expected_old_on_first_seed_fails_closed()
         "first checkpoint with CAS expectation fails closed: {r:?}"
     );
 }
+
+// --- c5 K16 backup/restore production drill ------------------------------
+//
+// The existing in-process dump → restore round-trip (`pg_audit_two_stores_match_…`)
+// proves the SQL round-trips inside the runtime. The drill test below adds the
+// PRODUCTION shape: the backup is written to a file on disk, a fresh PG
+// schema is created, the file is read back from disk, and the new schema is
+// populated from the file. This is the lifecycle a real backup workflow
+// uses (cron-driven dump to /var/backups, restore from a snapshot file
+// after a cluster failure) and proves the backup is durable across the
+// disk boundary, not just an in-memory string.
+
+#[tokio::test]
+async fn pg_k16_backup_restore_drill_round_trip_via_disk_file() {
+    use octos_store::repository::{
+        CronScheduleStore, LeaseStore, MisfirePolicy, NewCheckpoint, NewMessage, RecoveryStore,
+        Schedule, UnitOfWork,
+    };
+
+    // Source schema: populated, then dumped to a tempfile.
+    let src = _pg_store_in_schema("k16drillsrc", "src").await;
+    let scope = scope("t-k16drill", "sess-k16drill-1");
+
+    let mut uow = src.begin();
+    uow.append_message(NewMessage {
+        scope: scope.clone(),
+        message_id: "m-1".into(),
+        thread_id: "t-1".into(),
+        turn_id: "turn-1".into(),
+        role: "user".into(),
+        content: "drill payload".into(),
+    });
+    uow.commit().await.unwrap();
+    src.claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    src.commit_checkpoint(NewCheckpoint {
+        scope: scope.clone(),
+        run_id: "run-1".into(),
+        step: 1,
+        transcript_highwater: 1,
+        context: None,
+        workspace_revision: Some("rev-1".into()),
+        pending_invocation: None,
+        artifact_refs: None,
+        binding_digest: Some("sha256:b1".into()),
+        permission_snapshot: None,
+        digest: "sha256:cp-1".into(),
+        schema_version: "v1".into(),
+        runtime_version: "2.0.3".into(),
+        created_epoch: 1,
+        expected_old_workspace_revision: None,
+    })
+    .await
+    .unwrap();
+    src.create_schedule(
+        &scope,
+        Schedule {
+            schedule_id: "cron-drill".into(),
+            expression: "every 5m".into(),
+            timezone: None,
+            next_fire_at_ms: None,
+            misfire_policy: MisfirePolicy::RunOnce,
+            enabled: true,
+            last_fired_at_ms: None,
+            last_run_id: None,
+            name: "cron-drill".into(),
+            payload_json: "{}".into(),
+            delete_after_run: false,
+            origin_json: "".into(),
+            created_at_ms: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Dump → write to disk (the production backup lifecycle).
+    let sql = src.dump_tables_sql("t-k16drill").await.expect("dump");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backup_path = dir.path().join("backup.sql");
+    std::fs::write(&backup_path, &sql).expect("write backup file");
+    let backup_meta = std::fs::metadata(&backup_path).expect("stat");
+    assert!(backup_meta.len() > 0, "backup file must be non-empty");
+
+    // Fresh target schema: empty, then populate from the FILE (not from
+    // `sql` directly — the file is the contract boundary).
+    let dst = _pg_store_in_schema("k16drilldst", "dst").await;
+    let on_disk_sql = std::fs::read_to_string(&backup_path).expect("read backup file");
+    assert_eq!(
+        on_disk_sql, sql,
+        "disk round-trip must be byte-identical to the in-memory dump"
+    );
+    dst.restore_tables_sql(&on_disk_sql).await.expect("restore");
+
+    // After restore, dst should see the same canonical content as src.
+    let src_audit = src.audit_scope(&scope).await.expect("src audit");
+    let dst_audit = dst.audit_scope(&scope).await.expect("dst audit");
+    assert_eq!(
+        src_audit, dst_audit,
+        "src and dst audits match after file-mediated restore"
+    );
+
+    // Spot-check: a specific row round-tripped.
+    let restored_schedules = dst.list_schedules(&scope).await.expect("list schedules");
+    assert_eq!(restored_schedules.len(), 1);
+    assert_eq!(restored_schedules[0].schedule_id, "cron-drill");
+    assert_eq!(restored_schedules[0].expression, "every 5m");
+
+    let restored_cp = dst
+        .latest_checkpoint(&scope, "run-1")
+        .await
+        .expect("checkpoint restored");
+    assert_eq!(restored_cp.workspace_revision.as_deref(), Some("rev-1"));
+    assert_eq!(restored_cp.binding_digest.as_deref(), Some("sha256:b1"));
+}
+
+#[tokio::test]
+async fn pg_k16_backup_drill_via_psql_binary_when_docker_exec_available() {
+    // External-tool smoke: when `docker exec octos-pg psql` is reachable
+    // (typical local-dev setup), execute the backup file via psql and
+    // verify the data lands. This is the production-restore workflow
+    // (`psql -f backup.sql`) — the K16 drill that proves the dump is
+    // PG-compatible SQL, not just an in-process artefact. Skipped when
+    // the docker / psql tooling is not available so CI without a local
+    // container is not broken.
+    use octos_store::repository::{MisfirePolicy, NewMessage, Schedule, UnitOfWork};
+
+    // Probe: can we actually exec into the PG container? If not, skip.
+    let docker_probe = std::process::Command::new("docker")
+        .args(["exec", "octos-pg", "psql", "--version"])
+        .output();
+    let psql_in_docker = matches!(docker_probe, Ok(out) if out.status.success());
+    if !psql_in_docker {
+        eprintln!("K16 psql drill SKIPPED: docker exec octos-pg psql not available");
+        return;
+    }
+
+    // Seed source: a message + a schedule.
+    let src = _pg_store_in_schema("k16psql", "src").await;
+    let scope = scope("t-k16psql", "sess-k16psql-1");
+    let mut uow = src.begin();
+    uow.append_message(NewMessage {
+        scope: scope.clone(),
+        message_id: "psql-1".into(),
+        thread_id: "t-psql".into(),
+        turn_id: "turn-1".into(),
+        role: "user".into(),
+        content: "psql drill".into(),
+    });
+    uow.commit().await.unwrap();
+    src.create_schedule(
+        &scope,
+        Schedule {
+            schedule_id: "cron-psql".into(),
+            expression: "every 1m".into(),
+            timezone: None,
+            next_fire_at_ms: None,
+            misfire_policy: MisfirePolicy::RunOnce,
+            enabled: true,
+            last_fired_at_ms: None,
+            last_run_id: None,
+            name: "cron-psql".into(),
+            payload_json: "{}".into(),
+            delete_after_run: false,
+            origin_json: "".into(),
+            created_at_ms: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Dump → write to file.
+    let sql = src.dump_tables_sql("t-k16psql").await.expect("dump");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backup_path = dir.path().join("backup.sql");
+    std::fs::write(&backup_path, &sql).expect("write backup file");
+
+    // Prepare a fresh target schema in PG (separate from src so the
+    // restore genuinely populates it from the file).
+    let url = database_url();
+    let admin = sqlx::PgPool::connect(&url).await.expect("admin");
+    sqlx::query("DROP SCHEMA IF EXISTS test_k16psql_dst CASCADE")
+        .execute(&admin)
+        .await
+        .expect("drop dst schema");
+    sqlx::query("CREATE SCHEMA test_k16psql_dst")
+        .execute(&admin)
+        .await
+        .expect("create dst schema");
+    // Mirror the owned schema on the target so the INSERTs in the
+    // backup have a home. Easiest: run the same migration script
+    // through the dst schema's search_path.
+    let dst_url = format!("{url}?options=-c%20search_path%3Dtest_k16psql_dst");
+    let dst_store = PgStore::connect(&dst_url).await.expect("dst connect");
+    dst_store.migrate().await.expect("dst migrate");
+
+    // Run psql inside the docker container. The backup's first line is
+    // `BEGIN; SET LOCAL app.tenant_id = ...`; we prepend a
+    // `SET search_path TO <dst>` so the INSERTs land in the dst schema
+    // (the dump's tenant context is set via SET LOCAL inside the BEGIN
+    // block — search_path has to be set OUTSIDE the BEGIN for it to
+    // govern which schema the unprefixed table names resolve to).
+    let mut restored_sql = String::new();
+    restored_sql.push_str("SET search_path TO test_k16psql_dst;\n");
+    restored_sql.push_str(&sql);
+    let psql_input_path = dir.path().join("backup_for_psql.sql");
+    std::fs::write(&psql_input_path, &restored_sql).expect("write psql input");
+    let psql_status = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            "octos-pg",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "octos",
+            "-v",
+            "ON_ERROR_STOP=1",
+        ])
+        .stdin(std::fs::File::open(&psql_input_path).expect("open psql input"))
+        .output();
+    let out = psql_status.expect("docker exec psql");
+    assert!(
+        out.status.success(),
+        "psql restore failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // After psql restored, dst_store should see the data.
+    let restored = dst_store
+        .list_schedules(&scope)
+        .await
+        .expect("list after psql restore");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].schedule_id, "cron-psql");
+    assert_eq!(restored[0].expression, "every 1m");
+}
