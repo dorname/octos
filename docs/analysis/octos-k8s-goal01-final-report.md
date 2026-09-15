@@ -16,7 +16,7 @@
 | K05 | 审批跨 Pod 恢复 | ✅（4 层） | `714825cd` / `0f352c0b` / `242acb17` |
 | K06 | WS 断线/重连/重同步 | ✅ | `1ff38992` / `4dcda3b6` / `1e3ccd0a` / `67f8d54f` / `920fd8f5` / `d8106d26` |
 | K07 | RLS / 租户隔离 | ✅ | 已有 |
-| K08 | workspace revision CAS（无静默覆盖） | ✅ | `b5a265a3` / `a81b7c02` / `b5fbc93d` |
+| K08 | workspace revision CAS（无静默覆盖） | ✅ | `b5a265a3` / `a81b7c02` / `b5fbc93d` / `688468b8`（FOR UPDATE 行锁修复） |
 | K09 | 子任务 join 一次 | ✅ | `5e2259f4` |
 | K10 | Cron firing 集群唯一 | ✅ | `3f4e7135` / `18194f10` |
 | K11 | 旧 binding / 权限快照保留 | ✅ | 已有 |
@@ -35,7 +35,7 @@
 | P1 | 审批持久化（c2） | ✅ | `k8s-stateless-p3-baseline` |
 | P2 | 运行恢复（c3） | ✅ | `k8s-stateless-p3-baseline` |
 | P3 | 集群状态（c5） | ✅ | `k8s-stateless-p3-baseline` |
-| P5 | cron_service GREEN 接线 | ✅ | `db396b8f` / `0a742546` / `18194f10` / `cb9e9a1b` / `52dbd0aa` / `73ac85b8` |
+| P5 | cron_service GREEN 接线 | ✅ | `db396b8f` / `0a742546` / `18194f10` / `cb9e9a1b` / `52dbd0aa` / `73ac85b8` / `5cd71af3`（集成测试 + firing 修复） |
 
 ---
 
