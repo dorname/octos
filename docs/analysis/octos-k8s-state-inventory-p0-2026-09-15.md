@@ -101,9 +101,12 @@ deferred。
   但 `InProcessAgentOrchestrator`（49013 行）尚未在工具边界实际包装
   side-effect tool、未在接管时调用 `recover_run_from`、未实现 K09 join-once
   接入 TakeoverDecision。这是把组件变为运行时行为的关键剩余工作。
-- **c5 cron 完整集成**：`CronScheduleStore` 持久化已就绪，但 `octos-bus
-  cron_service.rs` 仍走内存/JSON，未真正改用持久化调度（涉及 octos-bus 引入
-  sqlx + 1000+ 行 cron_service 改造）。
+- **c5 cron 完整集成**：`CronScheduleStore` 持久化已就绪，`octos-bus
+  cron_service.rs` 仍走内存/JSON。下一步：specs/task-c5-cron-durable-firing.spec.md
+  (K18, agent-spec lint 100%, commit 817bdcd3) 锁定 RED→GREEN 三个集成测试
+  （pg_cron_durable_fires_only_one_pod_acks / pg_cron_takeover_after_lease_expires
+  / pg_cron_idempotent_fire_at_unique_constraint）；GREEN 阶段涉及 octos-bus 引入
+  sqlx + 1000+ 行 cron_service 改造。
 - **D6 多副本事件回放**：ledger 已是 disk-commit 是 truth（单节点 D6 成立）；
   多副本 K06 跨副本 seq 回放需要 PG session_events + outbox 接入
   ui_protocol_ledger（大型跨层改动）。
