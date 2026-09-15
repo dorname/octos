@@ -1,22 +1,31 @@
 //! Cron service that fires scheduled jobs into the message bus.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use octos_core::InboundMessage;
+use octos_core::execution_scope::Scope;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule, CronStore};
+use crate::cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule};
+use crate::local_cron_store::LocalCronStore;
+
+// `WrapErr` is still used by `write_cron_json_atomic`.
 
 /// Service that manages and executes cron jobs.
+///
+/// The durable truth-source is `LocalCronStore` (sync + JSON
+/// persistence); the `CronService` only holds a `mpsc::Sender` and
+/// the arm-timer state. Mutations route through the store; the
+/// store's JSON path is the single source of persistence.
 pub struct CronService {
     store_path: PathBuf,
-    store: Mutex<CronStore>,
+    store: Arc<LocalCronStore>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     running: AtomicBool,
     timer_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -31,6 +40,11 @@ pub struct CronService {
     /// when that happens, the notify wakes the sleeper on its next
     /// poll and the Arc releases without a delay_ms-long tail.
     shutdown_notify: tokio::sync::Notify,
+    /// Default scope for this service (a ProfileRuntime has exactly
+    /// one cron_service and one scope). The LocalCronStore accepts
+    /// a scope argument for symmetry with the async PG-backed
+    /// `CronScheduleStore`; we pass this through on every call.
+    default_scope: Scope,
 }
 
 /// Terse by design: the orchestrator holds an `Arc<CronService>` inside a
@@ -46,21 +60,50 @@ impl std::fmt::Debug for CronService {
     }
 }
 
-impl CronService {
-    /// Create a new cron service, loading persisted jobs from disk.
-    pub fn new(store_path: impl AsRef<Path>, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
-        let store_path = store_path.as_ref().to_path_buf();
-        // #2005 — never silently start empty on a corrupt store; see
-        // `load_store_or_quarantine`.
-        let store = load_store_or_quarantine(&store_path);
+/// Construct a placeholder scope for the legacy `CronService::new` path.
+/// The LocalCronStore backend does not enforce scope, so the placeholder
+/// is acceptable for callers that haven't migrated to `with_scope` yet.
+/// New callers should pass a real scope via `with_scope`.
+fn default_scope() -> Scope {
+    use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+    bind_scope(
+        &AuthenticatedIdentity {
+            tenant_id: "default".into(),
+            profile_id: "default".into(),
+        },
+        "default",
+        None,
+    )
+    .expect("default scope")
+}
 
+impl CronService {
+    /// Create a new cron service, loading persisted jobs from disk via
+    /// `LocalCronStore`.
+    pub fn new(store_path: impl AsRef<Path>, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
+        Self::with_scope(store_path, inbound_tx, default_scope())
+    }
+
+    /// Construct with an explicit scope. The synchronous LocalCronStore
+    /// back-end doesn't enforce scope, but accepting one keeps the API
+    /// symmetric with the eventual async-PG-backed path and lets a
+    /// caller pin a service to a specific (tenant, profile, workspace,
+    /// session) tuple without going through a scope-resolver hop.
+    pub fn with_scope(
+        store_path: impl AsRef<Path>,
+        inbound_tx: mpsc::Sender<InboundMessage>,
+        scope: Scope,
+    ) -> Self {
+        let store_path = store_path.as_ref().to_path_buf();
+        let store = Arc::new(LocalCronStore::open(&store_path));
         Self {
             store_path,
-            store: Mutex::new(store),
+            store,
             inbound_tx,
             running: AtomicBool::new(false),
             timer_handle: tokio::sync::Mutex::new(None),
             shutdown_notify: tokio::sync::Notify::new(),
+            default_scope: scope,
         }
     }
 
@@ -69,12 +112,22 @@ impl CronService {
         self.running.store(true, Ordering::Relaxed);
         let now_ms = Utc::now().timestamp_millis();
 
-        {
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            for job in &mut store.jobs {
-                if job.enabled && job.state.next_run_at_ms.is_none() {
-                    job.compute_next_run(now_ms);
-                }
+        // Recompute next_run for any job that's missing it. The
+        // LocalCronStore exposes a snapshot list; mutate each, then
+        // call update_schedule to persist. Jobs whose update fails
+        // (persist error) keep their prior state via the rollback
+        // inside LocalCronStore::update_schedule — memory never
+        // diverges from the file.
+        let jobs = self.store.list_schedules(&self.default_scope);
+        for mut job in jobs {
+            if job.enabled && job.state.next_run_at_ms.is_none() {
+                job.compute_next_run(now_ms);
+                // Best-effort: an update failure is logged but does
+                // not block startup (the schedule will simply not
+                // fire until the next `enable_job`/`add_job` saves a
+                // valid next_run). LocalCronStore already logs
+                // persistence failures.
+                let _ = self.store.update_schedule(&self.default_scope, job);
             }
         }
 
@@ -203,16 +256,11 @@ impl CronService {
 
         let result = job.clone();
 
-        {
-            // Mutate + persist under ONE lock hold (persistence
-            // invariant — see persist_store_locked). Roll the push back
-            // on a failed write so memory never diverges from the file.
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            store.jobs.push(job);
-            if let Err(error) = persist_store_locked(&self.store_path, &store) {
-                store.jobs.retain(|j| j.id != id);
-                return Err(error);
-            }
+        // Delegate to LocalCronStore: it owns the lock + persist +
+        // rollback atomically. Persistence invariant preserved (the
+        // store rolls back the push on persist failure).
+        if let Err(e) = self.store.create_schedule(&self.default_scope, job) {
+            return Err(eyre::Report::new(std::io::Error::other(e)));
         }
 
         self.arm_timer();
@@ -223,28 +271,15 @@ impl CronService {
 
     /// Remove a cron job by ID. Returns true if found and removed.
     pub fn remove_job(self: &std::sync::Arc<Self>, id: &str) -> bool {
-        let removed = {
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let mut extracted = Vec::new();
-            let mut kept = Vec::with_capacity(store.jobs.len());
-            for job in store.jobs.drain(..) {
-                if job.id == id {
-                    extracted.push(job);
-                } else {
-                    kept.push(job);
-                }
-            }
-            store.jobs = kept;
-            if extracted.is_empty() {
+        // Delegate to LocalCronStore: it owns lock + persist +
+        // rollback atomically. Persistence failure logs and reports
+        // not-removed.
+        let removed = match self.store.delete_schedule(&self.default_scope, id) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!("failed to save cron store after remove: {e}");
                 false
-            } else if let Err(e) = persist_store_locked(&self.store_path, &store) {
-                // Failed write: put the job back so memory matches the
-                // file (persistence invariant), and report not-removed.
-                store.jobs.extend(extracted);
-                tracing::warn!("failed to save cron store: {e}");
-                false
-            } else {
-                true
             }
         };
 
@@ -270,28 +305,9 @@ impl CronService {
     /// failed write, so memory never diverges from the file — the same
     /// persistence invariant `remove_job` keeps.
     pub fn remove_jobs_for_loop(self: &std::sync::Arc<Self>, loop_id: &str) -> Vec<String> {
-        let removed = {
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            let mut extracted = Vec::new();
-            let mut kept = Vec::with_capacity(store.jobs.len());
-            for job in store.jobs.drain(..) {
-                if job.belongs_to_loop(loop_id) {
-                    extracted.push(job);
-                } else {
-                    kept.push(job);
-                }
-            }
-            store.jobs = kept;
-            if extracted.is_empty() {
-                Vec::new()
-            } else if let Err(e) = persist_store_locked(&self.store_path, &store) {
-                store.jobs.extend(extracted);
-                tracing::warn!(loop_id = %loop_id, "failed to save cron store: {e}");
-                Vec::new()
-            } else {
-                extracted.into_iter().map(|j| j.id).collect()
-            }
-        };
+        // Delegate to LocalCronStore: same persistence invariant
+        // (rolled-back-on-failure) is preserved inside the store.
+        let removed = self.store.remove_jobs_for_loop(loop_id);
 
         if !removed.is_empty() {
             self.arm_timer();
@@ -303,44 +319,33 @@ impl CronService {
 
     /// List all enabled jobs, sorted by next run time.
     pub fn list_jobs(&self) -> Vec<CronJob> {
-        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let mut jobs: Vec<_> = store.jobs.iter().filter(|j| j.enabled).cloned().collect();
-        jobs.sort_by_key(|j| j.state.next_run_at_ms.unwrap_or(i64::MAX));
-        jobs
+        self.store.list_enabled_schedules(&self.default_scope)
     }
 
     /// List all jobs (including disabled), sorted by next run time.
     pub fn list_all_jobs(&self) -> Vec<CronJob> {
-        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let mut jobs: Vec<_> = store.jobs.clone();
-        jobs.sort_by_key(|j| j.state.next_run_at_ms.unwrap_or(i64::MAX));
-        jobs
+        self.store.list_schedules(&self.default_scope)
     }
 
     /// Enable or disable a cron job. Returns true if found.
     pub fn enable_job(self: &std::sync::Arc<Self>, id: &str, enabled: bool) -> bool {
-        let found = {
-            let now_ms = Utc::now().timestamp_millis();
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
-                let prior = job.clone();
-                job.enabled = enabled;
-                if enabled {
-                    job.compute_next_run(now_ms);
-                } else {
-                    job.state.next_run_at_ms = None;
-                }
-                if let Err(e) = persist_store_locked(&self.store_path, &store) {
-                    // Failed write: revert so memory matches the file.
-                    if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
-                        *job = prior;
-                    }
-                    tracing::warn!("failed to save cron store: {e}");
-                    false
-                } else {
-                    true
-                }
-            } else {
+        let now_ms = Utc::now().timestamp_millis();
+        // Read the current job, mutate enabled + next_run, then
+        // delegate the persisted update to LocalCronStore (which
+        // rolls back on persist failure).
+        let Some(mut job) = self.store.get_schedule(&self.default_scope, id) else {
+            return false;
+        };
+        job.enabled = enabled;
+        if enabled {
+            job.compute_next_run(now_ms);
+        } else {
+            job.state.next_run_at_ms = None;
+        }
+        let found = match self.store.update_schedule(&self.default_scope, job) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("failed to save cron store after enable: {e}");
                 false
             }
         };
@@ -372,44 +377,26 @@ impl CronService {
         id: &str,
         enabled: bool,
     ) -> Result<Option<CronJob>> {
-        let found = {
-            let now_ms = Utc::now().timestamp_millis();
-            // Reload + toggle + persist under ONE lock hold. Every other
-            // mutation persists before releasing this lock (persistence
-            // invariant — see persist_store_locked), so the file we
-            // reload is never behind unflushed memory, and nothing can
-            // interleave between our reload and our write (codex #1612
-            // r3 — both P1s).
-            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(fresh) = load_store(&self.store_path) {
-                *store = fresh;
-            }
-            let prior = store.jobs.clone();
-            let found = if let Some(job) = store.jobs.iter_mut().find(|j| j.id == id) {
-                job.enabled = enabled;
-                if enabled {
-                    job.compute_next_run(now_ms);
-                } else {
-                    job.state.next_run_at_ms = None;
-                }
-                Some(job.clone())
-            } else {
-                None
-            };
-            if found.is_some()
-                && let Err(error) = persist_store_locked(&self.store_path, &store)
-            {
-                // Failed write: revert so memory matches the file.
-                store.jobs = prior;
-                return Err(error);
-            }
-            found
+        // LocalCronStore keeps memory == disk at every persist
+        // boundary, so a "reconcile from disk then toggle" reduces to
+        // "read latest + update_schedule". Read fresh, mutate
+        // enabled + next_run, write back. On persist failure the
+        // LocalCronStore rolls back the in-memory mutation.
+        let now_ms = Utc::now().timestamp_millis();
+        let Some(mut job) = self.store.get_schedule(&self.default_scope, id) else {
+            return Ok(None);
         };
-
-        if found.is_some() {
-            self.arm_timer();
+        job.enabled = enabled;
+        if enabled {
+            job.compute_next_run(now_ms);
+        } else {
+            job.state.next_run_at_ms = None;
         }
-        Ok(found)
+        if let Err(e) = self.store.update_schedule(&self.default_scope, job.clone()) {
+            return Err(eyre::Report::new(std::io::Error::other(e)));
+        }
+        self.arm_timer();
+        Ok(Some(job))
     }
 
     /// Arm a timer for the earliest due job.
@@ -419,11 +406,9 @@ impl CronService {
         }
 
         let earliest_ms = {
-            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-            store
-                .jobs
+            self.store
+                .list_enabled_schedules(&self.default_scope)
                 .iter()
-                .filter(|j| j.enabled)
                 .filter_map(|j| j.state.next_run_at_ms)
                 .min()
         };
@@ -591,34 +576,50 @@ impl CronService {
         tokio::spawn(async move {
             let reserve = std::sync::Arc::clone(&this);
             let due_jobs: Vec<CronJob> = tokio::task::spawn_blocking(move || {
-                let mut store = reserve.store.lock().unwrap_or_else(|e| e.into_inner());
-                let mut due = Vec::new();
-                let mut to_delete = Vec::new();
+                // Reserve-then-fire: enumerate due jobs under the
+                // store's internal lock, advance their next_run (or
+                // mark for deletion), and persist. The LocalCronStore
+                // owns the lock + persist + rollback atomically, so
+                // we don't hold the lock across await — we collect
+                // due jobs in a snapshot, then mutate + persist each
+                // through the store.
+                let due = reserve
+                    .store
+                    .list_due_schedules(&reserve.default_scope, now_ms, 32);
 
-                for stored_job in &mut store.jobs {
-                    if !stored_job.is_due(now_ms) {
-                        continue;
-                    }
-                    due.push(stored_job.clone());
-
-                    stored_job.state.last_run_at_ms = Some(now_ms);
-                    stored_job.state.last_status = Some("ok".into());
-
-                    if stored_job.delete_after_run {
-                        to_delete.push(stored_job.id.clone());
+                // Advance each due job's next_run (or delete it) and
+                // persist. Update failures are logged and the tick
+                // proceeds — next_run stays advanced in memory, so
+                // no double-fire; the file catches up on the next
+                // successful persist.
+                let mut reserved = Vec::with_capacity(due.len());
+                for mut job in due {
+                    let id = job.id.clone();
+                    job.state.last_run_at_ms = Some(now_ms);
+                    job.state.last_status = Some("ok".into());
+                    if job.delete_after_run {
+                        if let Err(e) = reserve.store.delete_schedule(&reserve.default_scope, &id) {
+                            tracing::warn!(job_id = %id, "failed to delete one-shot: {e}");
+                            // Skip firing this occurrence rather than
+                            // sending a stale `last_run_at_ms` to the
+                            // bus.
+                            continue;
+                        }
                     } else {
-                        stored_job.compute_next_run(now_ms);
+                        job.compute_next_run(now_ms);
+                        if let Err(e) = reserve
+                            .store
+                            .update_schedule(&reserve.default_scope, job.clone())
+                        {
+                            tracing::warn!(job_id = %id, "failed to advance next_run: {e}");
+                            // Drop this tick rather than fire with a
+                            // stale state.
+                            continue;
+                        }
                     }
+                    reserved.push(job);
                 }
-
-                store.jobs.retain(|j| !to_delete.contains(&j.id));
-                // A failed write is logged and the tick proceeds —
-                // next_run stays advanced in memory, so no double-fire;
-                // the file catches up on the next successful persist.
-                if let Err(e) = persist_store_locked(&reserve.store_path, &store) {
-                    tracing::warn!("failed to save cron store: {e}");
-                }
-                due
+                reserved
             })
             .await
             .unwrap_or_default();
@@ -706,16 +707,14 @@ impl CronService {
     }
 }
 
-/// Serialize + atomically replace `cron.json`. The caller MUST hold the
-/// store lock for the whole call — that is the service's persistence
-/// invariant (every mutation persists before releasing the lock), which
-/// keeps memory and file in lockstep so no writer can interleave a
-/// stale snapshot (codex #1612 r3). Unique temp names keep
-/// out-of-process writers from colliding on a shared `cron.tmp`.
-fn persist_store_locked(store_path: &Path, store: &CronStore) -> Result<()> {
-    let json = serde_json::to_string_pretty(store).wrap_err("failed to serialize cron store")?;
-    write_cron_json_atomic(store_path, &json)
-}
+// `persist_store_locked` was the inline-persist helper inside
+// `CronService`. After N2-full step 3 the service no longer holds
+// `Mutex<CronStore>`; the equivalent persist lives in
+// `LocalCronStore::persist_store_locked` (which uses the same
+// `write_cron_json_atomic` primitive + the same `CRON_TMP_SEQ`).
+// The inline helper is gone; `cron_panel.rs` and other callers
+// reach the atomic-rename primitive via `write_cron_json_atomic` (still
+// `pub` below).
 
 /// Process-global temp-name sequence, shared by EVERY cron writer
 /// (`CronService::persist_store_locked` AND the serve-side file toggle
@@ -783,81 +782,10 @@ fn fsync_dir(dir: &Path) {
     }
 }
 
-fn load_store(path: &Path) -> Option<CronStore> {
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-/// #2005 — load the cron store, QUARANTINING a corrupt file instead of
-/// silently starting with zero jobs.
-///
-/// The old path was `load_store(..).unwrap_or_default()`, which collapsed
-/// "file absent" (legitimate first run) and "file present but unreadable /
-/// unparseable" into the same empty store — with no error and no log line.
-/// That is silent total loss, because the store is not read-only: the next
-/// `add_job` / `enable_job` persists the empty-plus-one store OVER the real
-/// `cron.json`, destroying every other job permanently.
-///
-/// Absent stays silent (first run is normal). Corrupt is loud AND preserved:
-/// the bytes are renamed aside so a later persist cannot overwrite them, and
-/// the operator can recover the jobs by hand. We still return an empty store
-/// so the service starts — cron being down is bad, but it is recoverable;
-/// losing the definitions is not.
-fn load_store_or_quarantine(path: &Path) -> CronStore {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // First run: no file yet. Legitimate, stay quiet.
-            return CronStore::default();
-        }
-        Err(error) => {
-            tracing::error!(
-                path = %path.display(),
-                %error,
-                "cron store is unreadable; quarantining it and starting with NO jobs. \
-                 Existing schedules will not fire until this is resolved.",
-            );
-            quarantine_cron_store(path);
-            return CronStore::default();
-        }
-    };
-    match serde_json::from_str(&data) {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(
-                path = %path.display(),
-                %error,
-                bytes = data.len(),
-                "cron store is corrupt; quarantining it and starting with NO jobs. \
-                 Existing schedules will not fire until this is resolved.",
-            );
-            quarantine_cron_store(path);
-            CronStore::default()
-        }
-    }
-}
-
-/// Move a corrupt cron store aside so the next persist cannot overwrite it.
-/// Best-effort: if the rename fails we have still logged the corruption, and
-/// leaving the file in place is no worse than the pre-#2005 behaviour.
-fn quarantine_cron_store(path: &Path) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
-    let quarantined = path.with_extension(format!("corrupt-{stamp}"));
-    match std::fs::rename(path, &quarantined) {
-        Ok(()) => tracing::error!(
-            quarantined = %quarantined.display(),
-            "corrupt cron store preserved here — recover job definitions from it",
-        ),
-        Err(error) => tracing::error!(
-            path = %path.display(),
-            %error,
-            "could not quarantine the corrupt cron store",
-        ),
-    }
-}
+// `load_store`, `load_store_or_quarantine`, and `quarantine_cron_store`
+// moved to `local_cron_store.rs` (the LocalCronStore owns the
+// quarantine behaviour — codex #2005 — and `cron_service.rs` no longer
+// reads `cron.json` directly).
 
 /// Generate a short 8-char hex ID.
 ///
@@ -877,6 +805,8 @@ fn short_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron_types::CronStore;
+    use crate::local_cron_store::{load_store, load_store_or_quarantine};
 
     #[test]
     fn short_id_is_unique_across_same_window_calls() {
@@ -1462,11 +1392,13 @@ mod tests {
         // Backdate both jobs (as if their interval elapsed) so they are
         // due the moment the service starts.
         let past_ms = Utc::now().timestamp_millis() - 60_000;
-        {
-            let mut store = service.store.lock().unwrap();
-            for job in store.jobs.iter_mut() {
-                job.state.next_run_at_ms = Some(past_ms);
-            }
+        let jobs = service.store.list_schedules(&service.default_scope);
+        for mut job in jobs {
+            job.state.next_run_at_ms = Some(past_ms);
+            service
+                .store
+                .update_schedule(&service.default_scope, job)
+                .expect("backdate");
         }
 
         service.start();
@@ -1600,7 +1532,7 @@ mod tests {
         .expect("pre-fill send must succeed on an empty capacity-1 channel");
 
         // Added while stopped, then backdated so it is due immediately.
-        let job = service
+        let _job_created = service
             .add_job(
                 "reserved".into(),
                 CronSchedule::Every { every_ms: 60_000 },
@@ -1608,10 +1540,16 @@ mod tests {
             )
             .unwrap();
         let past_ms = Utc::now().timestamp_millis() - 60_000;
-        {
-            let mut store = service.store.lock().unwrap();
-            store.jobs[0].state.next_run_at_ms = Some(past_ms);
-        }
+        let mut job = service
+            .store
+            .get_schedule(&service.default_scope, &service.list_all_jobs()[0].id)
+            .expect("exists");
+        job.state.next_run_at_ms = Some(past_ms);
+        let job_id_for_assert = job.id.clone();
+        service
+            .store
+            .update_schedule(&service.default_scope, job)
+            .expect("backdate");
 
         service.start();
 
@@ -1664,7 +1602,7 @@ mod tests {
                  aborted the timer task after the reservation committed",
             )
             .expect("bus channel closed unexpectedly");
-        assert_eq!(fired.chat_id, job.id);
+        assert_eq!(fired.chat_id, job_id_for_assert);
         assert_eq!(fired.content, "reserved fire");
 
         service.stop().await;

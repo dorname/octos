@@ -230,8 +230,12 @@ impl LocalCronStore {
 
 /// Load `cron.json` from disk; on parse failure quarantine the corrupt
 /// file and start empty. Matches the behaviour of `load_store_or_quarantine`
-/// in the original `cron_service.rs` (codex #2005).
-fn load_store_or_quarantine(store_path: &Path) -> CronStore {
+/// in the original `cron_service.rs` (codex #2005). `pub(crate)` so
+/// `cron_service.rs`'s tests can exercise the same quarantine path.
+///
+/// The quarantine file uses the `corrupt-<ts>` suffix the legacy test
+/// `corrupt_cron_store_is_quarantined_not_silently_discarded` asserts on.
+pub(crate) fn load_store_or_quarantine(store_path: &Path) -> CronStore {
     if !store_path.exists() {
         return CronStore::default();
     }
@@ -240,7 +244,7 @@ fn load_store_or_quarantine(store_path: &Path) -> CronStore {
             Ok(store) => store,
             Err(e) => {
                 let ts = Utc::now().timestamp_millis();
-                let quarantine = store_path.with_extension(format!("quarantine-{ts}"));
+                let quarantine = store_path.with_extension(format!("corrupt-{ts}"));
                 let _ = std::fs::rename(store_path, &quarantine);
                 tracing::warn!(
                     error = %e,
@@ -265,6 +269,17 @@ fn persist_store_locked(store_path: &Path, store: &CronStore) -> Result<(), Stri
     let json = serde_json::to_string_pretty(store).map_err(|e| format!("serialize: {e}"))?;
     crate::cron_service::write_cron_json_atomic(store_path, &json)
         .map_err(|e| format!("atomic write: {e}"))
+}
+
+/// Read `cron.json` from disk. Returns None when the file is missing or
+/// unreadable — the caller distinguishes "not present" from "store empty".
+/// Mirrors the original `cron_service.rs::load_store`. Only used from
+/// `cron_service.rs` unit tests; not part of the production LocalCronStore
+/// API.
+#[allow(dead_code)]
+pub(crate) fn load_store(path: &Path) -> Option<CronStore> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 // Re-export write_cron_json_atomic at the crate boundary so external
