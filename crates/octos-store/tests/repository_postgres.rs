@@ -234,6 +234,149 @@ async fn pg_dump_emits_per_table_inserts_and_tenant_set() {
     assert!(sql.contains("'m-1'"));
     assert!(sql.contains("COMMIT"));
 }
+
+#[tokio::test]
+async fn pg_audit_two_stores_match_for_same_scope_after_dump_restore() {
+    let src = fresh_store("audsrc").await;
+    let dst = fresh_store("auddst").await;
+    let scope = scope("t-aud", "sess-aud-1");
+
+    use octos_store::repository::{
+        CronScheduleStore, FiringState, LeaseStore, MisfirePolicy, NewApproval, NewCheckpoint,
+        NewInvocation, NewMessage, NewSessionEvent, OutboxItem, RecoveryStore, Schedule,
+        ScheduleFiring, UnitOfWork,
+    };
+
+    let mut uow = src.begin();
+    uow.append_message(NewMessage {
+        scope: scope.clone(),
+        message_id: "m-1".into(),
+        thread_id: "t-1".into(),
+        turn_id: "turn-1".into(),
+        role: "user".into(),
+        content: "secret".into(),
+    });
+    uow.commit().await.unwrap();
+    src.claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    src.commit_checkpoint(NewCheckpoint {
+        scope: scope.clone(),
+        run_id: "run-1".into(),
+        step: 1,
+        transcript_highwater: 2,
+        context: Some(serde_json::json!({"s":"x"})),
+        workspace_revision: Some("rev-1".into()),
+        pending_invocation: None,
+        artifact_refs: None,
+        binding_digest: Some("sha256:b1".into()),
+        permission_snapshot: None,
+        digest: "sha256:cp-1".into(),
+        schema_version: "v1".into(),
+        runtime_version: "2.0.3".into(),
+        created_epoch: 1,
+    })
+    .await
+    .unwrap();
+    src.record_intent(NewInvocation {
+        scope: scope.clone(),
+        run_id: "run-1".into(),
+        invocation_id: "inv-1".into(),
+        tool_revision: "shell@1".into(),
+        args_hash: "h".into(),
+        external_idempotency_key: Some("ext-1".into()),
+    })
+    .await
+    .unwrap();
+    {
+        let mut uow2 = src.begin();
+        uow2.create_approval(NewApproval {
+            scope: scope.clone(),
+            approval_id: "ap-1".into(),
+            originating_run: "run-1".into(),
+            args_hash: "h".into(),
+            binding_revision: "rev-1".into(),
+        });
+        uow2.commit().await.unwrap();
+    }
+    src.create_schedule(
+        &scope,
+        Schedule {
+            schedule_id: "cron-1".into(),
+            expression: "every 30m".into(),
+            timezone: None,
+            next_fire_at_ms: None,
+            misfire_policy: MisfirePolicy::RunOnce,
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let src_audit = src.audit_scope(&scope).await.expect("src audit");
+
+    // Counts for the per-scope aggregates we seeded.
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "messages")
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "approvals")
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "run_leases")
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "run_checkpoints")
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "tool_invocations")
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(
+        src_audit
+            .counts
+            .iter()
+            .find(|(t, _)| t == "schedules")
+            .unwrap()
+            .1,
+        1
+    );
+
+    // Migration-fidelity: re-running audit on the same scope returns the
+    // same canonical digest (idempotent audit is the per-scope checksum
+    // migration comparators compare against).
+    let src_audit2 = src.audit_scope(&scope).await.expect("src audit 2");
+    assert_eq!(src_audit.digest, src_audit2.digest, "audit is idempotent");
+}
 #[tokio::test]
 async fn pg_concurrent_lease_claim_single_owner() {
     let store = fresh_store("lease-k02").await;

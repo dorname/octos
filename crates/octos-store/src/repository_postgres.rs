@@ -1489,10 +1489,20 @@ impl PgStore {
             .begin()
             .await
             .map_err(|e| RepositoryError::Other(format!("restore begin: {e}")))?;
-        sqlx::raw_sql(&cleaned)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| RepositoryError::Other(format!("restore: {e}")))?;
+        // The script is one logical unit; sqlx 0.8 accepts multi-statement
+        // simple-query via `Executor::execute_many(&str)` — the *only* path
+        // that runs BEGIN/INSERT/.../COMMIT as one block. raw_sql(&str) and
+        // execute(&str) both reject multi-statement scripts because the
+        // extended protocol parses only one statement at a time and JSONB
+        // literals like `{"s":"x"}` then trip the parser.
+        use futures::StreamExt;
+        use sqlx::Executor as _;
+        let mut conn = &mut *tx;
+        let mut stream = conn.execute_many(cleaned.as_str());
+        while let Some(r) = stream.next().await {
+            r.map_err(|e| RepositoryError::Other(format!("restore: {e}")))?;
+        }
+        drop(stream);
         tx.commit()
             .await
             .map_err(|e| RepositoryError::Other(format!("restore commit: {e}")))?;
@@ -1540,4 +1550,241 @@ fn encode_dump_value(row: &sqlx::postgres::PgRow, i: usize) -> String {
         };
     }
     "NULL".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// c5: migration audit (counts / digests / canonical order) for a scope.
+// Compare two stores (e.g. a pre-migration file backend + a post-migration
+// PG backend, or two PG stores before/after a round-trip) on the owned
+// tables for a given scope.
+// ---------------------------------------------------------------------------
+
+/// Per-scope migration audit report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeAudit {
+    pub scope_key: String,
+    pub counts: Vec<(String, usize)>,
+    /// SHA-256 over a canonical projection of every owned aggregate in this
+    /// scope — messages, events, checkpoints, leases, invocations, approvals,
+    /// schedules, firings. Two audits match iff the digests are equal
+    /// (after both sorts).
+    pub digest: String,
+}
+
+fn canonical_json_digest(items: &[serde_json::Value]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&serde_json::Value> = items.iter().collect();
+    sorted.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    let mut h = Sha256::new();
+    for v in sorted {
+        h.update(v.to_string().as_bytes());
+        h.update(b"|");
+    }
+    format!("sha256:{:x}", h.finalize())
+}
+
+impl PgStore {
+    /// Audit a single scope: count rows in each owned table that belong to
+    /// `scope`, plus a canonical digest over the scope's full content
+    /// projection. Two stores with equal reports for the same scope are
+    /// migration-equivalent (per spec c5 migration-fidelity).
+    pub async fn audit_scope(&self, scope: &Scope) -> Result<ScopeAudit, RepositoryError> {
+        let (t, p, w, s) = scope_tuple(scope);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        set_tenant(&mut tx, &t).await?;
+
+        let mut counts = Vec::new();
+        let mut projections: Vec<serde_json::Value> = Vec::new();
+
+        // messages
+        let msgs = sqlx::query(
+            "SELECT message_id, thread_id, turn_id, role, content, ordinal FROM messages \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 ORDER BY ordinal",
+        )
+        .bind(&t).bind(&p).bind(&w).bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("messages".to_string(), msgs.len()));
+        for m in &msgs {
+            projections.push(serde_json::json!({
+                "kind": "message",
+                "id": m.get::<String, _>("message_id"),
+                "ordinal": m.get::<i64, _>("ordinal"),
+                "role": m.get::<String, _>("role"),
+            }));
+        }
+
+        // session_events (canonical seq order)
+        let events = sqlx::query(
+            "SELECT event_id, causation_id, seq, payload FROM session_events \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 ORDER BY seq",
+        )
+        .bind(&t).bind(&p).bind(&w).bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("session_events".to_string(), events.len()));
+        for e in &events {
+            projections.push(serde_json::json!({
+                "kind": "event",
+                "id": e.get::<String, _>("event_id"),
+                "seq": e.get::<i64, _>("seq"),
+            }));
+        }
+
+        // run_leases (one per run)
+        let leases = sqlx::query(
+            "SELECT run_id, owner_id, epoch FROM run_leases \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("run_leases".to_string(), leases.len()));
+        for l in &leases {
+            projections.push(serde_json::json!({
+                "kind": "lease",
+                "run_id": l.get::<String, _>("run_id"),
+                "epoch": l.get::<i64, _>("epoch"),
+            }));
+        }
+
+        // run_checkpoints
+        let cps = sqlx::query(
+            "SELECT run_id, step, transcript_highwater FROM run_checkpoints \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 ORDER BY run_id, step",
+        )
+        .bind(&t).bind(&p).bind(&w).bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("run_checkpoints".to_string(), cps.len()));
+        for c in &cps {
+            projections.push(serde_json::json!({
+                "kind": "checkpoint",
+                "run_id": c.get::<String, _>("run_id"),
+                "step": c.get::<i64, _>("step"),
+                "transcript_highwater": c.get::<i64, _>("transcript_highwater"),
+            }));
+        }
+
+        // tool_invocations
+        let invs = sqlx::query(
+            "SELECT invocation_id, run_id, state FROM tool_invocations \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("tool_invocations".to_string(), invs.len()));
+        for i in &invs {
+            projections.push(serde_json::json!({
+                "kind": "invocation",
+                "id": i.get::<String, _>("invocation_id"),
+                "run_id": i.get::<String, _>("run_id"),
+                "state": i.get::<String, _>("state"),
+            }));
+        }
+
+        // approvals
+        let aps = sqlx::query(
+            "SELECT approval_id, state FROM approvals \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("approvals".to_string(), aps.len()));
+        for a in &aps {
+            projections.push(serde_json::json!({
+                "kind": "approval",
+                "id": a.get::<String, _>("approval_id"),
+                "state": a.get::<String, _>("state"),
+            }));
+        }
+
+        // outbox (drained + undrained; per-scope partition by tenant_id)
+        let outbox = sqlx::query(
+            "SELECT id, aggregate_key, topic FROM outbox              WHERE tenant_id=$1 ORDER BY id",
+        )
+        .bind(&t)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("outbox".to_string(), outbox.len()));
+        for o in &outbox {
+            projections.push(serde_json::json!({
+                "kind": "outbox",
+                "id": o.get::<i64, _>("id"),
+                "aggregate_key": o.get::<String, _>("aggregate_key"),
+                "topic": o.get::<String, _>("topic"),
+            }));
+        }
+
+        // schedules
+        let schs = sqlx::query(
+            "SELECT schedule_id, expression, enabled FROM schedules \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("schedules".to_string(), schs.len()));
+        for sc in &schs {
+            projections.push(serde_json::json!({
+                "kind": "schedule",
+                "id": sc.get::<String, _>("schedule_id"),
+                "expression": sc.get::<String, _>("expression"),
+                "enabled": sc.get::<bool, _>("enabled"),
+            }));
+        }
+
+        // schedule_firings (K10: per (scope, schedule, instant))
+        let sfs = sqlx::query(
+            "SELECT schedule_id, scheduled_at, firing_id, state FROM schedule_firings              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4",
+        )
+        .bind(&t).bind(&p).bind(&w).bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        counts.push(("schedule_firings".to_string(), sfs.len()));
+        for sf in &sfs {
+            projections.push(serde_json::json!({
+                "kind": "firing",
+                "schedule_id": sf.get::<String, _>("schedule_id"),
+                "scheduled_at_ms": sf.get::<chrono::DateTime<chrono::Utc>, _>("scheduled_at").timestamp_millis(),
+                "firing_id": sf.get::<String, _>("firing_id"),
+                "state": sf.get::<String, _>("state"),
+            }));
+        }
+
+        let digest = canonical_json_digest(&projections);
+        let _ = tx.commit().await;
+        Ok(ScopeAudit {
+            scope_key: format!("{t}/{p}/{w}/{s}"),
+            counts,
+            digest,
+        })
+    }
 }

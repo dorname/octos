@@ -13,6 +13,7 @@ eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+futures = "0.3"
 base64 = { workspace = true }
 tracing = { workspace = true }
 redb = { workspace = true }
