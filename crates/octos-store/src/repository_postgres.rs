@@ -1279,6 +1279,56 @@ impl RecoveryStore for PgStore {
         self.cas_workspace_revision(scope, run_id, expected_old_revision, new_revision)
             .await
     }
+
+    async fn events_after(
+        &self,
+        scope: &Scope,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<SessionEvent>, RepositoryError> {
+        // K06: WS reconnect / resync path. The PG `session_events` table
+        // is the durable truth source — a client that reconnects to a
+        // different Pod sees the same canonical event sequence. The
+        // (tenant_id, session_id, seq) PK makes seq ordering total and
+        // gap-free within a session.
+        let (t, p, w, s) = scope_tuple(scope);
+        let rows = match after_seq {
+            None => sqlx::query(
+                "SELECT event_id, causation_id, seq, payload FROM session_events \
+                 WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+                 ORDER BY seq",
+            )
+            .bind(&t)
+            .bind(&p)
+            .bind(&w)
+            .bind(&s)
+            .fetch_all(&*self.pool)
+            .await
+            .map_err(|e| RepositoryError::Other(format!("events_after: {e}")))?,
+            Some(n) => sqlx::query(
+                "SELECT event_id, causation_id, seq, payload FROM session_events \
+                 WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+                   AND seq > $5 \
+                 ORDER BY seq",
+            )
+            .bind(&t)
+            .bind(&p)
+            .bind(&w)
+            .bind(&s)
+            .bind(n as i64)
+            .fetch_all(&*self.pool)
+            .await
+            .map_err(|e| RepositoryError::Other(format!("events_after: {e}")))?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| SessionEvent {
+                event_id: r.get("event_id"),
+                causation_id: r.get("causation_id"),
+                seq: r.get::<i64, _>("seq") as u64,
+                payload: r.get("payload"),
+            })
+            .collect())
+    }
 }
 
 impl PgStore {

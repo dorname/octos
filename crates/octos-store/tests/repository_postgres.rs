@@ -2170,3 +2170,97 @@ async fn pg_k16_backup_drill_via_psql_binary_when_docker_exec_available() {
     assert_eq!(restored[0].schedule_id, "cron-psql");
     assert_eq!(restored[0].expression, "every 1m");
 }
+
+// --- c5 K06: events_after for WS reconnect / resync ----------------------
+//
+// The WS reconnect path needs to replay events the client missed while
+// disconnected. `events_after(scope, after_seq)` is the durable query:
+// a client that reconnects to a different Pod (or the same Pod after a
+// restart) sees the same canonical event sequence from PG.
+
+#[tokio::test]
+async fn pg_k06_events_after_returns_events_past_cursor() {
+    use octos_store::repository::RecoveryStore;
+    let store = fresh_store("k06").await;
+    let scope = scope("t-k06", "sess-k06-1");
+
+    // Seed 5 events at seq 1..=5.
+    for i in 1u64..=5 {
+        let mut uow = store.begin();
+        uow.append_event(NewSessionEvent {
+            scope: scope.clone(),
+            event_id: format!("ev-{i}"),
+            causation_id: None,
+            payload: serde_json::json!({"seq": i}),
+        });
+        uow.commit().await.unwrap();
+    }
+
+    // Full replay: after_seq=None returns all 5.
+    let all = store.events_after(&scope, None).await.expect("full replay");
+    assert_eq!(all.len(), 5);
+    let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+
+    // Incremental replay: after_seq=Some(2) returns seq 3,4,5.
+    let incremental = store
+        .events_after(&scope, Some(2))
+        .await
+        .expect("incremental replay");
+    assert_eq!(incremental.len(), 3);
+    let seqs: Vec<u64> = incremental.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![3, 4, 5]);
+
+    // after_seq=Some(5) returns nothing (client is up to date).
+    let up_to_date = store
+        .events_after(&scope, Some(5))
+        .await
+        .expect("up to date");
+    assert!(up_to_date.is_empty());
+}
+
+#[tokio::test]
+async fn pg_k06_events_after_is_canonical_across_pods() {
+    // Two independent PgStore connections (two Pods) reading the same
+    // scope must see the same canonical event sequence. This is the
+    // K06 invariant: a client that reconnects to a different Pod sees
+    // the same replay stream.
+    use octos_store::repository::RecoveryStore;
+    let schema_tag = "k06pods";
+    let pod_a = _pg_store_in_schema(schema_tag, "a").await;
+    let pod_b = _pg_store_in_schema(schema_tag, "b").await;
+    let scope = scope("t-k06pods", "sess-k06pods-1");
+
+    // Pod A appends events.
+    for i in 1u64..=3 {
+        let mut uow = pod_a.begin();
+        uow.append_event(NewSessionEvent {
+            scope: scope.clone(),
+            event_id: format!("ev-{i}"),
+            causation_id: None,
+            payload: serde_json::json!({"seq": i}),
+        });
+        uow.commit().await.unwrap();
+    }
+
+    // Pod B reads the same events (canonical sequence from PG).
+    let from_a = pod_a
+        .events_after(&scope, None)
+        .await
+        .expect("pod a replay");
+    let from_b = pod_b
+        .events_after(&scope, None)
+        .await
+        .expect("pod b replay");
+    assert_eq!(from_a.len(), from_b.len());
+    assert_eq!(
+        from_a.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        from_b.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        "pods see the same canonical event sequence"
+    );
+    assert_eq!(
+        from_a.iter().map(|e| &e.event_id).collect::<Vec<_>>(),
+        from_b.iter().map(|e| &e.event_id).collect::<Vec<_>>(),
+        "pods see the same event ids"
+    );
+}

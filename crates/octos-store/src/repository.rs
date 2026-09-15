@@ -486,6 +486,27 @@ pub trait RecoveryStore: Send + Sync {
         expected_old_revision: Option<&str>,
         new_revision: &str,
     ) -> impl std::future::Future<Output = Result<String, RepositoryError>> + Send;
+
+    /// K06: enumerate session events with `seq > after_seq`, ordered by
+    /// seq ascending. The WS reconnect / resync path calls this to
+    /// replay events the client missed while disconnected. A client
+    /// that reconnects to a different Pod (or the same Pod after a
+    /// restart) sees the same canonical event sequence — the PG
+    /// `session_events` table is the durable truth source, not the
+    /// in-memory ledger on whichever Pod the client happened to be
+    /// connected to before.
+    ///
+    /// `after_seq = None` returns all events for the scope (full
+    /// replay). `after_seq = Some(n)` returns only events with
+    /// `seq > n` (incremental replay from the client's last-acked
+    /// seq). The caller is expected to pass its last-acked seq; the
+    /// first event in the returned Vec is the first event the client
+    /// missed.
+    fn events_after(
+        &self,
+        scope: &Scope,
+        after_seq: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<Vec<SessionEvent>, RepositoryError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,6 +1120,26 @@ impl RecoveryStore for LocalStore {
         // same in one transaction.
         self.cas_workspace_revision(scope, run_id, expected_old_revision, new_revision)
             .await
+    }
+
+    async fn events_after(
+        &self,
+        scope: &Scope,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<SessionEvent>, RepositoryError> {
+        // K06: enumerate events with seq > after_seq, ordered by seq
+        // ascending. The Local adapter holds events in a Vec per scope,
+        // appended in order — a linear scan with a filter is correct
+        // (the per-scope event count is bounded by the message count
+        // in a single-tenant deployment).
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let key = ScopeKey::from(scope);
+        let events = inner.events.get(&key).cloned().unwrap_or_default();
+        let filtered: Vec<SessionEvent> = match after_seq {
+            None => events,
+            Some(n) => events.into_iter().filter(|e| e.seq > n).collect(),
+        };
+        Ok(filtered)
     }
 }
 
