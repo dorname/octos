@@ -1068,3 +1068,95 @@ async fn pg_k16_dump_restore_round_trip_on_real_pg() {
     assert_eq!(messages[0].message_id, "m-1");
     assert_eq!(messages_dst[0].message_id, "m-1");
 }
+
+// --- c2 K05 cross-pod restart: pending approval survives originator death
+// and can be decided by a fresh pod that joins the same PG schema (real
+// cluster topology).
+//
+// specs/task-c2-persistence-boundary-postgres.spec.md Rule
+// approval-durability requires: "实例 A 持久化 pending 审批后终止; 实例 B
+// 收到批准决定" — K05. This test pins the storage-level invariant: the
+// durable record written by pod A is visible to a fresh pod B connection,
+// and the reply CAS on pod B succeeds against the same (scope,
+// approval_id) primary key. The in-process PendingApprovalStore path is
+// tested separately by the cli crate (LocalApprovalDurable, fail-closed
+// recovery); this PG test pins the durable layer alone.
+
+#[tokio::test]
+async fn pg_k05_approval_pending_survives_originator_restart() {
+    use octos_store::repository::{ApprovalDecision, NewApproval, RepositoryError, UnitOfWork};
+
+    let schema_tag = "k05cross";
+    let pod_a = _pg_store_in_schema(schema_tag, "a").await;
+    let k05_scope = scope("t-k05", "sess-k05-1");
+
+    // Pod A: persist a pending approval then "dies" — the connection is
+    // dropped. The record lives in PG only.
+    let mut uow = pod_a.begin();
+    uow.create_approval(NewApproval {
+        scope: k05_scope.clone(),
+        approval_id: "ap-k05-1".into(),
+        originating_run: "run-k05".into(),
+        args_hash: "sha256:args-k05".into(),
+        binding_revision: "rev-k05".into(),
+    });
+    uow.commit().await.unwrap();
+    drop(pod_a);
+
+    // Pod B: a fresh PgStore on the same PG schema (real cluster topology).
+    let pod_b = _pg_store_in_schema(schema_tag, "b").await;
+
+    // The pending approval is visible from pod B's connection.
+    let pending = pod_b
+        .approval_async(&k05_scope, "ap-k05-1")
+        .await
+        .expect("pending approval visible to pod B");
+    assert_eq!(
+        pending.state,
+        octos_store::repository::ApprovalState::Pending
+    );
+    assert_eq!(pending.originating_run, "run-k05");
+    assert_eq!(pending.args_hash, "sha256:args-k05");
+    assert_eq!(pending.binding_revision, "rev-k05");
+
+    // Pod B decides the approval via the durable CAS.
+    let decision = pod_b
+        .reply_approval_async(
+            &k05_scope,
+            "ap-k05-1",
+            "sha256:args-k05",
+            ApprovalDecision::Approved,
+        )
+        .await
+        .expect("CAS reply by pod B");
+    assert_eq!(decision, octos_store::repository::ApprovalState::Decided);
+
+    // A second pod B reply is rejected as AlreadyDecided — the durable
+    // record is the source of truth and there is exactly one winner.
+    let replay = pod_b
+        .reply_approval_async(
+            &k05_scope,
+            "ap-k05-1",
+            "sha256:args-k05",
+            ApprovalDecision::Approved,
+        )
+        .await;
+    assert!(
+        matches!(replay, Err(RepositoryError::AlreadyDecided)),
+        "K05: CAS rejects replay from same pod"
+    );
+    // And a cross-pod cross-scope CAS is rejected as NotFound (RLS).
+    let other_scope = scope("t-k05-other", "sess-k05-2");
+    let cross = pod_b
+        .reply_approval_async(
+            &other_scope,
+            "ap-k05-1",
+            "sha256:args-k05",
+            ApprovalDecision::Approved,
+        )
+        .await;
+    assert!(
+        matches!(cross, Err(RepositoryError::NotFound)),
+        "K05: cross-scope CAS rejected"
+    );
+}
