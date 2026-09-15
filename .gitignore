@@ -197,3 +197,4 @@ tsconfig.tsbuildinfo
 # `git add -A` here otherwise sweeps hundreds of artifact files — and any
 # workspace dirs the soaks `git init` — into a commit.
 /scratchpad/
+specs/task-c5-cron-durable-firing.spec.md
