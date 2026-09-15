@@ -1497,7 +1497,7 @@ impl PgStore {
         // literals like `{"s":"x"}` then trip the parser.
         use futures::StreamExt;
         use sqlx::Executor as _;
-        let mut conn = &mut *tx;
+        let conn = &mut *tx;
         let mut stream = conn.execute_many(cleaned.as_str());
         while let Some(r) = stream.next().await {
             r.map_err(|e| RepositoryError::Other(format!("restore: {e}")))?;
