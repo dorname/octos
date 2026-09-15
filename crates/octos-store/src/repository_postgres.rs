@@ -1229,8 +1229,13 @@ impl RecoveryStore for PgStore {
             .map_err(|e| RepositoryError::Other(format!("cas begin: {e}")))?;
         set_tenant(&mut tx, &t).await?;
         // Read the latest checkpoint's revision and current step.
+        // FOR UPDATE locks the row so a concurrent CAS sees the
+        // post-commit revision (or blocks until the first committer
+        // finishes) — without the lock two concurrent transactions
+        // both read "rev-1", both pass the predicate, and both
+        // UPDATE successfully (K08 silent overwrite).
         let row = sqlx::query(
-            "SELECT step, workspace_revision              FROM run_checkpoints              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4                AND run_id=$5              ORDER BY step DESC LIMIT 1",
+            "SELECT step, workspace_revision              FROM run_checkpoints              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4                AND run_id=$5              ORDER BY step DESC LIMIT 1              FOR UPDATE",
         )
         .bind(&t).bind(&p).bind(&w).bind(&s).bind(run_id)
         .fetch_optional(&mut *tx)
