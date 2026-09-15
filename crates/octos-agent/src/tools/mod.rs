@@ -804,6 +804,8 @@ pub use registry::ToolRegistry;
 // Tool policy
 pub mod policy;
 pub use policy::{PolicyDecision, ToolPolicy, keep_tool_in_slides_session};
+pub mod idempotent;
+pub use idempotent::{IdempotentToolExecutor, SideEffectLedger, SideEffectVerdict};
 
 // Shared dispatch-policy gate (#714 / #713) re-exported from the
 // crate root so [`SpawnTool::with_dispatch_policy`] callers can pull

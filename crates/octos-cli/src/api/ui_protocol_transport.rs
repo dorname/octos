@@ -22369,6 +22369,45 @@ async fn handle_turn_start_with_accept(
             state: turn_state.clone(),
         },
     );
+
+    // UPCR-2026-030 (c1): bind the authenticated identity + wire session to
+    // an authoritative cluster Scope and expose the run's server-allocated
+    // `run_id` on the accept reply (additive — absent `run_id` stays valid
+    // for older clients). The scope is bound once here; downstream
+    // ledger/registry reads keep their existing SessionKey identity until
+    // c2 switches them to Scope keys. Tenant/profile come ONLY from the
+    // authenticated connection, never from a client payload. Binding never
+    // blocks a valid turn: on scope-binding failure the accept simply omits
+    // `run_id`.
+    let accept_result = {
+        let tenant_id = connection_profile_id.or(routed_profile_id);
+        match tenant_id {
+            Some(tenant) => {
+                let thread_id = turn_id.0.to_string();
+                match super::execution_context::open_turn_scope(
+                    tenant,
+                    &profile_for_stamp,
+                    &session_id,
+                    &thread_id,
+                    None,
+                ) {
+                    Ok(ctx) => {
+                        let mut v = accept_result;
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "run_id".to_string(),
+                                Value::String(ctx.execution.run_id().to_string()),
+                            );
+                        }
+                        v
+                    }
+                    Err(_) => accept_result,
+                }
+            }
+            None => accept_result,
+        }
+    };
+
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {

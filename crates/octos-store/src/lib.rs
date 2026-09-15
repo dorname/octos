@@ -12,6 +12,9 @@ pub mod admin_audit_store;
 pub mod admin_token_store;
 pub mod approvals_audit;
 pub mod login_allowlist;
+pub mod repository;
+#[cfg(feature = "postgres")]
+pub mod repository_postgres;
 pub mod setup_state_store;
 pub mod smtp_secret_store;
 pub mod usage_ledger;

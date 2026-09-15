@@ -22,14 +22,21 @@ tokio = { workspace = true }
 # octos-cli, not workspace deps).
 getrandom = "0.2"
 constant_time_eq = "0.3"
+# c2: PostgreSQL backend for the repository contract (feature-gated so the
+# single-node local adapter build carries no PG dependency).
+sqlx = { workspace = true, optional = true }
 
 [features]
 # Exposes test-only helpers (e.g. `approvals_audit::read_audit_lines`) to
 # downstream crates' test builds. Never enable in production.
 test-util = []
+# PostgreSQL repository backend (`repository::postgres`).
+postgres = ["dep:sqlx"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The real-PG integration suite manages per-test schemas directly.
+sqlx = { workspace = true, features = ["postgres"] }
 
 [lints]
 workspace = true

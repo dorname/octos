@@ -669,6 +669,18 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
+        // c2 cluster mode: when `DATABASE_URL` is set, serve runs against
+        // PostgreSQL and approvals become durable (the in-process oneshot is
+        // only the wake-up accelerator). Wired BEFORE any connection can park
+        // an approval. Single-node serve (no DATABASE_URL) stays in-process.
+        #[cfg(feature = "postgres")]
+        {
+            if let Ok(url) = std::env::var("DATABASE_URL") {
+                if !url.trim().is_empty() {
+                    crate::commands::serve_cluster::attach_durable_approvals_pg(&url).await?;
+                }
+            }
+        }
         let cwd = match &self.cwd {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,

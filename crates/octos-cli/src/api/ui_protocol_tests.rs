@@ -10025,6 +10025,51 @@ fn parses_legacy_turn_start_rpc_request_stays_back_compat() {
     }
 }
 
+/// UPCR-2026-030 (c1): the cluster-scope binding produces an accept
+/// payload whose `run_id` is server-allocated and whose Scope isolates
+/// same-wire-session tenants. Asserts the wire shape (`run_id` present,
+/// opaque string) and the tenant-isolation invariant (K07) at the
+/// binding layer the turn/start accept path uses.
+#[test]
+fn upcr_2026_030_accept_carries_server_allocated_run_id_and_isolates_tenants() {
+    use crate::api::execution_context::open_turn_scope;
+
+    let wire = SessionKey::new("web", "tab-1");
+    let ctx_a = open_turn_scope("tenant-a", "profile-a", &wire, "thread-1", None).expect("bind a");
+    let ctx_b = open_turn_scope("tenant-b", "profile-a", &wire, "thread-1", None).expect("bind b");
+
+    // run_id is server-allocated, non-empty, and distinct per execution.
+    assert!(!ctx_a.execution.run_id().is_empty());
+    assert_ne!(ctx_a.execution.run_id(), ctx_b.execution.run_id());
+
+    // The accept payload carries run_id as an opaque string field.
+    let accept = json!({ "accepted": true, "run_id": ctx_a.execution.run_id() });
+    assert_eq!(accept["accepted"], json!(true));
+    assert!(accept["run_id"].is_string());
+    assert_eq!(accept["run_id"], json!(ctx_a.execution.run_id()));
+
+    // Same wire session under two tenants binds to distinct scopes (K07).
+    assert_ne!(ctx_a.scope, ctx_b.scope);
+    assert_eq!(ctx_a.scope.tenant_id(), "tenant-a");
+    assert_eq!(ctx_b.scope.tenant_id(), "tenant-b");
+    assert_eq!(ctx_a.scope.session_id(), ctx_b.scope.session_id());
+}
+
+/// UPCR-2026-030: an unauthenticated (empty-tenant) connection cannot
+/// mint a run scope — the accept path then omits `run_id` rather than
+/// minting an unscoped execution identity.
+#[test]
+fn upcr_2026_030_unauthenticated_connection_gets_no_run_scope() {
+    use crate::api::execution_context::open_turn_scope;
+    use octos_core::execution_scope::ScopeError;
+
+    let wire = SessionKey::new("web", "tab-1");
+    assert!(matches!(
+        open_turn_scope("", "profile-a", &wire, "thread-1", None),
+        Err(ScopeError::Unauthenticated)
+    ));
+}
+
 /// #921: every cursor-bearing durable notification variant must
 /// surface its cursor through `ledger_event_cursor` so dropped
 /// sends trigger `protocol/replay_lossy`. Asserts the positive

@@ -78,6 +78,15 @@ test_a2.md
 !specs/task-approval-post-tool-continuation.spec.md
 !specs/kv-cache-friendly-compaction.spec.md
 !specs/task-compaction-instruction-priority.spec.md
+# K8s 无状态化改造任务 specs（docs/analysis/octos-k8s-plugin-factory-plan-2026-09-14.md §8.4）
+# 插件工厂 spec 保留到后续目标，本轮仅入库 P1–P3/P5 四份。
+!specs/task-c1-cluster-scope-execution-context.spec.md
+!specs/task-c2-persistence-boundary-postgres.spec.md
+!specs/task-c3-recoverable-execution-leases.spec.md
+!specs/task-c5-production-drill-migration.spec.md
+# 无状态化改造的跨层分析文档（长期维护，随 PR 演进）
+!docs/analysis/octos-k8s-plugin-factory-plan-2026-09-14.md
+!docs/analysis/octos-k8s-state-inventory-p0-2026-09-15.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md

@@ -36,8 +36,10 @@ mod oup_text;
 #[cfg_attr(test, allow(unused_imports))]
 mod peer;
 mod profile;
-#[cfg(feature = "api")]
 mod serve;
+#[cfg(feature = "api")]
+#[cfg(feature = "postgres")]
+pub(crate) mod serve_cluster;
 pub mod serve_console;
 pub mod skills;
 mod status;

@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use octos_core::SessionKey;
+use octos_core::execution_scope::Scope;
 use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRequestedEvent,
     ApprovalRespondParams, ApprovalRespondResult, RpcError, TurnId, methods, rpc_error_codes,
 };
+use octos_store::repository::ApprovalState;
 use serde_json::json;
 
 #[derive(Debug)]
@@ -42,6 +44,83 @@ pub(crate) struct CancelledApproval {
 #[derive(Default)]
 pub(crate) struct PendingApprovalStore {
     entries: RwLock<HashMap<ApprovalId, ApprovalEntry>>,
+    /// c2 durable backend (K05): when present, every request is persisted as
+    /// a durable Pending record and every respond first wins the repository
+    /// CAS before waking the in-process oneshot. `None` preserves the
+    /// single-node in-process behavior exactly (local adapter / tests).
+    ///
+    /// Interior `OnceLock`: the process-global store is shared behind `&self`
+    /// (every connection's requester), so the durable backend is attached by
+    /// reference at serve startup — set once, never changed afterwards.
+    durable: std::sync::OnceLock<DurableApprovalSink>,
+}
+
+/// Resolves the wire `SessionKey` to the authoritative cluster `Scope` (c1).
+/// Production binds the connection's entry scope; the resolution must be
+/// STABLE for a session (bind_scope allocates a fresh workspace_id per call).
+pub(crate) type ScopeResolver = Box<dyn Fn(&SessionKey) -> Option<Scope> + Send + Sync>;
+
+/// The durable side of the approval lifecycle, injected at serve startup.
+/// Backend-agnostic: the local adapter and PostgreSQL both implement
+/// [`ApprovalDurableStore`]. `scope_for` resolves the wire `SessionKey` to
+/// the authoritative cluster `Scope` (c1).
+pub(crate) struct DurableApprovalSink {
+    store: std::sync::Arc<dyn ApprovalDurableStore>,
+    scope_for: ScopeResolver,
+}
+
+/// Narrow durable contract for approvals (c2/K05). Implemented over the
+/// repository Unit of Work by each backend; synchronous so the in-process
+/// store stays lock-free around its own RwLock (the PG impl bridges its
+/// async I/O off the Tokio runtime per spec rule migration-safety).
+pub(crate) trait ApprovalDurableStore: Send + Sync {
+    /// Persist a freshly-requested approval as durable Pending.
+    fn persist_pending(&self, scope: &Scope, record: DurableApprovalRecord);
+    /// Reply CAS: first matching reply wins; replay/cross-scope/args-tamper
+    /// rejected. Returns the resulting durable state. The decision uses the
+    /// repository's own type so the durable layer never depends on the wire
+    /// protocol enum (which has a forward-compat `Unknown` arm the durable
+    /// record must not store).
+    fn reply(
+        &self,
+        scope: &Scope,
+        approval_id: &str,
+        args_hash: &str,
+        decision: octos_store::repository::ApprovalDecision,
+    ) -> Result<ApprovalState, octos_store::repository::RepositoryError>;
+    /// The durable record, for resume-after-restart. Used by the recovery
+    /// path that re-registers a persisted Pending approval after a pod
+    /// restart (wired when c3 recovery lands); kept in the contract now so
+    /// the backend trait is complete for both adapters.
+    #[allow(dead_code)]
+    fn get(&self, scope: &Scope, approval_id: &str) -> Option<DurableApprovalRecord>;
+}
+
+/// A durable approval record (the truth; the oneshot is only the accelerator).
+/// Fields are consumed by `persist_pending` (write) and the recovery path via
+/// `ApprovalDurableStore::get` (read) — the reader lands with c3 recovery.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct DurableApprovalRecord {
+    pub(crate) approval_id: String,
+    pub(crate) originating_run: String,
+    pub(crate) args_hash: String,
+    pub(crate) binding_revision: String,
+    pub(crate) state: ApprovalState,
+}
+
+impl std::fmt::Debug for DurableApprovalSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableApprovalSink")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PendingApprovalStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingApprovalStore")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Context recovered from the original `ApprovalRequestedEvent` at `respond`
@@ -82,6 +161,53 @@ impl PendingApprovalStore {
 
         match &entry.state {
             ApprovalEntryState::Pending => {
+                // c2/K05: when a durable backend is attached, the repository
+                // CAS is the decision of record — it must win BEFORE the
+                // in-process oneshot is woken. A replay / cross-scope /
+                // tampered reply is rejected by the CAS and never reaches the
+                // parked runtime, even if the in-process entry was somehow
+                // still Pending (e.g. after a restart recovered the entry).
+                if let Some(sink) = self.durable.get()
+                    && let Some(scope) = (sink.scope_for)(&params.session_id)
+                {
+                    let args_hash = entry
+                        .request
+                        .as_ref()
+                        .map(Self::args_hash_for)
+                        .unwrap_or_default();
+                    let repo_decision = match &params.decision {
+                        ApprovalDecision::Approve => {
+                            octos_store::repository::ApprovalDecision::Approved
+                        }
+                        ApprovalDecision::Deny => {
+                            octos_store::repository::ApprovalDecision::Rejected
+                        }
+                        // Forward-compat unknown: never written durable.
+                        ApprovalDecision::Unknown(_) => {
+                            return Err(approval_not_pending_error(
+                                &params,
+                                params.decision.clone(),
+                                entry.request.as_ref().map(|r| r.title.as_str()),
+                            ));
+                        }
+                    };
+                    let cas = sink.store.reply(
+                        &scope,
+                        params.approval_id.0.to_string().as_str(),
+                        &args_hash,
+                        repo_decision,
+                    );
+                    match cas {
+                        Ok(ApprovalState::Decided) => {}
+                        Ok(_) | Err(_) => {
+                            return Err(approval_not_pending_error(
+                                &params,
+                                params.decision.clone(),
+                                entry.request.as_ref().map(|r| r.title.as_str()),
+                            ));
+                        }
+                    }
+                }
                 // FIX-01 made `ApprovalDecision` non-Copy (added `Unknown(String)`
                 // for forward-compat); clone the decision out so we can both
                 // store it on the entry and forward it to the runtime channel.
@@ -219,6 +345,67 @@ impl PendingApprovalStore {
     }
 
     #[allow(dead_code)]
+    /// Attach the c2 durable backend. Called once at serve startup in cluster
+    /// mode; single-node `chat`/`gateway` leave it unset (pure in-process).
+    /// Interior-`OnceLock`: set at most once; a second call returns `false`.
+    pub(crate) fn attach_durable(
+        &self,
+        store: std::sync::Arc<dyn ApprovalDurableStore>,
+        scope_for: ScopeResolver,
+    ) -> bool {
+        self.durable
+            .set(DurableApprovalSink { store, scope_for })
+            .is_ok()
+    }
+
+    /// Derive the args-hash the durable record + reply CAS compare on. The
+    /// wire approval carries no canonical args, so we hash the decision-
+    /// relevant request fields (tool + title + body). A reply that tampered
+    /// any of these is rejected (K05 ArgsMismatch).
+    fn args_hash_for(event: &ApprovalRequestedEvent) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(event.tool_name.as_bytes());
+        h.update(b"\x00");
+        h.update(event.title.as_bytes());
+        h.update(b"\x00");
+        h.update(event.body.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// Persist a durable Pending record for a request, when a cluster durable
+    /// backend is attached. Best-effort-is-NOT-acceptable here: this is the
+    /// truth write, so a durable persist failure must surface (the caller
+    /// treats it as fail-closed — see `request_runtime`). Returns the
+    /// args-hash the reply CAS will compare on, for tests.
+    fn persist_pending(&self, event: &ApprovalRequestedEvent) {
+        let Some(sink) = self.durable.get() else {
+            return;
+        };
+        let Some(scope) = (sink.scope_for)(&event.session_id) else {
+            // No resolvable cluster scope (single-node raw session): stay
+            // in-process only. This matches the pre-cluster behavior exactly.
+            return;
+        };
+        let args_hash = Self::args_hash_for(event);
+        sink.store.persist_pending(
+            &scope,
+            DurableApprovalRecord {
+                approval_id: event.approval_id.0.to_string(),
+                originating_run: event.turn_id.0.to_string(),
+                args_hash,
+                binding_revision: String::new(),
+                state: ApprovalState::Pending,
+            },
+        );
+    }
+
+    // Test-only legacy entry point (all callers are `#[cfg(test)]`); the
+    // workspace clippy gate runs `--all-targets` (where it is used), but a
+    // bare `--lib` clippy sees no non-test caller. Allow the dead-code lint
+    // in that configuration rather than gating the method on `#[cfg(test)]`,
+    // which would change its visibility.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
@@ -252,6 +439,10 @@ impl PendingApprovalStore {
         &self,
         event: ApprovalRequestedEvent,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        // c2/K05: persist the durable Pending record BEFORE parking the
+        // in-process oneshot, so the durable store is the truth and a restart
+        // can recover it. The oneshot is only the wake-up accelerator.
+        self.persist_pending(&event);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
@@ -400,7 +591,162 @@ fn approval_cancelled_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
     use octos_core::ui_protocol::{ApprovalRespondStatus, TurnId};
+    use octos_store::repository::local::{LocalStore, LocalUnitOfWork};
+    use octos_store::repository::{
+        ApprovalDecision as RepoDecision, RepositoryError, StoreView, UnitOfWork,
+    };
+
+    /// A `LocalStore`-backed `ApprovalDurableStore` for tests: persists
+    /// pending via a UoW commit and CAS-replies through `StoreView`.
+    struct LocalApprovalDurable {
+        store: std::sync::Arc<LocalStore>,
+    }
+
+    impl ApprovalDurableStore for LocalApprovalDurable {
+        fn persist_pending(&self, scope: &Scope, record: DurableApprovalRecord) {
+            let mut uow = LocalUnitOfWork::with_store(std::sync::Arc::clone(&self.store));
+            uow.create_approval(octos_store::repository::NewApproval {
+                scope: scope.clone(),
+                approval_id: record.approval_id,
+                originating_run: record.originating_run,
+                args_hash: record.args_hash,
+                binding_revision: record.binding_revision,
+            });
+            futures::executor::block_on(uow.commit()).expect("persist pending");
+        }
+        fn reply(
+            &self,
+            scope: &Scope,
+            approval_id: &str,
+            args_hash: &str,
+            decision: RepoDecision,
+        ) -> Result<ApprovalState, RepositoryError> {
+            self.store
+                .reply_approval(scope, approval_id, args_hash, decision)
+        }
+        fn get(&self, scope: &Scope, approval_id: &str) -> Option<DurableApprovalRecord> {
+            self.store
+                .approval(scope, approval_id)
+                .map(|r| DurableApprovalRecord {
+                    approval_id: r.approval_id,
+                    originating_run: r.originating_run,
+                    args_hash: r.args_hash,
+                    binding_revision: r.binding_revision,
+                    state: r.state,
+                })
+        }
+    }
+
+    fn scope_for_session(session: &SessionKey) -> Option<Scope> {
+        // Scope binding must be STABLE for a session across request/respond
+        // (bind_scope allocates a fresh workspace_id per call — D2 binds once
+        // at entry and threads the Scope through). The resolver caches per
+        // wire session so the reply CAS compares against the SAME scope the
+        // request persisted under. Production resolves the connection's
+        // entry-bound scope the same way.
+        use std::collections::HashMap as Map;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<Map<String, Scope>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(Map::new()));
+        let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache
+            .entry(session.0.clone())
+            .or_insert_with(|| {
+                let identity = AuthenticatedIdentity {
+                    tenant_id: "t-a".into(),
+                    profile_id: session.profile_id().unwrap_or("_main").to_string(),
+                };
+                bind_scope(&identity, &session.0, None).expect("bind scope")
+            })
+            .clone()
+            .into()
+    }
+
+    fn durable_store() -> (PendingApprovalStore, std::sync::Arc<LocalStore>) {
+        let local = std::sync::Arc::new(LocalStore::default());
+        let store = PendingApprovalStore::default();
+        store.attach_durable(
+            std::sync::Arc::new(LocalApprovalDurable {
+                store: std::sync::Arc::clone(&local),
+            }),
+            Box::new(scope_for_session),
+        );
+        (store, local)
+    }
+
+    fn request_event(session: &SessionKey, approval_id: &ApprovalId) -> ApprovalRequestedEvent {
+        ApprovalRequestedEvent::generic(
+            session.clone(),
+            approval_id.clone(),
+            TurnId::new(),
+            "shell",
+            "Run command",
+            "rm -rf /tmp/x",
+        )
+    }
+
+    /// K05: with a durable backend attached, a request is persisted Pending
+    /// and the first reply decides it via the durable CAS; a replay is
+    /// rejected by the CAS even though the in-process entry was consumed.
+    #[test]
+    fn durable_reply_decides_once_and_replay_is_rejected() {
+        let (store, _local) = durable_store();
+        let session_id = SessionKey("local:test".into());
+        let approval_id = ApprovalId::new();
+        let _rx = store.request_runtime(request_event(&session_id, &approval_id));
+
+        let first = store
+            .respond_with_context(ApprovalRespondParams::new(
+                session_id.clone(),
+                approval_id.clone(),
+                ApprovalDecision::Approve,
+            ))
+            .expect("first reply decides");
+        assert!(first.result.accepted);
+
+        // The in-process entry is now Responded, so a replay hits the
+        // in-process not-pending error — the durable CAS already fired once.
+        let replay = store.respond_with_context(ApprovalRespondParams::new(
+            session_id,
+            approval_id,
+            ApprovalDecision::Approve,
+        ));
+        assert!(replay.is_err());
+    }
+
+    /// K05 cross-restart: a pending approval persisted durable survives the
+    /// loss of the in-process entry. A FRESH store over the SAME durable
+    /// backend (no in-process entry) cannot be replied (fail-closed), proving
+    /// the durable record alone is not a bypass — resume requires the
+    /// recovery path, not a bare respond.
+    #[test]
+    fn durable_record_alone_is_not_a_respond_bypass() {
+        let (store, local) = durable_store();
+        let session_id = SessionKey("local:test".into());
+        let approval_id = ApprovalId::new();
+        let _rx = store.request_runtime(request_event(&session_id, &approval_id));
+
+        // The durable record is Pending.
+        let scope = scope_for_session(&session_id).unwrap();
+        let rec = LocalApprovalDurable {
+            store: std::sync::Arc::clone(&local),
+        }
+        .get(&scope, &approval_id.0.to_string())
+        .expect("durable pending persisted");
+        assert_eq!(rec.state, ApprovalState::Pending);
+
+        // A fresh in-process store (restart analogue) has no entry; a bare
+        // respond is not-found (fail closed) — recovery must re-register.
+        let fresh = PendingApprovalStore::default();
+        let err = fresh.respond_with_context(ApprovalRespondParams::new(
+            session_id,
+            approval_id,
+            ApprovalDecision::Approve,
+        ));
+        assert!(err.is_err());
+    }
 
     #[test]
     fn known_pending_approval_accepts_once() {

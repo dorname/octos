@@ -52,6 +52,18 @@ unsafe_code = "deny"
 [workspace.dependencies]
 # #2234/45c — echo-free interactive secret input (safe termios wrapper; the workspace denies unsafe_code, blocking a hand-rolled termios arm)
 rpassword = "7"
+# c2 persistence boundary (ADR cluster-state-and-execution D1): PostgreSQL
+# backend for the octos-store repository contract. Runtime-tokio + rustls,
+# no compile-time query macros (offline/CI-friendly; queries are checked by
+# the real-DB integration suite instead of `query!`).
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }
 # Internal crates
 octos-core = { path = "crates/octos-core" }
 octos-diagnostics = { path = "crates/octos-diagnostics" }
