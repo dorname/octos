@@ -45,6 +45,11 @@ pub enum RepositoryError {
     ArgsMismatch,
     /// The lease epoch carried by the write is stale (c3 fencing).
     StaleEpoch,
+    /// The workspace revision carried by the write does not match the
+    /// current latest checkpoint's revision (K08: parallel-run
+    /// workspace conflict — the loser must branch or retry, never
+    /// silently overwrite).
+    StaleRevision,
     /// Anything else; carries a human-readable message.
     Other(String),
 }
@@ -57,6 +62,7 @@ impl std::fmt::Display for RepositoryError {
             RepositoryError::AlreadyDecided => write!(f, "already decided"),
             RepositoryError::ArgsMismatch => write!(f, "args hash mismatch"),
             RepositoryError::StaleEpoch => write!(f, "stale epoch"),
+            RepositoryError::StaleRevision => write!(f, "stale workspace revision"),
             RepositoryError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -418,6 +424,33 @@ pub trait RecoveryStore: Send + Sync {
         run_id: &str,
         invocation_id: &str,
     ) -> impl std::future::Future<Output = Option<InvocationRecord>> + Send;
+
+    /// Compare-and-swap the workspace revision on the run's LATEST
+    /// checkpoint. The CAS predicate is `(scope, run_id,
+    /// expected_old_revision)`. `expected_old_revision` is the
+    /// revision the caller observed before mutating the workspace;
+    /// `new_revision` is what the caller wants to commit. Returns
+    /// the new (post-CAS) revision on success.
+    ///
+    /// Errors:
+    /// - [`RepositoryError::NotFound`]: no checkpoint exists for the run
+    ///   yet (caller must create one first via `commit_checkpoint`).
+    /// - [`RepositoryError::StaleRevision`]: the latest checkpoint's
+    ///   current revision does NOT match `expected_old_revision`
+    ///   (K08: a peer run already advanced the workspace; the caller
+    ///   must re-read the latest, branch, or fail — never silently
+    ///   overwrite).
+    ///
+    /// The CAS is implemented as `UPDATE ... WHERE workspace_revision =
+    /// $expected RETURNING ...` inside a transaction with the lease
+    /// epoch check (D5) so a stale-epoch writer cannot bypass it.
+    fn cas_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> impl std::future::Future<Output = Result<String, RepositoryError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +928,30 @@ impl RecoveryStore for LocalStore {
                 invocation_id.to_string(),
             ))
             .cloned()
+    }
+
+    async fn cas_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> Result<String, RepositoryError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (ScopeKey::from(scope), run_id.to_string());
+        let checkpoints = inner
+            .checkpoints
+            .get_mut(&key)
+            .ok_or(RepositoryError::NotFound)?;
+        // Latest checkpoint = the last entry (steps are appended in order).
+        let latest = checkpoints.last_mut().ok_or(RepositoryError::NotFound)?;
+        // K08: CAS predicate — current workspace_revision must match
+        // expected_old_revision exactly. None means "no prior revision".
+        if latest.workspace_revision.as_deref() != expected_old_revision {
+            return Err(RepositoryError::StaleRevision);
+        }
+        latest.workspace_revision = Some(new_revision.to_string());
+        Ok(new_revision.to_string())
     }
 }
 

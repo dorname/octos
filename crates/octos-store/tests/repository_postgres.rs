@@ -1230,3 +1230,97 @@ async fn pg_k05_pending_approvals_for_scope_lists_peer_originated() {
         "K05: RLS isolation — different tenant cannot enumerate peer approvals"
     );
 }
+
+// --- c5 K08: parallel-run workspace revision conflict resolution. -------
+// specs/plan §7.2 K08: "两个 run 修改同一 workspace revision: 一个成功
+// 发布或分支隔离；冲突不会悄悄覆盖". This test pins the storage-level
+// invariant: cas_workspace_revision is a hard CAS — two writers that both
+// observed R1 cannot both commit R2. The loser gets StaleRevision and
+// must branch (re-read the latest revision) or fail, never silently
+// overwrite.
+
+#[tokio::test]
+async fn pg_k08_workspace_revision_cas_rejects_stale_writer() {
+    use octos_store::repository::{LeaseStore, NewCheckpoint, RecoveryStore, RepositoryError};
+
+    let store = fresh_store("k08cas").await;
+    let scope = scope("t-k08", "sess-k08-1");
+    // Seed a run lease + initial checkpoint at revision R1.
+    store
+        .claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    store
+        .commit_checkpoint(NewCheckpoint {
+            scope: scope.clone(),
+            run_id: "run-1".into(),
+            step: 1,
+            transcript_highwater: 1,
+            context: None,
+            workspace_revision: Some("rev-1".into()),
+            pending_invocation: None,
+            artifact_refs: None,
+            binding_digest: None,
+            permission_snapshot: None,
+            digest: "sha256:cp-1".into(),
+            schema_version: "v1".into(),
+            runtime_version: "2.0.3".into(),
+            created_epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    // Writer A and writer B both observe rev-1 and try to commit rev-2.
+    let store_a = store.clone();
+    let sa = scope.clone();
+    let h_a = tokio::spawn(async move {
+        store_a
+            .cas_workspace_revision(&sa, "run-1", Some("rev-1"), "rev-2-a")
+            .await
+    });
+    let store_b = store.clone();
+    let sb = scope.clone();
+    let h_b = tokio::spawn(async move {
+        store_b
+            .cas_workspace_revision(&sb, "run-1", Some("rev-1"), "rev-2-b")
+            .await
+    });
+    let ra = h_a.await.unwrap();
+    let rb = h_b.await.unwrap();
+    let wins = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+    let stales = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, Err(RepositoryError::StaleRevision)))
+        .count();
+    assert_eq!(wins, 1, "K08: exactly one CAS winner");
+    assert_eq!(
+        stales, 1,
+        "K08: the other gets StaleRevision (no silent overwrite)"
+    );
+
+    // The winner's revision is the only one persisted.
+    let cur = store.latest_checkpoint(&scope, "run-1").await.expect("cp");
+    assert!(
+        cur.workspace_revision == Some("rev-2-a".into())
+            || cur.workspace_revision == Some("rev-2-b".into()),
+        "K08: latest checkpoint carries the CAS winner's revision"
+    );
+
+    // A subsequent CAS with the WRONG expected revision (the loser's
+    // assumption) is rejected — proving the loser must re-read.
+    let stale = store
+        .cas_workspace_revision(&scope, "run-1", Some("rev-1"), "rev-3")
+        .await;
+    assert!(
+        matches!(stale, Err(RepositoryError::StaleRevision)),
+        "K08: re-CAS with stale expected revision is rejected"
+    );
+
+    // But a CAS that uses the WINNER's revision as expected succeeds.
+    let winner_rev = cur.workspace_revision.clone().unwrap();
+    let after = store
+        .cas_workspace_revision(&scope, "run-1", Some(&winner_rev), "rev-3")
+        .await
+        .expect("CAS from winner revision succeeds");
+    assert_eq!(after, "rev-3");
+}

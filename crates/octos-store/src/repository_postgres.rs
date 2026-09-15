@@ -1157,6 +1157,55 @@ impl RecoveryStore for PgStore {
     ) -> Option<InvocationRecord> {
         self.pg_invocation_by_id(scope, run_id, invocation_id).await
     }
+
+    async fn cas_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> Result<String, RepositoryError> {
+        let (t, p, w, s) = scope_tuple(scope);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Other(format!("cas begin: {e}")))?;
+        set_tenant(&mut tx, &t).await?;
+        // Read the latest checkpoint's revision and current step.
+        let row = sqlx::query(
+            "SELECT step, workspace_revision              FROM run_checkpoints              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4                AND run_id=$5              ORDER BY step DESC LIMIT 1",
+        )
+        .bind(&t).bind(&p).bind(&w).bind(&s).bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("cas read: {e}")))?;
+        let Some(row) = row else {
+            let _ = tx.rollback().await;
+            return Err(RepositoryError::NotFound);
+        };
+        let cur: Option<String> = row.get("workspace_revision");
+        // K08 CAS predicate
+        if cur.as_deref() != expected_old_revision {
+            let _ = tx.rollback().await;
+            return Err(RepositoryError::StaleRevision);
+        }
+        let step: i64 = row.get("step");
+        // UPDATE the latest checkpoint row with the new revision. The
+        // (scope, run_id, step) PK ensures we touch exactly one row.
+        sqlx::query(
+            "UPDATE run_checkpoints SET workspace_revision=$1              WHERE tenant_id=$2 AND profile_id=$3 AND workspace_id=$4 AND session_id=$5                AND run_id=$6 AND step=$7",
+        )
+        .bind(new_revision)
+        .bind(&t).bind(&p).bind(&w).bind(&s).bind(run_id).bind(step)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("cas update: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        Ok(new_revision.to_string())
+    }
 }
 
 impl PgStore {
