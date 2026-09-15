@@ -75,15 +75,22 @@ firing、故障接管演练（强杀/SIGTERM 超时/节点删除）、备份恢�
 Scenario: 两个 Controller 同时扫到同一时间点（critical）
   Tags: critical, K10
   Test:
-    Package: octos-cli
+    Package: octos-store
     Filter: concurrent_cron_controllers_produce_single_firing
+  PG parity:
+    Package: octos-store
+    Filter: pg_concurrent_cron_controllers_produce_single_firing
+    Schema: real PG (k10 cron PG schema)
+  K18 cross-pod:
+    Package: octos-store
+    Filter: pg_k18_cron_durable_fires_only_one_pod_acks
   Given durable schedule 到达 fire 时间
   When 两个 Cron Controller 并发扫描
   Then 恰好一个 firing 记录与一个 run；另一实例因唯一约束让位
 
 Scenario: misfire 按策略补跑
   Test:
-    Package: octos-cli
+    Package: octos-store
     Filter: cron_misfire_policy_backfills_once
   Given Controller 停机错过 fire 时间
   When 恢复后扫描
@@ -147,11 +154,18 @@ Scenario: 从备份恢复 PG+对象存储后可打开历史（critical）
 Scenario: 强杀/SIGTERM 超时/节点删除（critical）
   Tags: critical, K17
   Test:
-    Package: octos-cli
-    Filter: pod_kill_sigterm_timeout_node_deletion_recovery_boundaries
-  Given 运行中的 API/Worker/Scheduler Pod
-  When 分别执行强杀、SIGTERM 超时强退、节点删除
-  Then 已确认业务状态不丢失；接管在约定边界内完成；不依赖 preStop
-       才能保数据
+    Package: octos-store
+    Filter: pg_k17_pod_failover_drill_takeover_recovery_audit
+  Given 运行中的 API/Worker/Scheduler Pod（PG 后端）
+  When pod A SIGKILL、pod B 调用 tick_takeover
+  Then lease + checkpoint 接管；pinned binding (K11) 保留；audit 跨 pod 一致
   Level: integration
-  Test Double: 真实多 Pod 故障注入环境
+  Test Double: 真实 PG16 docker (real cluster topology)
+
+  K09 跨任务 join-once:
+    Package: octos-cli
+    Filter: duplicate_child_terminal_joins_parent_once
+
+  K16 端到端 dump→restore:
+    Package: octos-store
+    Filter: pg_k16_dump_restore_round_trip_on_real_pg
