@@ -119,8 +119,14 @@ Scenario: 重启后消息/上下文/审批一致（critical）
 Scenario: 审批请求后杀掉原进程，从另一实例批准（critical）
   Tags: critical, K05
   Test:
+    Package: octos-store
+    Filter: pg_k05_approval_pending_survives_originator_restart
+  In-process CAS path:
     Package: octos-cli
-    Filter: approval_survives_originator_restart_and_cas_reply
+    Filter: durable_reply_decides_once_and_replay_is_rejected
+  Fail-closed restart path:
+    Package: octos-cli
+    Filter: durable_record_alone_is_not_a_respond_bypass
   Given 实例 A 持久化 pending 审批后终止
   When 实例 B 收到批准决定
   Then CAS 写入一次决策；重复回复、跨租户回复、参数变化的回复均被拒绝
