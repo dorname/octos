@@ -454,3 +454,52 @@ mod supervisor_tests {
         assert!(d3[0].recovered.is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// c5 N3: cluster cron service — CronServicePg wiring for multi-replica
+// deployments. When `DATABASE_URL` is set, `serve` can attach a PG-backed
+// cron service instead of the default sync `CronService` (LocalCronStore).
+// The sync `CronService` remains the single-process default; this is the
+// cluster counterpart.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+use octos_bus::cron_service_pg::CronServicePg;
+#[cfg(feature = "postgres")]
+use octos_store::repository::postgres::PgStore as CronPgStore;
+
+/// Attach a PG-backed cron service for cluster mode. Returns the
+/// `Arc<CronServicePg>` so the caller can register it on the tool
+/// registry and stash it on the runtime lifecycle. The caller is
+/// responsible for calling `start()` on the returned service (async).
+///
+/// `controller_id` is the unique id of this Pod / process — used by
+/// `claim_firing` to enforce K10 single-claim (two Pods racing the
+/// same firing produce one winner and one Conflict). A hostname or
+/// pod-name from the environment is the typical value.
+#[cfg(feature = "postgres")]
+pub async fn attach_cron_service_pg(
+    database_url: &str,
+    scope: &Scope,
+    controller_id: &str,
+    inbound_tx: tokio::sync::mpsc::Sender<octos_core::InboundMessage>,
+) -> Result<std::sync::Arc<CronServicePg>> {
+    let store = CronPgStore::connect(database_url)
+        .await
+        .wrap_err("connect cron PG store")?;
+    store.migrate().await.wrap_err("migrate cron schema")?;
+    let store: std::sync::Arc<dyn octos_bus::cron_service_pg::CronScheduleStoreObj> =
+        std::sync::Arc::new(store);
+    let svc = std::sync::Arc::new(CronServicePg::new(
+        store,
+        scope.clone(),
+        controller_id.to_string(),
+        inbound_tx,
+    ));
+    tracing::info!(
+        target = "octos::cluster",
+        controller_id,
+        "cron service attached (PostgreSQL)"
+    );
+    Ok(svc)
+}
