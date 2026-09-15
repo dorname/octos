@@ -300,6 +300,20 @@ pub struct NewCheckpoint {
     pub runtime_version: String,
     /// The lease epoch this checkpoint was written under (fencing, D5).
     pub created_epoch: u64,
+    /// K08 runtime wiring: when set, the checkpoint write is conditional
+    /// on the LATEST checkpoint's `workspace_revision` matching this
+    /// value (a CAS predicate). A concurrent committer that has already
+    /// advanced past `expected_old_workspace_revision` causes the write
+    /// to be rejected with [`RepositoryError::StaleRevision`] instead
+    /// of silently overwriting the workspace revision on the previous
+    /// step's row.
+    ///
+    /// `None` (the default for legacy callers) skips the check — the
+    /// commit writes `workspace_revision` unconditionally. This is the
+    /// behaviour every caller had before K08 wiring landed, so existing
+    /// call sites are unchanged. New runtime paths that want K08
+    /// guarantees set this to the revision they last observed.
+    pub expected_old_workspace_revision: Option<String>,
 }
 
 /// A stored checkpoint.
@@ -888,6 +902,22 @@ impl RecoveryStore for LocalStore {
             Some(lease) if lease.epoch == cp.created_epoch => {}
             Some(_) => return Err(RepositoryError::StaleEpoch),
             None => return Err(RepositoryError::NotFound),
+        }
+        // K08 runtime wiring (see NewCheckpoint::expected_old_workspace_revision).
+        // When set, the commit is rejected if the latest checkpoint for
+        // this run's workspace_revision does not match the caller's
+        // expectation. None skips the check (legacy behaviour).
+        if let Some(expected_old) = cp.expected_old_workspace_revision.as_deref() {
+            let cur_rev = inner
+                .checkpoints
+                .get(&(ScopeKey::from(&cp.scope), cp.run_id.clone()))
+                .and_then(|list| list.last())
+                .and_then(|c| c.workspace_revision.as_deref());
+            match cur_rev {
+                None => return Err(RepositoryError::StaleRevision),
+                Some(cur) if cur != expected_old => return Err(RepositoryError::StaleRevision),
+                Some(_) => {}
+            }
         }
         let key = (ScopeKey::from(&cp.scope), cp.run_id.clone());
         let list = inner.checkpoints.entry(key).or_default();

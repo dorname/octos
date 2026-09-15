@@ -907,6 +907,60 @@ impl RecoveryStore for PgStore {
             Some(_) => {}
         }
 
+        // K08 runtime wiring: when the caller provides an
+        // expected_old_workspace_revision, the commit is conditional on
+        // the LATEST checkpoint (any step) for this (scope, run_id)
+        // currently carrying that revision. A concurrent committer that
+        // has already advanced to a different revision causes the write
+        // to be rejected with StaleRevision — the loser's workspace
+        // state was based on a stale read, so the commit must re-read
+        // and retry. None means "no K08 check" (legacy behaviour).
+        //
+        // We only enforce the predicate when this checkpoint is NOT the
+        // first one for the run (an INSERT path); a brand-new run
+        // trivially has no latest, so any expected_old would be
+        // misleading and we accept it as a future error if the caller
+        // explicitly asks for a CAS on a non-existent latest.
+        if let Some(expected_old) = cp.expected_old_workspace_revision.as_deref() {
+            let latest: Option<(i64, Option<String>)> = sqlx::query(
+                "SELECT step, workspace_revision FROM run_checkpoints \
+                 WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+                   AND run_id=$5 \
+                 ORDER BY step DESC LIMIT 1",
+            )
+            .bind(&t)
+            .bind(&p)
+            .bind(&w)
+            .bind(&s)
+            .bind(&cp.run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::Other(format!("cas read: {e}")))?
+            .map(|r| {
+                (
+                    r.get::<i64, _>("step"),
+                    r.get::<Option<String>, _>("workspace_revision"),
+                )
+            });
+            match latest {
+                None => {
+                    // First checkpoint for this run. Caller asked for a
+                    // CAS predicate that requires a prior revision;
+                    // there is none — fail closed so the caller must
+                    // explicitly opt out by passing None on the seed
+                    // commit.
+                    let _ = tx.rollback().await;
+                    return Err(RepositoryError::StaleRevision);
+                }
+                Some((_step, cur_rev)) => {
+                    if cur_rev.as_deref() != Some(expected_old) {
+                        let _ = tx.rollback().await;
+                        return Err(RepositoryError::StaleRevision);
+                    }
+                }
+            }
+        }
+
         sqlx::query(
             "INSERT INTO run_checkpoints \
              (tenant_id, profile_id, workspace_id, session_id, run_id, step, transcript_highwater, \

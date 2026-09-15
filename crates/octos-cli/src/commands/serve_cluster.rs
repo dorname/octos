@@ -365,6 +365,7 @@ mod supervisor_tests {
                 schema_version: cp.schema_version.clone(),
                 runtime_version: cp.runtime_version.clone(),
                 created_epoch: 1,
+                expected_old_workspace_revision: None,
             })
             .await
             .unwrap();

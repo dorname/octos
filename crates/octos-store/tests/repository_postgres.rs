@@ -273,6 +273,7 @@ async fn pg_audit_two_stores_match_for_same_scope_after_dump_restore() {
         schema_version: "v1".into(),
         runtime_version: "2.0.3".into(),
         created_epoch: 1,
+        expected_old_workspace_revision: None,
     })
     .await
     .unwrap();
@@ -478,6 +479,7 @@ fn pg_cp(
         schema_version: "v1".into(),
         runtime_version: "2.0.3".into(),
         created_epoch: epoch,
+        expected_old_workspace_revision: None,
     }
 }
 
@@ -769,6 +771,7 @@ async fn pg_k17_pod_failover_drill_takeover_recovery_audit() {
             schema_version: "v1".into(),
             runtime_version: "2.0.3".into(),
             created_epoch: 1,
+            expected_old_workspace_revision: None,
         })
         .await
         .unwrap();
@@ -814,6 +817,7 @@ async fn pg_k17_pod_failover_drill_takeover_recovery_audit() {
             schema_version: "v1".into(),
             runtime_version: "2.0.3".into(),
             created_epoch: 2,
+            expected_old_workspace_revision: None,
         })
         .await
         .unwrap();
@@ -1024,6 +1028,7 @@ async fn pg_k16_dump_restore_round_trip_on_real_pg() {
         schema_version: "v1".into(),
         runtime_version: "2.0.3".into(),
         created_epoch: 1,
+        expected_old_workspace_revision: None,
     })
     .await
     .unwrap();
@@ -1301,6 +1306,7 @@ async fn pg_k08_workspace_revision_cas_rejects_stale_writer() {
             schema_version: "v1".into(),
             runtime_version: "2.0.3".into(),
             created_epoch: 1,
+            expected_old_workspace_revision: None,
         })
         .await
         .unwrap();
@@ -1627,6 +1633,7 @@ async fn pg_k08_runtime_bump_workspace_revision_succeeds_and_stale_loser() {
             schema_version: "v1".into(),
             runtime_version: "2.0.3".into(),
             created_epoch: 1,
+            expected_old_workspace_revision: None,
         })
         .await
         .unwrap();
@@ -1705,5 +1712,222 @@ async fn pg_k08_runtime_bump_with_no_checkpoint_returns_not_found() {
     assert!(
         matches!(r, Err(RepositoryError::NotFound)),
         "bump without a checkpoint returns NotFound, not StaleRevision"
+    );
+}
+
+// --- c5 K08 commit_checkpoint CAS wiring -------------------------------
+//
+// `commit_checkpoint` now accepts an `expected_old_workspace_revision`.
+// When set, the write is rejected with StaleRevision if the latest
+// checkpoint for the run does NOT carry that revision — the caller
+// observed a stale workspace state. When None (the default), the
+// legacy behaviour holds: the workspace_revision is written
+// unconditionally. This is the runtime wiring: K08 no longer lives
+// only behind `cas_workspace_revision` / `bump_workspace_revision`;
+// the orchestrator's checkpoint commit path is now the primary
+// enforcement surface.
+
+#[tokio::test]
+async fn pg_k08_commit_checkpoint_with_expected_old_rejects_stale_writer() {
+    use octos_store::repository::{LeaseStore, RecoveryStore};
+    let store = fresh_store("k08cp").await;
+    let scope = scope("t-k08cp", "sess-k08cp-1");
+
+    store
+        .claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+
+    // Worker-A and Worker-B both observed latest workspace_revision
+    // = "rev-1" (after seeding). They both try to commit step=2 with
+    // workspace_revision = "rev-2-{a,b}" and K08 expectation
+    // expected_old_workspace_revision = Some("rev-1").
+    //
+    // Seed first: a step=1 checkpoint at "rev-1".
+    store
+        .commit_checkpoint(NewCheckpoint {
+            scope: scope.clone(),
+            run_id: "run-1".into(),
+            step: 1,
+            transcript_highwater: 1,
+            context: None,
+            workspace_revision: Some("rev-1".into()),
+            pending_invocation: None,
+            artifact_refs: None,
+            binding_digest: None,
+            permission_snapshot: None,
+            digest: "sha256:d1".into(),
+            schema_version: "v1".into(),
+            runtime_version: "2.0.3".into(),
+            created_epoch: 1,
+            expected_old_workspace_revision: None,
+        })
+        .await
+        .expect("seed checkpoint at step=1 with rev-1");
+
+    // Worker-A: expected rev-1, commits rev-2-a at step=2. Should win.
+    let sa = scope.clone();
+    let store_a = store.clone();
+    let ha = tokio::spawn(async move {
+        store_a
+            .commit_checkpoint(NewCheckpoint {
+                scope: sa,
+                run_id: "run-1".into(),
+                step: 2,
+                transcript_highwater: 2,
+                context: None,
+                workspace_revision: Some("rev-2-a".into()),
+                pending_invocation: None,
+                artifact_refs: None,
+                binding_digest: None,
+                permission_snapshot: None,
+                digest: "sha256:d2a".into(),
+                schema_version: "v1".into(),
+                runtime_version: "2.0.3".into(),
+                created_epoch: 1,
+                expected_old_workspace_revision: Some("rev-1".into()),
+            })
+            .await
+    });
+
+    // Worker-B: same expected rev-1, commits rev-2-b at step=3.
+    // Concurrently racing with A — but A is at step=2, B at step=3,
+    // so PK does NOT collide. The K08 CAS predicate IS the gate:
+    // whoever lands second observes a different latest revision than
+    // they read and must fail.
+    let sb = scope.clone();
+    let store_b = store.clone();
+    let hb = tokio::spawn(async move {
+        store_b
+            .commit_checkpoint(NewCheckpoint {
+                scope: sb,
+                run_id: "run-1".into(),
+                step: 3,
+                transcript_highwater: 3,
+                context: None,
+                workspace_revision: Some("rev-2-b".into()),
+                pending_invocation: None,
+                artifact_refs: None,
+                binding_digest: None,
+                permission_snapshot: None,
+                digest: "sha256:d2b".into(),
+                schema_version: "v1".into(),
+                runtime_version: "2.0.3".into(),
+                created_epoch: 1,
+                expected_old_workspace_revision: Some("rev-1".into()),
+            })
+            .await
+    });
+
+    let ra = ha.await.unwrap();
+    let rb = hb.await.unwrap();
+
+    // One of the two CAS attempts must fail with StaleRevision; the
+    // other succeeds. The exact ordering depends on tokio's schedule,
+    // but the invariant — at most one writer that read rev-1 commits
+    // a new rev-2 — is what we assert.
+    let oks = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+    let stales = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, Err(RepositoryError::StaleRevision)))
+        .count();
+    assert_eq!(oks, 1, "exactly one of A/B wins the rev-1 -> rev-2-X race");
+    assert_eq!(
+        stales, 1,
+        "the loser gets StaleRevision (K08 no-silent-overwrite)"
+    );
+
+    // latest_checkpoint carries the winner's revision.
+    let cur = store
+        .latest_checkpoint(&scope, "run-1")
+        .await
+        .expect("checkpoint exists");
+    let winner_rev = cur.workspace_revision.clone().unwrap();
+    assert!(
+        winner_rev == "rev-2-a" || winner_rev == "rev-2-b",
+        "winner revision: {winner_rev}"
+    );
+}
+
+#[tokio::test]
+async fn pg_k08_commit_checkpoint_with_no_expected_old_skips_cas_check() {
+    // Legacy behaviour: callers that pass
+    // expected_old_workspace_revision: None must NOT be subject to the
+    // K08 check. Two consecutive commits with the same workspace
+    // revision, neither passing an expected_old, both succeed.
+    use octos_store::repository::{LeaseStore, RecoveryStore};
+    let store = fresh_store("k08cpleg").await;
+    let scope = scope("t-k08cpleg", "sess-k08cpleg-1");
+
+    store
+        .claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    for step in 1u64..=3 {
+        store
+            .commit_checkpoint(NewCheckpoint {
+                scope: scope.clone(),
+                run_id: "run-1".into(),
+                step,
+                transcript_highwater: step,
+                context: None,
+                workspace_revision: Some("rev-1".into()),
+                pending_invocation: None,
+                artifact_refs: None,
+                binding_digest: None,
+                permission_snapshot: None,
+                digest: format!("sha256:d{step}"),
+                schema_version: "v1".into(),
+                runtime_version: "2.0.3".into(),
+                created_epoch: 1,
+                expected_old_workspace_revision: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("step {step}: {e}"));
+    }
+    let cur = store
+        .latest_checkpoint(&scope, "run-1")
+        .await
+        .expect("checkpoint exists");
+    assert_eq!(cur.workspace_revision.as_deref(), Some("rev-1"));
+}
+
+#[tokio::test]
+async fn pg_k08_commit_checkpoint_with_expected_old_on_first_seed_fails_closed() {
+    // The first checkpoint for a run has no "latest" to compare
+    // against. A caller that asks for CAS on a fresh run must fail
+    // closed (StaleRevision), not silently succeed — otherwise an
+    // orchestrator that confused "no latest" with "any old" would
+    // skip the check entirely on its seed commit.
+    use octos_store::repository::{LeaseStore, RecoveryStore};
+    let store = fresh_store("k08cpseed").await;
+    let scope = scope("t-k08cpseed", "sess-k08cpseed-1");
+
+    store
+        .claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    let r = store
+        .commit_checkpoint(NewCheckpoint {
+            scope: scope.clone(),
+            run_id: "run-1".into(),
+            step: 1,
+            transcript_highwater: 1,
+            context: None,
+            workspace_revision: Some("rev-1".into()),
+            pending_invocation: None,
+            artifact_refs: None,
+            binding_digest: None,
+            permission_snapshot: None,
+            digest: "sha256:d1".into(),
+            schema_version: "v1".into(),
+            runtime_version: "2.0.3".into(),
+            created_epoch: 1,
+            expected_old_workspace_revision: Some("rev-1".into()),
+        })
+        .await;
+    assert!(
+        matches!(r, Err(RepositoryError::StaleRevision)),
+        "first checkpoint with CAS expectation fails closed: {r:?}"
     );
 }

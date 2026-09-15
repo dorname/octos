@@ -326,6 +326,7 @@ fn cp(
         schema_version: "v1".into(),
         runtime_version: "2.0.3".into(),
         created_epoch: epoch,
+        expected_old_workspace_revision: None,
     }
 }
 
