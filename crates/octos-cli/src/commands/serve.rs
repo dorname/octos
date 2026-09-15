@@ -678,6 +678,38 @@ impl ServeCommand {
             if let Ok(url) = std::env::var("DATABASE_URL") {
                 if !url.trim().is_empty() {
                     crate::commands::serve_cluster::attach_durable_approvals_pg(&url).await?;
+                    // N3: attach the PG-backed cron service for cluster mode.
+                    // The service is constructed but NOT started here — the
+                    // caller (profile.rs or the gateway runtime) calls
+                    // `start()` on it. The scope uses the default tenant
+                    // resolution (the per-connection authenticated identity
+                    // refines tenant/profile at request time — c1's entry
+                    // binding in `execution_context`). The controller_id is
+                    // the hostname (or a UUID when hostname is unavailable)
+                    // so K10 single-claim works across Pods.
+                    let scope = {
+                        use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+                        let identity = AuthenticatedIdentity {
+                            tenant_id: "default".into(),
+                            profile_id: "_main".into(),
+                        };
+                        bind_scope(&identity, "cluster-cron", None).expect("bind cron scope")
+                    };
+                    let controller_id = std::env::var("HOSTNAME")
+                        .unwrap_or_else(|_| uuid::Uuid::now_v7().to_string());
+                    let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+                    let _cron_service_pg = crate::commands::serve_cluster::attach_cron_service_pg(
+                        &url,
+                        &scope,
+                        &controller_id,
+                        cron_tx,
+                    )
+                    .await?;
+                    tracing::info!(
+                        target = "octos::cluster",
+                        controller_id = %controller_id,
+                        "cron service (PG) attached"
+                    );
                 }
             }
         }
