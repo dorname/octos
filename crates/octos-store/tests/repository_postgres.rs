@@ -214,6 +214,27 @@ use octos_store::repository::LeaseStore;
 /// K02 on real PG: truly concurrent claims on the same (scope, run) yield
 /// exactly ONE owner — the row lock serializes the claimers.
 #[tokio::test]
+async fn pg_dump_emits_per_table_inserts_and_tenant_set() {
+    let store = fresh_store("dump").await;
+    let scope = scope("t-dump", "sess-dump-1");
+    let mut uow = store.begin();
+    uow.append_message(NewMessage {
+        scope: scope.clone(),
+        message_id: "m-1".into(),
+        thread_id: "t-1".into(),
+        turn_id: "turn-1".into(),
+        role: "user".into(),
+        content: "hello".into(),
+    });
+    uow.commit().await.unwrap();
+
+    let sql = store.dump_tables_sql("t-dump").await.expect("dump");
+    assert!(sql.contains("SET LOCAL app.tenant_id = 't-dump'"));
+    assert!(sql.contains("INSERT INTO messages VALUES ('t-dump', 'profile-a',"));
+    assert!(sql.contains("'m-1'"));
+    assert!(sql.contains("COMMIT"));
+}
+#[tokio::test]
 async fn pg_concurrent_lease_claim_single_owner() {
     let store = fresh_store("lease-k02").await;
     let scope = scope("t-lk02", "sess-lk02-1");

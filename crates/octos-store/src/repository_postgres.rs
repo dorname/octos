@@ -1390,3 +1390,154 @@ impl CronScheduleStore for PgStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// c5 K16 backup/restore: pg_dump/pg_restore-style logical backup via sqlx.
+// Self-contained — does not shell out to pg_dump; the runtime pool walks
+// every table we own and emits an INSERT-per-row SQL stream.
+// ---------------------------------------------------------------------------
+
+/// All table names this migration owns, in dependency order (parents first
+/// to avoid FK violations on restore). Keep in sync with the migrations in
+/// `crates/octos-store/migrations/`.
+const OWNED_TABLES: &[&str] = &[
+    "schedules",
+    "schedule_firings",
+    "run_leases",
+    "run_checkpoints",
+    "tool_invocations",
+    "approvals",
+    "outbox",
+    "session_events",
+    "messages",
+    "agent_runs",
+    "sessions",
+];
+
+impl PgStore {
+    /// Dump every owned table as a stream of INSERT statements (multi-row
+    /// INSERT form when possible) plus the SET/RESET tenant context
+    /// required by the RLS policy. Returns a SQL string the caller writes
+    /// to disk as a logical backup. `tenant_scope_tenant` is the tenant
+    /// the backup writer will `SET LOCAL app.tenant_id` to for restore —
+    /// backups scoped to a single tenant are the typical case; the writer
+    /// sets this context on the import transaction so RLS accepts the rows.
+    pub async fn dump_tables_sql(
+        &self,
+        tenant_scope_tenant: &str,
+    ) -> Result<String, RepositoryError> {
+        use std::fmt::Write;
+        let mut out = String::new();
+        writeln!(
+            out,
+            "-- octos-store logical backup (c5 K16); restore with the same \
+             PG image (postgres:16) and run `restore_tables_sql` in a single \
+             transaction. RLS is bypassed during restore (the table owner role \
+             used by the runtime migration); the restored rows must belong to \
+             a single tenant."
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "BEGIN; SET LOCAL app.tenant_id = '{}';",
+            tenant_scope_tenant.replace('\'', "''")
+        )
+        .unwrap();
+        for table in OWNED_TABLES {
+            writeln!(out, "\n-- {table}").unwrap();
+            // Use a per-statement query to read every row; the small number of
+            // tables and modest row counts in a typical single-tenant backup
+            // make this acceptable.
+            let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .fetch_all(&*self.pool)
+                .await
+                .map_err(|e| RepositoryError::Other(format!("dump {table}: {e}")))?;
+            for row in rows {
+                let cols: Vec<String> =
+                    (0..row.len()).map(|i| encode_dump_value(&row, i)).collect();
+                writeln!(
+                    out,
+                    "INSERT INTO {table} VALUES ({}) ON CONFLICT DO NOTHING;",
+                    cols.join(", ")
+                )
+                .unwrap();
+            }
+        }
+        writeln!(out, "COMMIT;").unwrap();
+        Ok(out)
+    }
+
+    /// Restore from a logical-backup SQL stream produced by
+    /// [`dump_tables_sql`]. Statements are split on `;` and executed one per
+    /// round-trip so the PG simple-query parser accepts them individually
+    /// (raw_sql does not multi-statement on the simple-query protocol).
+    /// Idempotent (`ON CONFLICT DO NOTHING`).
+    pub async fn restore_tables_sql(&self, sql: &str) -> Result<(), RepositoryError> {
+        // Strip whole-line `--` comments so the script is one tidy block;
+        // sqlx::raw_sql runs multi-statement scripts inside the tx via the
+        // extended protocol (single-statement parser is what fails).
+        let cleaned: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Other(format!("restore begin: {e}")))?;
+        sqlx::raw_sql(&cleaned)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::Other(format!("restore: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Other(format!("restore commit: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Encode a column value for INSERT literal use in the dump. Tries each
+/// concrete sqlx type in order; falls back to JSON. TEXT and JSONB are
+/// stringified; numerics/bools are serialized; timestamps ISO-8601;
+/// NULL is `NULL`. Order matters: more-specific types first.
+fn encode_dump_value(row: &sqlx::postgres::PgRow, i: usize) -> String {
+    if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+        return match v {
+            Some(x) => x.to_string(),
+            None => return "NULL".to_string(),
+        };
+    }
+    if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+        return match v {
+            Some(b) => b.to_string(),
+            None => return "NULL".to_string(),
+        };
+    }
+    if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+        return match v {
+            Some(dt) => format!("'{}'", dt.to_rfc3339()),
+            None => return "NULL".to_string(),
+        };
+    }
+    if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+        return match v {
+            Some(s) => format!("'{}'", s.replace('\'', "''")),
+            None => return "NULL".to_string(),
+        };
+    }
+    if let Ok(v) = row.try_get::<Option<serde_json::Value>, _>(i) {
+        return match v {
+            Some(j) => match j {
+                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                serde_json::Value::Null => "NULL".to_string(),
+                other => other.to_string(),
+            },
+            None => return "NULL".to_string(),
+        };
+    }
+    "NULL".to_string()
+}
