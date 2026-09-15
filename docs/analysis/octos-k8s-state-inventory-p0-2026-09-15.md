@@ -74,6 +74,19 @@ c1 Scope → c2 持久化边界 → c3 可恢复执行 → c5 迁移演练；插
   (scope, schedule_id, scheduled_at) 强制 K10 单 firing 单 claim，real-PG
   + local 双后端测试覆盖。
 
+> Baseline commit：`80636697`（`k8s-stateless-p3-baseline` 标签显式标注
+> plugin factory deferred）。本目标范围内全部 41 个本目标文件已 commit。
+
+**编排器 K04 接入**：`ToolRegistry::wrap_with_idempotent_ledger` API 已
+落地并测试通过——把 side-effect tool 用 `IdempotentToolExecutor` 包装，
+由 ledger 驱动 K04 复用/对账语义。生产编排器侧接入仍属剩余工程主体。
+
+**插件工厂显式保留（按目标"插件工厂保留到下一个目标执行"）**：
+plan §7.2 P4（Build/Registry/Catalog/Binding/AgentDefinition/binary/MCP
+adapters/发布回滚）+ K12–K14（manifest/signing/MCP）+ K18–K20（多 adapter/
+限额/包撤销）均未开始；commit message 与 baseline tag 均显式标注
+deferred。
+
 未完成的接线（诚实边界，不得当作已完成）：
 
 - **编排器接入**：`IdempotentToolExecutor`/`recover_run`/supervisor 已就绪，
