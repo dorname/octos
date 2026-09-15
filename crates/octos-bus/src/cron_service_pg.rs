@@ -275,6 +275,24 @@ impl CronServicePg {
             .await
             .map_err(|e| format!("create schedule: {e}"))?;
 
+        // Record the first firing as Intent so `on_timer`'s
+        // `list_due_firings` can find it. The firing_id is
+        // `<schedule_id>:<scheduled_at_ms>` — deterministic and
+        // collision-free within a schedule.
+        if let Some(next_fire_at_ms) = job.state.next_run_at_ms {
+            let firing = ScheduleFiring {
+                schedule_id: job.id.clone(),
+                scheduled_at_ms: next_fire_at_ms as u64,
+                firing_id: format!("{}:{}", job.id, next_fire_at_ms),
+                claimed_by: None,
+                state: FiringState::Intent,
+                run_id: None,
+            };
+            // Best-effort: a duplicate firing (e.g. the schedule was
+            // re-added after a crash) is a Conflict and ignored.
+            let _ = self.store.record_firing(&self.scope, firing).await;
+        }
+
         self.arm_timer();
         debug!(id = %id, "added cron job (PG)");
         Ok(job)

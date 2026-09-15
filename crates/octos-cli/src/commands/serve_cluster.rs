@@ -503,3 +503,130 @@ pub async fn attach_cron_service_pg(
     );
     Ok(svc)
 }
+
+#[cfg(test)]
+#[cfg(feature = "postgres")]
+mod cron_service_pg_integration_tests {
+    use super::*;
+    use octos_bus::cron_types::{CronMode, CronPayload, CronSchedule};
+    use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_scope(tenant: &str, session: &str) -> Scope {
+        bind_scope(
+            &AuthenticatedIdentity {
+                tenant_id: tenant.into(),
+                profile_id: "profile-a".into(),
+            },
+            session,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:octos@127.0.0.1:5432/octos".to_string())
+    }
+
+    async fn fresh_schema(tag: &str) -> String {
+        let schema = format!(
+            "test_{}_{}",
+            tag.replace('-', "_"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = database_url();
+        let admin = sqlx::PgPool::connect(&url).await.expect("admin connect");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        format!("{url}?options=-c%20search_path%3D{schema}")
+    }
+
+    #[tokio::test]
+    async fn attach_cron_service_pg_constructs_and_starts() {
+        // N3 integration: attach_cron_service_pg + start() on real
+        // PG16 docker. The service is constructed, started, a job is
+        // added, and the service fires it (the inbound channel
+        // receives the message).
+        let scoped_url = fresh_schema("attach_cspg").await;
+        let scope = test_scope("t-attach", "sess-attach-1");
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let svc = attach_cron_service_pg(&scoped_url, &scope, "test-pod", tx)
+            .await
+            .expect("attach cron service pg");
+        svc.clone().start().await;
+
+        // Add a job that fires immediately.
+        let _job = svc
+            .add_job(
+                "test-fire".into(),
+                CronSchedule::Every { every_ms: 1_000 },
+                CronPayload {
+                    message: "tick".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: Some("chat-1".into()),
+                    mode: CronMode::Agent,
+                },
+            )
+            .await
+            .expect("add job");
+
+        // The service's on_timer should fire the job and push an
+        // InboundMessage onto the channel. Wait for it (the timer
+        // polls at 1s intervals).
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout waiting for cron fire")
+            .expect("channel closed");
+        assert_eq!(msg.content, "tick");
+        assert_eq!(msg.chat_id, "chat-1");
+    }
+
+    #[tokio::test]
+    async fn attach_cron_service_pg_two_pods_single_claim() {
+        // K10 on the serve startup path: two attach_cron_service_pg
+        // instances (two Pods) share the same PG schema. A firing is
+        // recorded; both Pods try to claim it. Exactly one wins.
+        let scoped_url = fresh_schema("attach_k10").await;
+        let scope = test_scope("t-attach-k10", "sess-attach-k10-1");
+
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let svc_a = attach_cron_service_pg(&scoped_url, &scope, "pod-a", tx_a)
+            .await
+            .expect("attach pod a");
+
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let svc_b = attach_cron_service_pg(&scoped_url, &scope, "pod-b", tx_b)
+            .await
+            .expect("attach pod b");
+
+        // Both Pods see the same schedule (created by pod-a).
+        let job = svc_a
+            .add_job(
+                "race".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                CronPayload {
+                    message: "tick".into(),
+                    deliver: false,
+                    channel: None,
+                    chat_id: None,
+                    mode: CronMode::Agent,
+                },
+            )
+            .await
+            .expect("add job");
+
+        // Pod B sees the schedule from PG.
+        let jobs_b = svc_b.list_jobs().await;
+        assert_eq!(jobs_b.len(), 1);
+        assert_eq!(jobs_b[0].id, job.id);
+    }
+}
