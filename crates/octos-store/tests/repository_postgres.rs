@@ -1160,3 +1160,73 @@ async fn pg_k05_approval_pending_survives_originator_restart() {
         "K05: cross-scope CAS rejected"
     );
 }
+
+// --- c2 K05 cluster rehydrate: pending_approvals_for_scope_async returns
+// the durable Pending rows for a scope on real PG so the gateway's
+// lazy-rehydrate hook can pick up peer-originated approvals.
+
+#[tokio::test]
+async fn pg_k05_pending_approvals_for_scope_lists_peer_originated() {
+    use octos_store::repository::{NewApproval, UnitOfWork};
+
+    let store = fresh_store("k05lazy").await;
+    let k05_scope = scope("t-k05lazy", "sess-k05lazy-1");
+
+    // Three approvals, two Pending + one decided. The Pending ones are
+    // what the lazy rehydrate path must surface.
+    let mut uow = store.begin();
+    uow.create_approval(NewApproval {
+        scope: k05_scope.clone(),
+        approval_id: "ap-lazy-1".into(),
+        originating_run: "run-1".into(),
+        args_hash: "sha256:a".into(),
+        binding_revision: "rev-1".into(),
+    });
+    uow.create_approval(NewApproval {
+        scope: k05_scope.clone(),
+        approval_id: "ap-lazy-2".into(),
+        originating_run: "run-1".into(),
+        args_hash: "sha256:b".into(),
+        binding_revision: "rev-1".into(),
+    });
+    uow.create_approval(NewApproval {
+        scope: k05_scope.clone(),
+        approval_id: "ap-lazy-3".into(),
+        originating_run: "run-2".into(),
+        args_hash: "sha256:c".into(),
+        binding_revision: "rev-2".into(),
+    });
+    uow.commit().await.unwrap();
+
+    // Decide ap-lazy-3 so it's no longer Pending.
+    store
+        .reply_approval_async(
+            &k05_scope,
+            "ap-lazy-3",
+            "sha256:c",
+            ApprovalDecision::Approved,
+        )
+        .await
+        .expect("decide ap-lazy-3");
+
+    // The lazy enumeration must return only the two Pending rows.
+    let pending = store.pending_approvals_for_scope_async(&k05_scope).await;
+    let mut ids: Vec<String> = pending.iter().map(|r| r.approval_id.clone()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["ap-lazy-1".to_string(), "ap-lazy-2".to_string()],
+        "K05: pending enumeration returns only Pending rows in order"
+    );
+    for r in &pending {
+        assert_eq!(r.state, ApprovalState::Pending);
+    }
+
+    // RLS isolation: a different tenant sees nothing.
+    let other_scope = scope("t-other-tenant-k05", "sess-other-1");
+    let other_pending = store.pending_approvals_for_scope_async(&other_scope).await;
+    assert!(
+        other_pending.is_empty(),
+        "K05: RLS isolation — different tenant cannot enumerate peer approvals"
+    );
+}

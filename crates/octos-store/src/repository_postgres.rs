@@ -309,17 +309,19 @@ impl PgStore {
     /// rehydrate (K05). RLS-enforced via SET LOCAL app.tenant_id.
     pub async fn pending_approvals_for_scope_async(&self, scope: &Scope) -> Vec<ApprovalRecord> {
         let (t, p, w, s) = scope_tuple(scope);
-        let mut tx = self.pool.begin().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "pending_approvals begin failed; returning empty");
-            // Return a sentinel "never" pool — fall through to empty result.
-            // Use the real pool's begin fallback path: re-enter via block.
-            unreachable!("begin failed; PgStore pool is unhealthy")
-        });
-        if set_tenant(&mut tx, &t).await.is_err() {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(error = %e, "pending_approvals begin failed; returning empty");
+                return Vec::new();
+            }
+        };
+        if let Err(e) = set_tenant(&mut tx, &t).await {
+            tracing::warn!(error = %e, "set_tenant failed; returning empty");
             let _ = tx.rollback().await;
             return Vec::new();
         }
-        let rows = sqlx::query(
+        let rows_result = sqlx::query(
             "SELECT approval_id, originating_run, args_hash, binding_revision, state, decision              FROM approvals              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4                AND state='pending'              ORDER BY approval_id",
         )
         .bind(&t)
@@ -327,9 +329,18 @@ impl PgStore {
         .bind(&w)
         .bind(&s)
         .fetch_all(&mut *tx)
-        .await
-        .unwrap_or_default();
-        let _ = tx.rollback().await;
+        .await;
+        let rows = match rows_result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "pending_approvals SELECT failed");
+                let _ = tx.rollback().await;
+                return Vec::new();
+            }
+        };
+        // Read-only transaction: commit (not rollback) releases the
+        // connection promptly and signals success.
+        let _ = tx.commit().await;
         rows.into_iter()
             .map(|row| {
                 let state = ApprovalState::Pending;
