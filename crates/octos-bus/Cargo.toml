@@ -26,6 +26,7 @@ email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mail
 
 [dependencies]
 octos-core = { workspace = true }
+octos-store = { workspace = true }
 tokio = { workspace = true }
 lru = { workspace = true }
 async-trait = { workspace = true }

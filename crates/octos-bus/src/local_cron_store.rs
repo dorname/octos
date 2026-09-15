@@ -461,14 +461,16 @@ mod tests {
         assert!(store.is_empty());
 
         // The original file is gone (renamed to a quarantine artifact).
+        // The suffix is `corrupt-<ts>` (matching the legacy
+        // `cron_service.rs` test `corrupt_cron_store_is_quarantined_not_silently_discarded`).
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains("quarantine"))
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
             .collect();
         assert!(
             !entries.is_empty(),
-            "a quarantine-<ts> artifact must exist alongside the live store"
+            "a corrupt-<ts> artifact must exist alongside the live store"
         );
 
         // The live store can be re-seeded fresh.

@@ -5,6 +5,7 @@ pub mod channel;
 pub mod cli_channel;
 pub mod coalesce;
 pub mod cron_service;
+pub mod cron_service_pg;
 pub mod cron_types;
 pub mod dedup;
 pub mod file_handle;
