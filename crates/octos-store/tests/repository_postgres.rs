@@ -306,6 +306,13 @@ async fn pg_audit_two_stores_match_for_same_scope_after_dump_restore() {
             next_fire_at_ms: None,
             misfire_policy: MisfirePolicy::RunOnce,
             enabled: true,
+            last_fired_at_ms: None,
+            last_run_id: None,
+            name: "cron-1".into(),
+            payload_json: "{}".into(),
+            delete_after_run: false,
+            origin_json: "".into(),
+            created_at_ms: 0,
         },
     )
     .await
@@ -608,6 +615,13 @@ fn pg_sched(id: &str) -> Schedule {
         next_fire_at_ms: None,
         misfire_policy: MisfirePolicy::RunOnce,
         enabled: true,
+        last_fired_at_ms: None,
+        last_run_id: None,
+        name: id.into(),
+        payload_json: "{}".into(),
+        delete_after_run: false,
+        origin_json: "".into(),
+        created_at_ms: 0,
     }
 }
 
@@ -847,6 +861,13 @@ async fn pg_k18_cron_durable_fires_only_one_pod_acks() {
                 next_fire_at_ms: None,
                 misfire_policy: MisfirePolicy::RunOnce,
                 enabled: true,
+                last_fired_at_ms: None,
+                last_run_id: None,
+                name: "cron-1".into(),
+                payload_json: "{}".into(),
+                delete_after_run: false,
+                origin_json: "".into(),
+                created_at_ms: 0,
             },
         )
         .await
@@ -861,6 +882,13 @@ async fn pg_k18_cron_durable_fires_only_one_pod_acks() {
                 next_fire_at_ms: None,
                 misfire_policy: MisfirePolicy::RunOnce,
                 enabled: true,
+                last_fired_at_ms: None,
+                last_run_id: None,
+                name: "cron-1".into(),
+                payload_json: "{}".into(),
+                delete_after_run: false,
+                origin_json: "".into(),
+                created_at_ms: 0,
             },
         )
         .await
@@ -1008,6 +1036,13 @@ async fn pg_k16_dump_restore_round_trip_on_real_pg() {
             next_fire_at_ms: None,
             misfire_policy: MisfirePolicy::RunOnce,
             enabled: true,
+            last_fired_at_ms: None,
+            last_run_id: None,
+            name: "cron-rt".into(),
+            payload_json: "{}".into(),
+            delete_after_run: false,
+            origin_json: "".into(),
+            created_at_ms: 0,
         },
     )
     .await

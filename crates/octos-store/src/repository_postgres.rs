@@ -34,6 +34,8 @@ const MIGRATION: &str = concat!(
     include_str!("../migrations/0003_c3_checkpoints_invocations.sql"),
     "\n",
     include_str!("../migrations/0004_c5_cron_durable.sql"),
+    "\n",
+    include_str!("../migrations/0005_c5_cron_payload.sql"),
 );
 
 /// A PostgreSQL-backed repository store. Cheap to clone (shared pool).
@@ -1319,8 +1321,10 @@ impl CronScheduleStore for PgStore {
         let res = sqlx::query(
             "INSERT INTO schedules \
              (tenant_id, profile_id, workspace_id, session_id, schedule_id, expression, \
-              timezone, next_fire_at, misfire_policy, enabled) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+              timezone, next_fire_at, misfire_policy, enabled, \
+              last_fired_at, last_run_id, name, payload_json, delete_after_run, \
+              origin_json, created_at_ms) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
         )
         .bind(&t)
         .bind(&p)
@@ -1332,6 +1336,13 @@ impl CronScheduleStore for PgStore {
         .bind(schedule.next_fire_at_ms.map(ms_to_timestamptz_cron))
         .bind(misfire_str(schedule.misfire_policy))
         .bind(schedule.enabled)
+        .bind(schedule.last_fired_at_ms.map(ms_to_timestamptz_cron))
+        .bind(&schedule.last_run_id)
+        .bind(&schedule.name)
+        .bind(&schedule.payload_json)
+        .bind(schedule.delete_after_run)
+        .bind(&schedule.origin_json)
+        .bind(schedule.created_at_ms)
         .execute(&mut *tx)
         .await;
         if let Err(e) = res {
@@ -1616,7 +1627,9 @@ impl CronScheduleStore for PgStore {
         // is also a stable snapshot for panel/debug views.
         let (t, p, w, s) = scope_tuple(scope);
         let rows = sqlx::query(
-            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled \
+            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled, \
+                    last_fired_at, last_run_id, name, payload_json, delete_after_run, \
+                    origin_json, created_at_ms \
              FROM schedules \
              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
              ORDER BY schedule_id ASC",
@@ -1631,6 +1644,7 @@ impl CronScheduleStore for PgStore {
         let mut out: Vec<Schedule> = Vec::with_capacity(rows.len());
         for row in rows {
             let next_fire_at: Option<chrono::DateTime<chrono::Utc>> = row.get("next_fire_at");
+            let last_fired_at: Option<chrono::DateTime<chrono::Utc>> = row.get("last_fired_at");
             out.push(Schedule {
                 schedule_id: row.get("schedule_id"),
                 expression: row.get("expression"),
@@ -1638,6 +1652,13 @@ impl CronScheduleStore for PgStore {
                 next_fire_at_ms: next_fire_at.map(timestamptz_cron_to_ms),
                 misfire_policy: parse_misfire(row.get::<String, _>("misfire_policy").as_str()),
                 enabled: row.get("enabled"),
+                last_fired_at_ms: last_fired_at.map(timestamptz_cron_to_ms),
+                last_run_id: row.get("last_run_id"),
+                name: row.get("name"),
+                payload_json: row.get("payload_json"),
+                delete_after_run: row.get("delete_after_run"),
+                origin_json: row.get("origin_json"),
+                created_at_ms: row.get("created_at_ms"),
             });
         }
         Ok(out)
@@ -1650,7 +1671,9 @@ impl CronScheduleStore for PgStore {
     ) -> Result<Option<Schedule>, RepositoryError> {
         let (t, p, w, s) = scope_tuple(scope);
         let row = sqlx::query(
-            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled \
+            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled, \
+                    last_fired_at, last_run_id, name, payload_json, delete_after_run, \
+                    origin_json, created_at_ms \
              FROM schedules \
              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
                AND schedule_id=$5",
@@ -1668,6 +1691,7 @@ impl CronScheduleStore for PgStore {
             Some(r) => r,
         };
         let next_fire_at: Option<chrono::DateTime<chrono::Utc>> = row.get("next_fire_at");
+        let last_fired_at: Option<chrono::DateTime<chrono::Utc>> = row.get("last_fired_at");
         Ok(Some(Schedule {
             schedule_id: row.get("schedule_id"),
             expression: row.get("expression"),
@@ -1675,6 +1699,13 @@ impl CronScheduleStore for PgStore {
             next_fire_at_ms: next_fire_at.map(timestamptz_cron_to_ms),
             misfire_policy: parse_misfire(row.get::<String, _>("misfire_policy").as_str()),
             enabled: row.get("enabled"),
+            last_fired_at_ms: last_fired_at.map(timestamptz_cron_to_ms),
+            last_run_id: row.get("last_run_id"),
+            name: row.get("name"),
+            payload_json: row.get("payload_json"),
+            delete_after_run: row.get("delete_after_run"),
+            origin_json: row.get("origin_json"),
+            created_at_ms: row.get("created_at_ms"),
         }))
     }
 
@@ -1692,7 +1723,10 @@ impl CronScheduleStore for PgStore {
         set_tenant(&mut tx, &t).await?;
         let n = sqlx::query(
             "UPDATE schedules SET expression=$6, timezone=$7, next_fire_at=$8, \
-                                   misfire_policy=$9, enabled=$10 \
+                                   misfire_policy=$9, enabled=$10, \
+                                   last_fired_at=$11, last_run_id=$12, \
+                                   name=$13, payload_json=$14, delete_after_run=$15, \
+                                   origin_json=$16, created_at_ms=$17 \
              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
                AND schedule_id=$5",
         )
@@ -1706,6 +1740,13 @@ impl CronScheduleStore for PgStore {
         .bind(schedule.next_fire_at_ms.map(ms_to_timestamptz_cron))
         .bind(misfire_str(schedule.misfire_policy))
         .bind(schedule.enabled)
+        .bind(schedule.last_fired_at_ms.map(ms_to_timestamptz_cron))
+        .bind(&schedule.last_run_id)
+        .bind(&schedule.name)
+        .bind(&schedule.payload_json)
+        .bind(schedule.delete_after_run)
+        .bind(&schedule.origin_json)
+        .bind(schedule.created_at_ms)
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Other(format!("update_schedule: {e}")))?

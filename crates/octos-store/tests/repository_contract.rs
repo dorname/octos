@@ -481,6 +481,13 @@ fn sched(id: &str) -> Schedule {
         next_fire_at_ms: None,
         misfire_policy: MisfirePolicy::RunOnce,
         enabled: true,
+        last_fired_at_ms: None,
+        last_run_id: None,
+        name: id.into(),
+        payload_json: "{}".into(),
+        delete_after_run: false,
+        origin_json: "".into(),
+        created_at_ms: 0,
     }
 }
 

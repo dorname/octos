@@ -465,11 +465,42 @@ pub trait RecoveryStore: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub schedule_id: String,
+    /// Cron expression / interval spec — the schedule kind.
     pub expression: String,
+    /// IANA timezone for cron expressions.
     pub timezone: Option<String>,
+    /// Next firing instant (epoch ms). None means the schedule is paused,
+    /// disabled, or already terminal (an `At` schedule that fired).
     pub next_fire_at_ms: Option<u64>,
+    /// What to do when the controller lapses a fire (skip / run once /
+    /// catch up).
     pub misfire_policy: MisfirePolicy,
+    /// Whether the controller is allowed to fire this schedule.
     pub enabled: bool,
+    /// Last instant the controller actually fired this schedule. None
+    /// until the first fire. Used by `CronJob::compute_next_run` to base
+    /// `Every` intervals on the last fire rather than the wall clock.
+    pub last_fired_at_ms: Option<u64>,
+    /// Run id of the last fire, back-link for audit / cancel. None until
+    /// the first fire.
+    pub last_run_id: Option<String>,
+    /// Human-readable label — the panel's job name.
+    pub name: String,
+    /// Serialized payload (message + delivery metadata + cron mode).
+    /// Stored as a JSON-encoded string so the durable schema is decoupled
+    /// from the bus-side `CronPayload` type. The `octos-bus` cron service
+    /// round-trips through serde_json.
+    pub payload_json: String,
+    /// True when the schedule is `CronSchedule::At` and must be deleted
+    /// after its single fire. Mirrors `CronJob::delete_after_run`.
+    pub delete_after_run: bool,
+    /// Serialized origin (loop_id / session_id / profile_id). Empty
+    /// string when the schedule was created without origin metadata
+    /// (i.e. the legacy hand-made job shape). Mirrors
+    /// `CronJob::origin`.
+    pub origin_json: String,
+    /// Created-at timestamp, epoch ms.
+    pub created_at_ms: i64,
 }
 
 /// What a schedule does after a missed fire (controller lapsed).
