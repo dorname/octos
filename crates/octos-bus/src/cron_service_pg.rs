@@ -604,3 +604,252 @@ fn short_id() -> String {
     let hex = format!("{:032x}", id.as_u128());
     hex[hex.len() - 8..].to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+    use octos_store::repository::postgres::PgStore;
+    use tokio::sync::mpsc;
+
+    fn test_scope(tenant: &str, session: &str) -> Scope {
+        bind_scope(
+            &AuthenticatedIdentity {
+                tenant_id: tenant.into(),
+                profile_id: "profile-a".into(),
+            },
+            session,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:octos@127.0.0.1:5432/octos".to_string())
+    }
+
+    async fn fresh_store(tag: &str) -> PgStore {
+        let schema = format!(
+            "test_{}_{}",
+            tag.replace('-', "_"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = database_url();
+        let admin = sqlx::PgPool::connect(&url).await.expect("admin connect");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let scoped_url = format!("{url}?options=-c%20search_path%3D{schema}");
+        let store = PgStore::connect(&scoped_url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        store
+    }
+
+    fn make_service(
+        store: Arc<dyn CronScheduleStoreObj>,
+        scope: Scope,
+        controller_id: &str,
+    ) -> (Arc<CronServicePg>, mpsc::Receiver<InboundMessage>) {
+        let (tx, rx) = mpsc::channel(64);
+        let svc = Arc::new(CronServicePg::new(
+            store,
+            scope,
+            controller_id.to_string(),
+            tx,
+        ));
+        (svc, rx)
+    }
+
+    fn payload(message: &str, mode: CronMode) -> CronPayload {
+        CronPayload {
+            message: message.into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_add_and_list_round_trip() {
+        let store = Arc::new(fresh_store("cspg-add").await);
+        let scope = test_scope("t-cspg", "sess-cspg-1");
+        let (svc, _rx) = make_service(store, scope, "pod-a");
+
+        let job = svc
+            .add_job(
+                "test-job".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("tick", CronMode::Agent),
+            )
+            .await
+            .expect("add job");
+        assert_eq!(job.name, "test-job");
+
+        let jobs = svc.list_jobs().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job.id);
+        assert!(jobs[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn pg_remove_and_enable_round_trip() {
+        let store = Arc::new(fresh_store("cspg-rm").await);
+        let scope = test_scope("t-cspg-rm", "sess-cspg-rm-1");
+        let (svc, _rx) = make_service(store, scope, "pod-a");
+
+        let job = svc
+            .add_job(
+                "temp".into(),
+                CronSchedule::At {
+                    at_ms: i64::MAX - 1,
+                },
+                payload("once", CronMode::Agent),
+            )
+            .await
+            .expect("add job");
+
+        assert!(svc.remove_job(&job.id).await);
+        assert!(svc.list_jobs().await.is_empty());
+        assert!(!svc.remove_job("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn pg_k10_double_claim_single_winner() {
+        // K10: two Pods racing the same firing produce one winner and
+        // one Conflict. Both Pods share the same PG schema (real
+        // cluster topology).
+        let schema_tag = format!(
+            "k10_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = database_url();
+        let admin = sqlx::PgPool::connect(&url).await.expect("admin connect");
+        sqlx::query(&format!("CREATE SCHEMA {schema_tag}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let scoped_url = format!("{url}?options=-c%20search_path%3D{schema_tag}");
+
+        let store_a = Arc::new(PgStore::connect(&scoped_url).await.expect("connect pod a"));
+        store_a.migrate().await.expect("migrate a");
+        let store_b = Arc::new(PgStore::connect(&scoped_url).await.expect("connect pod b"));
+        store_b.migrate().await.expect("migrate b");
+
+        let scope = test_scope("t-k10", "sess-k10-1");
+        let (svc_a, _rx_a) = make_service(store_a.clone(), scope.clone(), "pod-a");
+        let (_svc_b, _rx_b) = make_service(store_b.clone(), scope.clone(), "pod-b");
+
+        // Seed a schedule on Pod A.
+        let job = svc_a
+            .add_job(
+                "race".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("tick", CronMode::Agent),
+            )
+            .await
+            .expect("add job");
+
+        // Record a firing for the schedule (simulating the controller
+        // tick that both Pods observe).
+        let firing = ScheduleFiring {
+            schedule_id: job.id.clone(),
+            scheduled_at_ms: 1_000,
+            firing_id: "f-1000".into(),
+            claimed_by: None,
+            state: FiringState::Intent,
+            run_id: None,
+        };
+        CronScheduleStore::record_firing(&*store_a, &scope, firing.clone())
+            .await
+            .expect("record firing");
+
+        // Both Pods try to claim the same firing. Exactly one wins.
+        let claim_a =
+            CronScheduleStore::claim_firing(&*store_a, &scope, &job.id, 1_000, "pod-a").await;
+        let claim_b =
+            CronScheduleStore::claim_firing(&*store_b, &scope, &job.id, 1_000, "pod-b").await;
+        let wins = [&claim_a, &claim_b].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&claim_a, &claim_b]
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.to_string().contains("conflict")))
+            .count();
+        assert_eq!(wins, 1, "exactly one Pod wins the claim");
+        assert_eq!(conflicts, 1, "the other Pod gets Conflict");
+    }
+
+    #[tokio::test]
+    async fn pg_k18_durable_firing_survives_pod_restart() {
+        // K18: a firing recorded by Pod A is visible to Pod B (the
+        // durable `schedule_firings` table is the truth source, not
+        // the in-memory state of whichever Pod happened to record it).
+        let schema_tag = format!(
+            "k18_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let url = database_url();
+        let admin = sqlx::PgPool::connect(&url).await.expect("admin connect");
+        sqlx::query(&format!("CREATE SCHEMA {schema_tag}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let scoped_url = format!("{url}?options=-c%20search_path%3D{schema_tag}");
+
+        let store_a = Arc::new(PgStore::connect(&scoped_url).await.expect("connect pod a"));
+        store_a.migrate().await.expect("migrate a");
+        let store_b = Arc::new(PgStore::connect(&scoped_url).await.expect("connect pod b"));
+        store_b.migrate().await.expect("migrate b");
+
+        let scope = test_scope("t-k18", "sess-k18-1");
+        let (svc_a, _rx_a) = make_service(store_a.clone(), scope.clone(), "pod-a");
+
+        // Pod A adds a schedule and records a firing.
+        let job = svc_a
+            .add_job(
+                "durable".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("tick", CronMode::Agent),
+            )
+            .await
+            .expect("add job");
+        CronScheduleStore::record_firing(
+            &*store_a,
+            &scope,
+            ScheduleFiring {
+                schedule_id: job.id.clone(),
+                scheduled_at_ms: 1_000,
+                firing_id: "f-1000".into(),
+                claimed_by: None,
+                state: FiringState::Intent,
+                run_id: None,
+            },
+        )
+        .await
+        .expect("record firing");
+
+        // Pod B (simulating a restart or a different Pod) sees the
+        // same schedule and firing from PG.
+        let (svc_b, _rx_b) = make_service(store_b.clone(), scope.clone(), "pod-b");
+        let jobs = svc_b.list_jobs().await;
+        assert_eq!(jobs.len(), 1, "Pod B sees the schedule from PG");
+        assert_eq!(jobs[0].id, job.id);
+
+        let due = CronScheduleStore::list_due_firings(&*store_b, &scope, 2_000, 32)
+            .await
+            .expect("list due");
+        assert_eq!(due.len(), 1, "Pod B sees the firing from PG");
+        assert_eq!(due[0].schedule_id, job.id);
+        assert_eq!(due[0].state, FiringState::Intent);
+    }
+}
