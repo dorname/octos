@@ -59,6 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
+use octos_core::execution_scope::Scope;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
     TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
@@ -513,6 +514,41 @@ impl SessionLedger {
 
 // ---------- Ledger ----------
 
+/// K06: object-safe durable event replay interface. The
+/// `octos-store::repository::RecoveryStore` trait is not dyn
+/// compatible (its `impl Future` return types are not object-safe),
+/// so the ledger uses this thin wrapper trait. `PgStore` implements
+/// it via `async_trait`; `LocalStore` can too for single-node
+/// testing.
+#[async_trait::async_trait]
+pub(crate) trait DurableEventReplay: Send + Sync {
+    /// Enumerate session events with `seq > after_seq`, ordered by
+    /// seq ascending. `after_seq = None` returns all events for the
+    /// scope. Mirrors `RecoveryStore::events_after`.
+    async fn events_after(
+        &self,
+        scope: &Scope,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<octos_store::repository::SessionEvent>, String>;
+}
+
+/// Blanket impl for any type that implements
+/// `octos_store::repository::RecoveryStore`. The `async_trait`
+/// attribute makes the method object-safe (the wrapped future is
+/// boxed internally).
+#[async_trait::async_trait]
+impl<T: octos_store::repository::RecoveryStore + Send + Sync> DurableEventReplay for T {
+    async fn events_after(
+        &self,
+        scope: &Scope,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<octos_store::repository::SessionEvent>, String> {
+        octos_store::repository::RecoveryStore::events_after(self, scope, after_seq)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub(crate) struct UiProtocolLedger {
     config: LedgerConfig,
     inner: Mutex<LedgerInner>,
@@ -559,6 +595,17 @@ pub(crate) struct UiProtocolLedger {
     /// Storage identities found at boot, independent of replay ring trimming
     /// and idle eviction. They are NOT authority to restore a cwd or sandbox.
     recovered_session_ids: Mutex<std::collections::HashSet<SessionKey>>,
+    /// K06: optional durable store for WS reconnect / resync. When
+    /// present, `replay_from_pg` falls back to
+    /// `DurableEventReplay::events_after` after the in-memory ring and
+    /// the disk snapshot both miss — a client that reconnects to a
+    /// different Pod (or the same Pod after a restart + disk loss)
+    /// replays from the durable `session_events` table instead of
+    /// getting cursor-out-of-range. The type is `Arc<dyn
+    /// DurableEventReplay>` (object-safe, no `postgres` feature
+    /// dependency) so the ledger does not depend on the store backend.
+    #[allow(dead_code)]
+    pg_store: Option<std::sync::Arc<dyn DurableEventReplay>>,
 }
 
 /// One lazily-recoverable on-disk session. `reconciled` tracks whether the
@@ -772,7 +819,19 @@ impl UiProtocolLedger {
             #[cfg(test)]
             lazy_replays: std::sync::atomic::AtomicUsize::new(0),
             recovered_session_ids: Mutex::new(std::collections::HashSet::new()),
+            pg_store: None,
         }
+    }
+
+    /// K06: attach a durable store for WS reconnect / resync. When
+    /// set, `replay_from_pg` falls back to
+    /// `DurableEventReplay::events_after` after the in-memory ring
+    /// and the disk snapshot both miss. The store is a no-op for
+    /// every other ledger path (append, live subscribe, metrics) —
+    /// only the replay fallback reads it.
+    #[allow(dead_code)]
+    pub(crate) fn set_pg_store(&mut self, store: std::sync::Arc<dyn DurableEventReplay>) {
+        self.pg_store = Some(store);
     }
 
     /// Register (or clear, with `None`) the per-project storage scope for a
@@ -1024,6 +1083,7 @@ impl UiProtocolLedger {
             // cold start recovers this session from snapshot+tail instead.
             // Best-effort, same discipline as the append-cadence path: a
             // failed write never breaks recovery.
+            #[allow(clippy::collapsible_if)]
             if needs_bootstrap_snapshot {
                 let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(session) = inner.sessions.get(storage_id) {
@@ -3372,6 +3432,126 @@ impl UiProtocolLedger {
         hydrate_session_from_snapshot(session, snapshot);
         inner.touch_lru(session_id);
         Ok((result, head_seq))
+    }
+
+    /// K06: durable WS reconnect / resync fallback. When the in-memory
+    /// ring and the disk snapshot both miss (e.g. Pod restart + disk
+    /// loss, or a client reconnecting to a different Pod), replay
+    /// events from the durable PG `session_events` table.
+    ///
+    /// The caller (WS handler) is expected to call this AFTER
+    /// `replay_after_with_head` returns `Err` — it is the last resort
+    /// before giving up on replay. Returns the replayed events and
+    /// the head seq observed at the moment of the PG read (the same
+    /// atomic pair the in-memory path returns, so the forwarder
+    /// baseline is correct).
+    ///
+    /// `SessionEvent.payload` must be a serialized
+    /// `UiProtocolLedgerEvent` (the same JSON shape the in-memory
+    /// ledger writes to its ring). Events whose payload does not
+    /// deserialize are skipped with a warning — best-effort replay
+    /// that does not drop the session entirely on a single corrupt
+    /// row.
+    #[allow(dead_code)]
+    pub(crate) async fn replay_from_pg(
+        &self,
+        session_id: &SessionKey,
+        after_seq: u64,
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, u64), RpcError> {
+        let Some(pg_store) = &self.pg_store else {
+            return Err(cursor_out_of_range_error(
+                session_id,
+                &UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: after_seq,
+                },
+                0,
+                None,
+            ));
+        };
+        let session_id = &self.storage_session_id(session_id);
+        let scope = self.scope_for_session(session_id);
+        let events = pg_store
+            .events_after(&scope, Some(after_seq))
+            .await
+            .map_err(|e| {
+                warn!(
+                    target = "octos::ledger",
+                    ?e,
+                    session_id = %session_id.0,
+                    "pg events_after failed"
+                );
+                cursor_out_of_range_error(
+                    session_id,
+                    &UiCursor {
+                        stream: session_id.0.clone(),
+                        seq: after_seq,
+                    },
+                    0,
+                    None,
+                )
+            })?;
+
+        let mut out = Vec::with_capacity(events.len());
+        let mut head_seq = after_seq;
+        for event in events {
+            head_seq = event.seq;
+            match serde_json::from_value::<UiProtocolLedgerEvent>(event.payload.clone()) {
+                Ok(ledger_event) => {
+                    out.push(LedgeredUiProtocolEvent {
+                        cursor: UiCursor {
+                            stream: session_id.0.clone(),
+                            seq: event.seq,
+                        },
+                        event: ledger_event,
+                        from_connection: None,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        target = "octos::ledger",
+                        ?e,
+                        session_id = %session_id.0,
+                        seq = event.seq,
+                        "skipping undecodable session_event payload"
+                    );
+                }
+            }
+        }
+        Ok((out, head_seq))
+    }
+
+    /// Resolve the PG scope for a storage session id. Falls back to a
+    /// placeholder scope when the session has no registered scope —
+    /// the PG path is best-effort; a missing scope means the query
+    /// returns empty rather than failing.
+    #[allow(dead_code)]
+    fn scope_for_session(&self, session_id: &SessionKey) -> octos_core::execution_scope::Scope {
+        use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+        let scopes = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
+        let scope_key = scopes
+            .get(&session_id.0)
+            .cloned()
+            .unwrap_or_else(|| session_id.0.clone());
+        bind_scope(
+            &AuthenticatedIdentity {
+                tenant_id: "default".into(),
+                profile_id: "default".into(),
+            },
+            &scope_key,
+            None,
+        )
+        .unwrap_or_else(|_| {
+            bind_scope(
+                &AuthenticatedIdentity {
+                    tenant_id: "default".into(),
+                    profile_id: "default".into(),
+                },
+                "default",
+                None,
+            )
+            .expect("fallback scope")
+        })
     }
 }
 
