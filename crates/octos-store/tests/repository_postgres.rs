@@ -1324,3 +1324,230 @@ async fn pg_k08_workspace_revision_cas_rejects_stale_writer() {
         .expect("CAS from winner revision succeeds");
     assert_eq!(after, "rev-3");
 }
+
+// --- c5 cron: N1 store surface (list_due_firings / delete_schedule /
+//          list_schedules / get_schedule / update_schedule) ---------------
+//
+// These exercise the new store primitives that `octos-bus::cron_service`
+// (N2) will call into: the controller hot loop reads due firings with
+// `list_due_firings`, claims them, and the panel calls into the others.
+// Every assertion is on a real PG16 docker store — no mocks.
+
+#[tokio::test]
+async fn pg_c5_list_due_firings_returns_only_intent_and_due() {
+    // K10 controller hot path. Seed: 1 due firing + 1 future firing + 1
+    // due firing already Running. `list_due_firings(now=2000)` should
+    // return ONLY the Intent firing whose scheduled_at <= 2000.
+    let store = fresh_store("c5-due").await;
+    let scope = scope("t-due", "sess-due-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-d"))
+        .await
+        .unwrap();
+
+    // Due, Intent — should appear.
+    store
+        .record_firing(&scope, pg_firing("cron-d", 1_000))
+        .await
+        .unwrap();
+    // Future, Intent — should NOT appear.
+    store
+        .record_firing(&scope, pg_firing("cron-d", 9_000))
+        .await
+        .unwrap();
+    // Due, Running (already claimed) — should NOT appear.
+    store
+        .record_firing(&scope, pg_firing("cron-d", 1_500))
+        .await
+        .unwrap();
+    store
+        .claim_firing(&scope, "cron-d", 1_500, "controller-a")
+        .await
+        .unwrap();
+
+    let due = store
+        .list_due_firings(&scope, 2_000, 32)
+        .await
+        .expect("list_due_firings");
+    assert_eq!(due.len(), 1, "exactly one Intent+due firing");
+    assert_eq!(due[0].schedule_id, "cron-d");
+    assert_eq!(due[0].scheduled_at_ms, 1_000);
+    assert_eq!(due[0].state, FiringState::Intent);
+}
+
+#[tokio::test]
+async fn pg_c5_list_due_firings_respects_limit_and_orders_chronologically() {
+    // Order: oldest scheduled_at first (so the controller drains in time
+    // order). Limit caps the batch — never silently pull all rows.
+    let store = fresh_store("c5-due-lim").await;
+    let scope = scope("t-lim", "sess-lim-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-l"))
+        .await
+        .unwrap();
+    // Insert 5 firings at increasing scheduled_at; 4 are due (≤ 5000),
+    // 1 is future (9_000).
+    for ms in [1_000u64, 2_000, 3_000, 4_000, 9_000] {
+        store
+            .record_firing(&scope, pg_firing("cron-l", ms))
+            .await
+            .unwrap();
+    }
+    let batch = store
+        .list_due_firings(&scope, 5_000, 2)
+        .await
+        .expect("limit=2");
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].scheduled_at_ms, 1_000);
+    assert_eq!(batch[1].scheduled_at_ms, 2_000);
+
+    // Full batch (limit=32) returns all 4 due, in chronological order.
+    let all = store
+        .list_due_firings(&scope, 5_000, 32)
+        .await
+        .expect("limit=32");
+    assert_eq!(all.len(), 4);
+    let times: Vec<u64> = all.iter().map(|f| f.scheduled_at_ms).collect();
+    assert_eq!(times, vec![1_000, 2_000, 3_000, 4_000]);
+}
+
+#[tokio::test]
+async fn pg_c5_delete_schedule_removes_schedule_and_its_firings() {
+    // K18: deleting a schedule must drop both the schedules row and every
+    // firing keyed under (scope, schedule_id), in one transaction. A
+    // non-existent id returns Ok(false) without touching other schedules.
+    let store = fresh_store("c5-del").await;
+    let scope = scope("t-del", "sess-del-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-x"))
+        .await
+        .unwrap();
+    store
+        .create_schedule(&scope, pg_sched("cron-y"))
+        .await
+        .unwrap();
+    store
+        .record_firing(&scope, pg_firing("cron-x", 1_000))
+        .await
+        .unwrap();
+    store
+        .record_firing(&scope, pg_firing("cron-x", 2_000))
+        .await
+        .unwrap();
+    store
+        .record_firing(&scope, pg_firing("cron-y", 1_000))
+        .await
+        .unwrap();
+
+    let removed = store
+        .delete_schedule(&scope, "cron-x")
+        .await
+        .expect("delete");
+    assert!(removed, "first delete returns true");
+
+    // cron-x's firings are gone (list_due_firings returns only cron-y).
+    let due = store.list_due_firings(&scope, 9_000, 32).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].schedule_id, "cron-y");
+
+    // Second delete returns Ok(false) — no schedule, no error.
+    let again = store
+        .delete_schedule(&scope, "cron-x")
+        .await
+        .expect("idempotent");
+    assert!(!again, "second delete returns false");
+
+    // Cross-schedule invariant: cron-y survives.
+    assert!(
+        store
+            .get_schedule(&scope, "cron-y")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn pg_c5_list_schedules_returns_every_schedule_in_scope_sorted() {
+    // K18 panel path. list_schedules is the durable mirror of
+    // `list_all_jobs`. Returns both enabled and disabled, ordered by id.
+    let store = fresh_store("c5-list").await;
+    let scope = scope("t-list", "sess-list-1");
+    let mut s = pg_sched("cron-b");
+    s.enabled = false;
+    store
+        .create_schedule(&scope, pg_sched("cron-a"))
+        .await
+        .unwrap();
+    store.create_schedule(&scope, s).await.unwrap();
+    store
+        .create_schedule(&scope, pg_sched("cron-c"))
+        .await
+        .unwrap();
+
+    let listed = store.list_schedules(&scope).await.expect("list");
+    let ids: Vec<String> = listed.iter().map(|s| s.schedule_id.clone()).collect();
+    assert_eq!(ids, vec!["cron-a", "cron-b", "cron-c"]);
+    // The disabled one is in the listing (enabled=false does NOT exclude it).
+    assert!(!listed[1].enabled, "cron-b carries enabled=false through");
+}
+
+#[tokio::test]
+async fn pg_c5_get_schedule_returns_some_or_none_not_error() {
+    // K18: missing schedule is None, NOT NotFound — panel / controller
+    // distinguish "no such schedule" (handled) from "store failure"
+    // (propagated).
+    let store = fresh_store("c5-get").await;
+    let scope = scope("t-get", "sess-get-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-g"))
+        .await
+        .unwrap();
+    let found = store.get_schedule(&scope, "cron-g").await.expect("get ok");
+    assert!(found.is_some());
+    let missing = store
+        .get_schedule(&scope, "nope")
+        .await
+        .expect("get missing");
+    assert!(missing.is_none(), "missing schedule is None, not NotFound");
+}
+
+#[tokio::test]
+async fn pg_c5_update_schedule_round_trips_and_notfound_on_unknown() {
+    // K18: update_schedule replaces the mutable fields (expression,
+    // next_fire_at_ms, enabled). Returns NotFound for an unknown id, so the
+    // caller can distinguish "re-create" from "store failure".
+    let store = fresh_store("c5-upd").await;
+    let scope = scope("t-upd", "sess-upd-1");
+    store
+        .create_schedule(&scope, pg_sched("cron-u"))
+        .await
+        .unwrap();
+
+    let mut updated = pg_sched("cron-u");
+    updated.expression = "every 5m".into();
+    updated.timezone = Some("Asia/Shanghai".into());
+    updated.next_fire_at_ms = Some(60_000);
+    updated.misfire_policy = MisfirePolicy::CatchUp;
+    updated.enabled = false;
+    store
+        .update_schedule(&scope, updated.clone())
+        .await
+        .expect("update");
+
+    let read_back = store.get_schedule(&scope, "cron-u").await.unwrap().unwrap();
+    assert_eq!(read_back.expression, "every 5m");
+    assert_eq!(read_back.timezone.as_deref(), Some("Asia/Shanghai"));
+    assert_eq!(read_back.next_fire_at_ms, Some(60_000));
+    assert_eq!(read_back.misfire_policy, MisfirePolicy::CatchUp);
+    assert!(!read_back.enabled);
+
+    // Unknown id → NotFound.
+    let mut bad = pg_sched("cron-unknown");
+    bad.schedule_id = "ghost".into();
+    let r = store.update_schedule(&scope, bad).await;
+    assert!(matches!(r, Err(RepositoryError::NotFound)));
+
+    // Update for an id that DOES exist in the schedule above is the only
+    // one we need to assert against ghost here.
+}

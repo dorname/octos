@@ -1287,6 +1287,22 @@ fn parse_firing_state(s: &str) -> FiringState {
     }
 }
 
+fn parse_misfire(s: &str) -> MisfirePolicy {
+    match s {
+        "run_once" => MisfirePolicy::RunOnce,
+        "catch_up" => MisfirePolicy::CatchUp,
+        _ => MisfirePolicy::Skip,
+    }
+}
+
+/// Inverse of `ms_to_timestamptz_cron`. Used by the schedule / firing read
+/// paths to convert TIMESTAMPTZ columns back into the u64 epoch-ms the store
+/// API speaks in. Saturates to 0 on out-of-range inputs (matches the
+/// forward direction's 0 fallback).
+fn timestamptz_cron_to_ms(dt: chrono::DateTime<chrono::Utc>) -> u64 {
+    dt.timestamp_millis().max(0) as u64
+}
+
 impl CronScheduleStore for PgStore {
     async fn create_schedule(
         &self,
@@ -1486,6 +1502,213 @@ impl CronScheduleStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| RepositoryError::Other(e.to_string()))?
+        .rows_affected();
+        if n == 0 {
+            let _ = tx.rollback().await;
+            return Err(RepositoryError::NotFound);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_due_firings(
+        &self,
+        scope: &Scope,
+        now_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<ScheduleFiring>, RepositoryError> {
+        // K10 controller hot path. The (state, scheduled_at) index makes
+        // the WHERE clause an index scan; we ORDER BY scheduled_at so the
+        // caller drains the oldest due firing first. `limit` caps the batch
+        // so a misbehaving clock (clock skew, big catch-up batch) can't
+        // pull the entire schedules table into memory at once.
+        let (t, p, w, s) = scope_tuple(scope);
+        let now_ts = ms_to_timestamptz_cron(now_ms);
+        let rows = sqlx::query(
+            "SELECT schedule_id, scheduled_at, firing_id, claimed_by, state, run_id \
+             FROM schedule_firings \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+               AND state='intent' AND scheduled_at <= $5 \
+             ORDER BY scheduled_at ASC \
+             LIMIT $6",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .bind(now_ts)
+        .bind(limit as i64)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("list_due_firings: {e}")))?;
+        let mut out: Vec<ScheduleFiring> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let scheduled_at: chrono::DateTime<chrono::Utc> = row.get("scheduled_at");
+            out.push(ScheduleFiring {
+                schedule_id: row.get("schedule_id"),
+                scheduled_at_ms: timestamptz_cron_to_ms(scheduled_at),
+                firing_id: row.get("firing_id"),
+                claimed_by: row.get("claimed_by"),
+                state: parse_firing_state(row.get::<String, _>("state").as_str()),
+                run_id: row.get("run_id"),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn delete_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        // K18: same-transaction drop of firings + schedule row. RLS scopes
+        // the WHERE to the current tenant (the FORCE RLS policy rejects
+        // any row whose tenant_id doesn't match `app.tenant_id`), so a
+        // cross-tenant id can never wipe another tenant's data even with a
+        // leaked (scope, schedule_id) tuple. Returns the schedules
+        // rows_affected; 0 = id did not exist in this scope → false, 1+ =
+        // removed.
+        let (t, p, w, s) = scope_tuple(scope);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        set_tenant(&mut tx, &t).await?;
+        sqlx::query(
+            "DELETE FROM schedule_firings \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+               AND schedule_id=$5",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .bind(schedule_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("delete firings: {e}")))?;
+        let n = sqlx::query(
+            "DELETE FROM schedules \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+               AND schedule_id=$5",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .bind(schedule_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("delete schedule: {e}")))?
+        .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    async fn list_schedules(&self, scope: &Scope) -> Result<Vec<Schedule>, RepositoryError> {
+        // ORDER BY schedule_id so two callers see the same ordering — used
+        // by `list_all_jobs` which sorts by next_run, but `list_schedules`
+        // is also a stable snapshot for panel/debug views.
+        let (t, p, w, s) = scope_tuple(scope);
+        let rows = sqlx::query(
+            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled \
+             FROM schedules \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+             ORDER BY schedule_id ASC",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("list_schedules: {e}")))?;
+        let mut out: Vec<Schedule> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let next_fire_at: Option<chrono::DateTime<chrono::Utc>> = row.get("next_fire_at");
+            out.push(Schedule {
+                schedule_id: row.get("schedule_id"),
+                expression: row.get("expression"),
+                timezone: row.get("timezone"),
+                next_fire_at_ms: next_fire_at.map(timestamptz_cron_to_ms),
+                misfire_policy: parse_misfire(row.get::<String, _>("misfire_policy").as_str()),
+                enabled: row.get("enabled"),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn get_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> Result<Option<Schedule>, RepositoryError> {
+        let (t, p, w, s) = scope_tuple(scope);
+        let row = sqlx::query(
+            "SELECT schedule_id, expression, timezone, next_fire_at, misfire_policy, enabled \
+             FROM schedules \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+               AND schedule_id=$5",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .bind(schedule_id)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("get_schedule: {e}")))?;
+        let row = match row {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+        let next_fire_at: Option<chrono::DateTime<chrono::Utc>> = row.get("next_fire_at");
+        Ok(Some(Schedule {
+            schedule_id: row.get("schedule_id"),
+            expression: row.get("expression"),
+            timezone: row.get("timezone"),
+            next_fire_at_ms: next_fire_at.map(timestamptz_cron_to_ms),
+            misfire_policy: parse_misfire(row.get::<String, _>("misfire_policy").as_str()),
+            enabled: row.get("enabled"),
+        }))
+    }
+
+    async fn update_schedule(
+        &self,
+        scope: &Scope,
+        schedule: Schedule,
+    ) -> Result<(), RepositoryError> {
+        let (t, p, w, s) = scope_tuple(scope);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::Other(e.to_string()))?;
+        set_tenant(&mut tx, &t).await?;
+        let n = sqlx::query(
+            "UPDATE schedules SET expression=$6, timezone=$7, next_fire_at=$8, \
+                                   misfire_policy=$9, enabled=$10 \
+             WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4 \
+               AND schedule_id=$5",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .bind(&schedule.schedule_id)
+        .bind(&schedule.expression)
+        .bind(&schedule.timezone)
+        .bind(schedule.next_fire_at_ms.map(ms_to_timestamptz_cron))
+        .bind(misfire_str(schedule.misfire_policy))
+        .bind(schedule.enabled)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Other(format!("update_schedule: {e}")))?
         .rows_affected();
         if n == 0 {
             let _ = tx.rollback().await;

@@ -543,6 +543,56 @@ pub trait CronScheduleStore: Send + Sync {
         state: FiringState,
         run_id: Option<&str>,
     ) -> impl std::future::Future<Output = Result<(), RepositoryError>> + Send;
+
+    /// K10: enumerate Intent firings whose `scheduled_at_ms <= now_ms` for the
+    /// given scope. Implementations MUST NOT return firings in a terminal or
+    /// Running state, and SHOULD respect `limit` as a hard upper bound. The
+    /// caller is expected to call `claim_firing` for each result; two
+    /// concurrent list-then-claim cycles on the same firing yield one winner
+    /// and one `Conflict` (K10 cluster uniqueness).
+    fn list_due_firings(
+        &self,
+        scope: &Scope,
+        now_ms: u64,
+        limit: u32,
+    ) -> impl std::future::Future<Output = Result<Vec<ScheduleFiring>, RepositoryError>> + Send;
+
+    /// K18: remove a schedule (and all its firings) for the given scope.
+    /// Returns `true` if a schedule was removed, `false` if no such schedule
+    /// existed. The two DELETE statements run in the same transaction so
+    /// either both rows are gone or neither is.
+    fn delete_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> impl std::future::Future<Output = Result<bool, RepositoryError>> + Send;
+
+    /// K18: list every schedule in the scope (both enabled and disabled),
+    /// ordered by `schedule_id`. Used by `list_all_jobs` and panel views.
+    fn list_schedules(
+        &self,
+        scope: &Scope,
+    ) -> impl std::future::Future<Output = Result<Vec<Schedule>, RepositoryError>> + Send;
+
+    /// Look up a single schedule by id. Returns `None` if the schedule does
+    /// not exist in this scope (NOT a `NotFound` error — call sites already
+    /// distinguish "not found" from "store failure").
+    fn get_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Schedule>, RepositoryError>> + Send;
+
+    /// Replace an existing schedule's mutable fields (`expression`,
+    /// `timezone`, `next_fire_at_ms`, `misfire_policy`, `enabled`). Returns
+    /// `NotFound` when no schedule with this id exists in the scope. The
+    /// `schedule_id` field of `schedule` is the lookup key; the other fields
+    /// are written verbatim. No-op if the values are unchanged.
+    fn update_schedule(
+        &self,
+        scope: &Scope,
+        schedule: Schedule,
+    ) -> impl std::future::Future<Output = Result<(), RepositoryError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1089,102 @@ impl CronScheduleStore for LocalStore {
             .ok_or(RepositoryError::NotFound)?;
         firing.state = state;
         firing.run_id = run_id.map(str::to_string);
+        Ok(())
+    }
+
+    async fn list_due_firings(
+        &self,
+        scope: &Scope,
+        now_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<ScheduleFiring>, RepositoryError> {
+        // K10: enumerate Intent firings whose scheduled_at <= now_ms, sorted
+        // oldest-first so the controller drains in chronological order. Limit
+        // is a hard upper bound — callers tune it to bound the per-tick
+        // batch. The store holds only Intent firings a controller hasn't
+        // claimed yet (K10 single-claim invariant), so we filter on
+        // FiringState::Intent here too as belt-and-suspenders.
+        let mut due: Vec<ScheduleFiring> = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let scope_key = ScopeKey::from(scope);
+            let mut out: Vec<ScheduleFiring> = inner
+                .firings
+                .iter()
+                .filter(|((sc, _, _), firing)| {
+                    *sc == scope_key
+                        && firing.state == FiringState::Intent
+                        && firing.scheduled_at_ms <= now_ms
+                })
+                .map(|(_, firing)| firing.clone())
+                .collect();
+            // Stable sort so two callers picking the same batch see the same
+            // order; the limit applies AFTER sort so we drop the newest, not
+            // the oldest.
+            out.sort_by_key(|f| f.scheduled_at_ms);
+            out
+        };
+        due.truncate(limit as usize);
+        Ok(due)
+    }
+
+    async fn delete_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> Result<bool, RepositoryError> {
+        // K18: drop the schedule row and every firing keyed under it in one
+        // critical section so the Local adapter's "memory always reflects
+        // what the store would answer" invariant holds.
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let scope_key = ScopeKey::from(scope);
+        let key = (scope_key.clone(), schedule_id.to_string());
+        let removed = inner.schedules.remove(&key).is_some();
+        if removed {
+            // Drop every firing for this (scope, schedule_id) regardless of
+            // scheduled_at. The store has no FK, but the contract on this
+            // method is "delete the schedule" — orphan firings would leak
+            // for an id no caller can name.
+            inner
+                .firings
+                .retain(|(sc, sid, _), _| !(sc == &scope_key && sid == schedule_id));
+        }
+        Ok(removed)
+    }
+
+    async fn list_schedules(&self, scope: &Scope) -> Result<Vec<Schedule>, RepositoryError> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let scope_key = ScopeKey::from(scope);
+        let mut out: Vec<Schedule> = inner
+            .schedules
+            .iter()
+            .filter(|((sc, _), _)| sc == &scope_key)
+            .map(|(_, schedule)| schedule.clone())
+            .collect();
+        out.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
+        Ok(out)
+    }
+
+    async fn get_schedule(
+        &self,
+        scope: &Scope,
+        schedule_id: &str,
+    ) -> Result<Option<Schedule>, RepositoryError> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (ScopeKey::from(scope), schedule_id.to_string());
+        Ok(inner.schedules.get(&key).cloned())
+    }
+
+    async fn update_schedule(
+        &self,
+        scope: &Scope,
+        schedule: Schedule,
+    ) -> Result<(), RepositoryError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (ScopeKey::from(scope), schedule.schedule_id.clone());
+        if !inner.schedules.contains_key(&key) {
+            return Err(RepositoryError::NotFound);
+        }
+        inner.schedules.insert(key, schedule);
         Ok(())
     }
 }
