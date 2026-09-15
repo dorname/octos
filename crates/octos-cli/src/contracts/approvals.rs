@@ -15,6 +15,12 @@ struct ApprovalEntry {
     session_id: SessionKey,
     state: ApprovalEntryState,
     request: Option<ApprovalRequestedEvent>,
+    /// CAS args_hash the durable reply compares on. Populated from
+    /// `args_hash_for(request)` at request_runtime time so a rehydrated
+    /// entry (no `request` clone available — durable record carries
+    /// only the hash) can pass the CAS unchanged. `None` for the legacy
+    /// `insert_pending` test path that never carried a request.
+    args_hash: Option<String>,
     runtime_resumable: bool,
     response_tx: Option<tokio::sync::oneshot::Sender<ApprovalDecision>>,
 }
@@ -171,9 +177,9 @@ impl PendingApprovalStore {
                     && let Some(scope) = (sink.scope_for)(&params.session_id)
                 {
                     let args_hash = entry
-                        .request
-                        .as_ref()
-                        .map(Self::args_hash_for)
+                        .args_hash
+                        .clone()
+                        .or_else(|| entry.request.as_ref().map(Self::args_hash_for))
                         .unwrap_or_default();
                     let repo_decision = match &params.decision {
                         ApprovalDecision::Approve => {
@@ -377,27 +383,77 @@ impl PendingApprovalStore {
     /// backend is attached. Best-effort-is-NOT-acceptable here: this is the
     /// truth write, so a durable persist failure must surface (the caller
     /// treats it as fail-closed — see `request_runtime`). Returns the
-    /// args-hash the reply CAS will compare on, for tests.
-    fn persist_pending(&self, event: &ApprovalRequestedEvent) {
-        let Some(sink) = self.durable.get() else {
-            return;
-        };
-        let Some(scope) = (sink.scope_for)(&event.session_id) else {
-            // No resolvable cluster scope (single-node raw session): stay
-            // in-process only. This matches the pre-cluster behavior exactly.
-            return;
-        };
+    /// args-hash the reply CAS will compare on, so `request_runtime` can
+    /// stash it on the in-process entry for rehydrate paths. `None` when
+    /// no durable backend is attached or the wire session has no resolvable
+    /// cluster scope.
+    fn persist_pending(&self, event: &ApprovalRequestedEvent) -> Option<String> {
+        let sink = self.durable.get()?;
+        let scope = (sink.scope_for)(&event.session_id)?;
         let args_hash = Self::args_hash_for(event);
         sink.store.persist_pending(
             &scope,
             DurableApprovalRecord {
                 approval_id: event.approval_id.0.to_string(),
                 originating_run: event.turn_id.0.to_string(),
-                args_hash,
+                args_hash: args_hash.clone(),
                 binding_revision: String::new(),
                 state: ApprovalState::Pending,
             },
         );
+        Some(args_hash)
+    }
+
+    /// Rehydrate a pending approval from the durable backend into the
+    /// in-process `RwLock`. Used by a fresh `PendingApprovalStore` (Pod B)
+    /// that joined the cluster after the originator (Pod A) crashed: the
+    /// durable record is the source of truth, and this method installs a
+    /// minimal `ApprovalEntry` so `respond_with_context` can pass the CAS
+    /// without a full request clone (the durable record carries the
+    /// `args_hash` we need).
+    ///
+    /// Returns `true` when an entry was rehydrated (durable record was
+    /// Pending and matched `session_id`); `false` when no durable record
+    /// exists, the record is already terminal, or the durable backend is
+    /// not attached.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rehydrate_pending(
+        &self,
+        session_id: &SessionKey,
+        approval_id: &ApprovalId,
+    ) -> bool {
+        let Some(sink) = self.durable.get() else {
+            return false;
+        };
+        let Some(scope) = (sink.scope_for)(session_id) else {
+            return false;
+        };
+        let Some(rec) = sink.store.get(&scope, &approval_id.0.to_string()) else {
+            return false;
+        };
+        if rec.state != ApprovalState::Pending {
+            return false;
+        }
+        // The durable record is scope-keyed (tenant_id+profile_id+workspace_id
+        // +session_id per Scope) and RLS-enforced; cross-scope CAS is
+        // rejected by the repository, so rehydrate can trust the lookup.
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
+        // Idempotent: if the entry already exists, do nothing.
+        if entries.contains_key(approval_id) {
+            return false;
+        }
+        entries.insert(
+            approval_id.clone(),
+            ApprovalEntry {
+                session_id: session_id.clone(),
+                state: ApprovalEntryState::Pending,
+                request: None,
+                args_hash: Some(rec.args_hash),
+                runtime_resumable: true,
+                response_tx: None,
+            },
+        );
+        true
     }
 
     // Test-only legacy entry point (all callers are `#[cfg(test)]`); the
@@ -414,6 +470,7 @@ impl PendingApprovalStore {
                 session_id,
                 state: ApprovalEntryState::Pending,
                 request: None,
+                args_hash: None,
                 runtime_resumable: false,
                 response_tx: None,
             },
@@ -421,6 +478,7 @@ impl PendingApprovalStore {
     }
 
     pub(crate) fn request(&self, event: ApprovalRequestedEvent) -> ApprovalRequestedEvent {
+        let args_hash = Self::args_hash_for(&event);
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             event.approval_id.clone(),
@@ -428,6 +486,7 @@ impl PendingApprovalStore {
                 session_id: event.session_id.clone(),
                 state: ApprovalEntryState::Pending,
                 request: Some(event.clone()),
+                args_hash: Some(args_hash),
                 runtime_resumable: false,
                 response_tx: None,
             },
@@ -442,7 +501,7 @@ impl PendingApprovalStore {
         // c2/K05: persist the durable Pending record BEFORE parking the
         // in-process oneshot, so the durable store is the truth and a restart
         // can recover it. The oneshot is only the wake-up accelerator.
-        self.persist_pending(&event);
+        let args_hash = self.persist_pending(&event);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
@@ -451,6 +510,7 @@ impl PendingApprovalStore {
                 session_id: event.session_id.clone(),
                 state: ApprovalEntryState::Pending,
                 request: Some(event),
+                args_hash,
                 runtime_resumable: true,
                 response_tx: Some(tx),
             },
@@ -797,6 +857,87 @@ mod tests {
             bare.is_err(),
             "K05 fail-closed: pod B cannot respond without recovery"
         );
+    }
+
+    /// K05 positive rehydrate: a fresh `PendingApprovalStore` (Pod B)
+    /// can recover a pending approval that Pod A persisted to the
+    /// durable backend and the in-process entry then lost. The
+    /// `rehydrate_pending` method installs a minimal `ApprovalEntry`
+    /// whose `args_hash` matches the durable record's stored hash, so
+    /// `respond_with_context` passes the durable CAS and the decision
+    /// settles the durable record (Pending → Decided).
+    ///
+    /// Companion to k05_durable_record_visible_across_pod_stores
+    /// (which pins the fail-closed bare-respond path) — together they
+    /// prove both halves of the K05 cross-pod invariant.
+    #[test]
+    fn k05_rehydrate_pending_allows_pod_b_to_decide() {
+        let (store_a, local) = durable_store();
+        let session_id = SessionKey("local:k05rehydrate".into());
+        let approval_id = ApprovalId::new();
+        let event = request_event(&session_id, &approval_id);
+        let expected_args_hash = PendingApprovalStore::args_hash_for(&event);
+        let _rx = store_a.request_runtime(event);
+        // Pod A: persisted durable Pending. The in-process entry exists
+        // on store_a.
+        let scope = scope_for_session(&session_id).expect("scope");
+        let rec = local
+            .approval(&scope, &approval_id.0.to_string())
+            .expect("durable pending");
+        assert_eq!(rec.state, ApprovalState::Pending);
+        assert_eq!(rec.args_hash, expected_args_hash);
+        drop(store_a);
+
+        // Pod B: a fresh PendingApprovalStore over the SAME LocalStore +
+        // LocalApprovalDurable adapter.
+        let store_b = PendingApprovalStore::default();
+        store_b.attach_durable(
+            std::sync::Arc::new(LocalApprovalDurable {
+                store: std::sync::Arc::clone(&local),
+            }),
+            Box::new(scope_for_session),
+        );
+        // Bare respond fails closed before rehydrate.
+        let pre = store_b.respond_with_context(ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ));
+        assert!(
+            pre.is_err(),
+            "K05 fail-closed: bare respond without rehydrate rejected"
+        );
+        // Rehydrate from the durable backend.
+        let ok = store_b.rehydrate_pending(&session_id, &approval_id);
+        assert!(
+            ok,
+            "rehydrate_pending must succeed for an existing durable Pending"
+        );
+        // The rehydrated entry is now in-process: respond_with_context
+        // passes the durable CAS and decides the approval.
+        let outcome = store_b
+            .respond_with_context(ApprovalRespondParams::new(
+                session_id.clone(),
+                approval_id.clone(),
+                ApprovalDecision::Approve,
+            ))
+            .expect("post-rehydrate respond decides the approval");
+        assert!(outcome.result.accepted);
+        // The durable record is now Decided.
+        let after = local
+            .approval(&scope, &approval_id.0.to_string())
+            .expect("durable after");
+        assert_eq!(after.state, ApprovalState::Decided);
+        // Re-rehydrate is idempotent (returns false because entry exists).
+        let again = store_b.rehydrate_pending(&session_id, &approval_id);
+        assert!(!again, "rehydrate is idempotent: entry already exists");
+        // Replay is rejected by the CAS.
+        let replay = store_b.respond_with_context(ApprovalRespondParams::new(
+            session_id,
+            approval_id,
+            ApprovalDecision::Approve,
+        ));
+        assert!(replay.is_err(), "K05 CAS: replay after decide is rejected");
     }
 
     #[test]
