@@ -748,6 +748,57 @@ mod tests {
         assert!(err.is_err());
     }
 
+    /// K05 cross-pod in-process: two `PendingApprovalStore` instances
+    /// share ONE `LocalStore` (the test's `LocalApprovalDurable` adapter)
+    /// — simulating two pods sharing one durable backend. Pod A requests
+    /// an approval, the durable record is written, and Pod A is dropped
+    /// (process exits). A fresh `PendingApprovalStore` (Pod B) is
+    /// constructed over the SAME durable backend: the request that Pod A
+    /// issued is still visible to Pod B via the durable record, and a
+    /// direct reply (recover-and-decide path) is rejected as not-pending
+    /// because the in-process entry on Pod B is empty (fail-closed).
+    /// This pins the K05 invariant at the in-process layer in parallel
+    /// to the storage-level drill (pg_k05_approval_pending_survives_*
+    /// in octos-store).
+    #[test]
+    fn k05_durable_record_visible_across_pod_stores() {
+        let (store_a, local) = durable_store();
+        let session_id = SessionKey("local:k05pod".into());
+        let approval_id = ApprovalId::new();
+        let _rx = store_a.request_runtime(request_event(&session_id, &approval_id));
+        // Pod A: persisted via UoW. The durable record exists on the
+        // shared LocalStore; the in-process entry is on store_a.
+        let scope = scope_for_session(&session_id).expect("scope");
+        let rec = local
+            .approval(&scope, &approval_id.0.to_string())
+            .expect("durable pending");
+        assert_eq!(rec.state, ApprovalState::Pending);
+        drop(store_a);
+        // Pod B: a fresh PendingApprovalStore over the SAME LocalStore.
+        let store_b = PendingApprovalStore::default();
+        store_b.attach_durable(
+            std::sync::Arc::new(LocalApprovalDurable {
+                store: std::sync::Arc::clone(&local),
+            }),
+            Box::new(scope_for_session),
+        );
+        // The durable record is visible to Pod B (storage layer).
+        let rec_b = local
+            .approval(&scope, &approval_id.0.to_string())
+            .expect("pod B sees durable record");
+        assert_eq!(rec_b.state, ApprovalState::Pending);
+        // But a bare respond on Pod B fails closed (no in-process entry).
+        let bare = store_b.respond_with_context(ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ));
+        assert!(
+            bare.is_err(),
+            "K05 fail-closed: pod B cannot respond without recovery"
+        );
+    }
+
     #[test]
     fn known_pending_approval_accepts_once() {
         let store = PendingApprovalStore::default();
