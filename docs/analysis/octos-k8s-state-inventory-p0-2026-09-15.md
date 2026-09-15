@@ -105,6 +105,11 @@ deferred。
   已绿（commit 3f4e7135、tag k8s-stateless-k18-cron）。`octos-bus::cron_service`
   仍走内存/JSON；下一步 GREEN 阶段把 `fire_once` 接到 `claim_firing`，涉及
   octos-bus 引入 sqlx + 1000+ 行 cron_service 改造（保留 `LocalCronStore` 降级路径）。
+- **K05 跨 Pod 审批恢复**：存储层跨 Pod 真实演练已绿（commit 714825cd、
+  tag k8s-stateless-k05-cross）。`octos-cli` 层 `PendingApprovalStore` ↔
+  `PgApprovalDurable` 已通过 `attach_durable_approvals_pg` 接线，但缺少
+  跨 Pod in-process 重组集成测试（OnceLock 单次附着 + 不同 scope resolver 是
+  已知复杂度点）。
 - **D6 多副本事件回放**：ledger 已是 disk-commit 是 truth（单节点 D6 成立）；
   多副本 K06 跨副本 seq 回放需要 PG session_events + outbox 接入
   ui_protocol_ledger（大型跨层改动）。
