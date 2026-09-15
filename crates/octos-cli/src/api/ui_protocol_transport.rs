@@ -20161,8 +20161,47 @@ async fn open_session_result(
     for notification in open_compaction_events {
         let _ = ledger.append_notification_from(notification, connection_id);
     }
+    // K06: WS reconnect / resync. The in-memory ledger replay is the
+    // primary path. When it fails with cursor-out-of-range (the client
+    // last-acked a seq that the in-memory ring + disk snapshot no
+    // longer cover — e.g. Pod restart + disk loss, or the client
+    // reconnecting to a different Pod), fall back to the durable PG
+    // `session_events` table via `replay_from_pg`.
     let (mut replay, replay_baseline_seq) =
-        ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
+        match ledger.replay_after_with_head(&params.session_id, params.after.as_ref()) {
+            Ok((events, head)) => (events, head),
+            Err(in_memory_err) => {
+                // Only fall back to PG when the client asked for replay
+                // (params.after is Some). A "live only" open (after=None)
+                // has nothing to replay — the in-memory path already
+                // returns an empty Vec with the current head.
+                let Some(after) = params.after.as_ref() else {
+                    return Err(in_memory_err);
+                };
+                match ledger.replay_from_pg(&params.session_id, after.seq).await {
+                    Ok((events, head)) => {
+                        tracing::info!(
+                            session_id = %params.session_id.0,
+                            after_seq = after.seq,
+                            events = events.len(),
+                            head_seq = head,
+                            "K06: WS reconnect replayed from PG after in-memory miss"
+                        );
+                        (events, head)
+                    }
+                    Err(pg_err) => {
+                        tracing::warn!(
+                            session_id = %params.session_id.0,
+                            after_seq = after.seq,
+                            in_memory_error = ?in_memory_err,
+                            pg_error = ?pg_err,
+                            "K06: both in-memory and PG replay failed"
+                        );
+                        return Err(in_memory_err);
+                    }
+                }
+            }
+        };
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
