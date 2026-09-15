@@ -73,9 +73,17 @@ c1 Scope → c2 持久化边界 → c3 可恢复执行 → c5 迁移演练；插
 - **c5 存储层 K10**：`schedules`/`schedule_firings` + PRIMARY KEY
   (scope, schedule_id, scheduled_at) 强制 K10 单 firing 单 claim，real-PG
   + local 双后端测试覆盖。
+- **c5 K16 backup**：`PgStore::dump_tables_sql` 导出全部 11 张 owned table
+  为 INSERT 语句（SET LOCAL app.tenant_id + per-table 行 + COMMIT）——真实
+  PG 端到端 dump 验证通过；restore 端到端受 sqlx simple-query protocol 对
+  inline JSONB 的限制影响而 `#[ignore]`（生产用 psql/pg_restore 是文档操作路径）。
+- **c5 migration audit**：`PgStore::audit_scope` 返回 per-scope 行数 +
+  canonical SHA-256 digest；同一 scope 二次 audit 一致（spec c5 migration-
+  fidelity 端到端核对支撑：counts + digest 一致即可证明迁移保真）。
 
-> Baseline commit：`80636697`（`k8s-stateless-p3-baseline` 标签显式标注
-> plugin factory deferred）。本目标范围内全部 41 个本目标文件已 commit。
+> Baseline 链：`80636697` → `e4b25d05` → `dc4ed9f7` → `d39ed267` →
+> `70b30301` → `89d0637a`；tag 链 `k8s-stateless-p3-baseline` +
+> `k8s-stateless-k16-backup` + `k8s-stateless-c5-audit`。
 
 **编排器 K04 接入**：`ToolRegistry::wrap_with_idempotent_ledger` API 已
 落地并测试通过——把 side-effect tool 用 `IdempotentToolExecutor` 包装，
