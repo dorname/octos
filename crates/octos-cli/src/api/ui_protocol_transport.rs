@@ -20187,6 +20187,23 @@ async fn open_session_result(
                             head_seq = head,
                             "K06: WS reconnect replayed from PG after in-memory miss"
                         );
+                        // K06 write path: the in-memory ring may
+                        // contain events that PG does not (appended
+                        // since the last flush). Flush them now so
+                        // the next reconnect (to this Pod or another)
+                        // reads from PG. Best-effort: a failed flush
+                        // logs and does not fail the reconnect.
+                        let flushed = ledger
+                            .flush_session_to_pg(&params.session_id)
+                            .await
+                            .unwrap_or(0);
+                        if flushed > 0 {
+                            tracing::info!(
+                                session_id = %params.session_id.0,
+                                flushed,
+                                "K06: flushed in-memory events to PG after reconnect"
+                            );
+                        }
                         (events, head)
                     }
                     Err(pg_err) => {
