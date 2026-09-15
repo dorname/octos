@@ -698,17 +698,26 @@ impl ServeCommand {
                     let controller_id = std::env::var("HOSTNAME")
                         .unwrap_or_else(|_| uuid::Uuid::now_v7().to_string());
                     let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-                    let _cron_service_pg = crate::commands::serve_cluster::attach_cron_service_pg(
+                    let cron_service_pg = crate::commands::serve_cluster::attach_cron_service_pg(
                         &url,
                         &scope,
                         &controller_id,
                         cron_tx,
                     )
                     .await?;
+                    // N3: start the PG-backed cron service. The service
+                    // spawns a tokio timer task that re-arms via
+                    // `Arc::clone(self)` — the task self-holds an
+                    // `Arc<CronServicePg>` so the service is not
+                    // dropped when `run_async` returns. The shutdown
+                    // path flips `running` to false via
+                    // `shutdown_signal` and the task drops its self-held
+                    // Arc on the next tick.
+                    cron_service_pg.clone().start().await;
                     tracing::info!(
                         target = "octos::cluster",
                         controller_id = %controller_id,
-                        "cron service (PG) attached"
+                        "cron service (PG) attached and started"
                     );
                 }
             }
