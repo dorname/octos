@@ -1586,3 +1586,124 @@ async fn pg_c5_update_schedule_round_trips_and_notfound_on_unknown() {
     // Update for an id that DOES exist in the schedule above is the only
     // one we need to assert against ghost here.
 }
+
+// --- c5 K08 runtime wiring: bump_workspace_revision is the orchestrator's
+//    "advance my view of workspace revision" entry point. The same CAS
+//    invariant applies, but the caller doesn't have to first read the
+//    latest checkpoint — the storage layer reads + checks + writes
+//    atomically inside one transaction. -----------------------------------
+
+#[tokio::test]
+async fn pg_k08_runtime_bump_workspace_revision_succeeds_and_stale_loser() {
+    // Simulate two orchestrator workers (e.g. agent A and agent B) that
+    // both observed workspace_revision "rev-1" and try to bump to their
+    // own "rev-2-{a,b}". Exactly one bump succeeds; the other gets
+    // StaleRevision. No silent overwrite of the latest checkpoint's
+    // workspace_revision — the loser's bump is rejected, the winner's
+    // lands.
+    use octos_store::repository::{LeaseStore, RecoveryStore};
+    let store = fresh_store("k08rt").await;
+    let scope = scope("t-k08rt", "sess-k08rt-1");
+
+    // Seed a run lease + an initial checkpoint at workspace_revision
+    // "rev-1".
+    store
+        .claim(&scope, "run-1", "worker-1", 60_000, 1_000)
+        .await
+        .unwrap();
+    store
+        .commit_checkpoint(NewCheckpoint {
+            scope: scope.clone(),
+            run_id: "run-1".into(),
+            step: 1,
+            transcript_highwater: 1,
+            context: None,
+            workspace_revision: Some("rev-1".into()),
+            pending_invocation: None,
+            artifact_refs: None,
+            binding_digest: None,
+            permission_snapshot: None,
+            digest: "sha256:dummy".into(),
+            schema_version: "v1".into(),
+            runtime_version: "2.0.3".into(),
+            created_epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    // Worker A and worker B both observed "rev-1" and try to bump.
+    let store_a = store.clone();
+    let sa = scope.clone();
+    let ha = tokio::spawn(async move {
+        store_a
+            .bump_workspace_revision(&sa, "run-1", Some("rev-1"), "rev-2-a")
+            .await
+    });
+    let store_b = store.clone();
+    let sb = scope.clone();
+    let hb = tokio::spawn(async move {
+        store_b
+            .bump_workspace_revision(&sb, "run-1", Some("rev-1"), "rev-2-b")
+            .await
+    });
+    let ra = ha.await.unwrap();
+    let rb = hb.await.unwrap();
+    let wins = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+    let stales = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, Err(RepositoryError::StaleRevision)))
+        .count();
+    assert_eq!(wins, 1, "exactly one bump wins");
+    assert_eq!(stales, 1, "the other gets StaleRevision");
+
+    // latest_checkpoint carries the winner's revision (a or b).
+    let cur = store
+        .latest_checkpoint(&scope, "run-1")
+        .await
+        .expect("checkpoint exists");
+    let winner_rev = cur.workspace_revision.clone().unwrap();
+    assert!(
+        winner_rev == "rev-2-a" || winner_rev == "rev-2-b",
+        "latest checkpoint carries the bump winner's revision: {winner_rev}"
+    );
+
+    // A re-bump using the loser's stale expected_old ("rev-1") is
+    // rejected — proving the loser must re-read before retrying.
+    let stale = store
+        .bump_workspace_revision(&scope, "run-1", Some("rev-1"), "rev-3")
+        .await;
+    assert!(
+        matches!(stale, Err(RepositoryError::StaleRevision)),
+        "re-bump with stale expected_old is rejected"
+    );
+
+    // A bump using the winner's actual revision as expected_old
+    // succeeds, advancing to "rev-3".
+    let after = store
+        .bump_workspace_revision(&scope, "run-1", Some(&winner_rev), "rev-3")
+        .await
+        .expect("bump from winner revision succeeds");
+    assert_eq!(after, "rev-3");
+    let cur2 = store
+        .latest_checkpoint(&scope, "run-1")
+        .await
+        .expect("checkpoint exists after second bump");
+    assert_eq!(cur2.workspace_revision.as_deref(), Some("rev-3"));
+}
+
+#[tokio::test]
+async fn pg_k08_runtime_bump_with_no_checkpoint_returns_not_found() {
+    // bump_workspace_revision on a run that has no checkpoint yet returns
+    // NotFound — distinct from StaleRevision ("revision mismatch"). This
+    // lets the orchestrator decide between "initial seed: caller must
+    // commit_checkpoint first" and "concurrent drift: re-read latest".
+    let store = fresh_store("k08rt-nf").await;
+    let scope = scope("t-k08rt-nf", "sess-k08rt-nf-1");
+    let r = store
+        .bump_workspace_revision(&scope, "run-no-cp", None, "rev-1")
+        .await;
+    assert!(
+        matches!(r, Err(RepositoryError::NotFound)),
+        "bump without a checkpoint returns NotFound, not StaleRevision"
+    );
+}

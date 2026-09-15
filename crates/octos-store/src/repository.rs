@@ -451,6 +451,27 @@ pub trait RecoveryStore: Send + Sync {
         expected_old_revision: Option<&str>,
         new_revision: &str,
     ) -> impl std::future::Future<Output = Result<String, RepositoryError>> + Send;
+
+    /// K08 runtime wiring: a higher-level wrapper that wraps the
+    /// `expected_old_revision` lookup + CAS into ONE call so the
+    /// orchestrator can say "advance my view of workspace_revision to
+    /// `new` if it's still where I last saw it" without re-reading the
+    /// latest checkpoint itself. Returns the new revision on success.
+    ///
+    /// This is the runtime entry point that branch-on-StaleRevision code
+    /// in the orchestrator calls: pass `expected_old = None` to assert
+    /// "no checkpoint has been committed yet" (initial seed), or pass the
+    /// `workspace_revision` carried by the last checkpoint the caller
+    /// actually read. A concurrent committer that advances the revision
+    /// between the caller's read and this bump will surface as
+    /// [`RepositoryError::StaleRevision`].
+    fn bump_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> impl std::future::Future<Output = Result<String, RepositoryError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1054,21 @@ impl RecoveryStore for LocalStore {
         }
         latest.workspace_revision = Some(new_revision.to_string());
         Ok(new_revision.to_string())
+    }
+
+    async fn bump_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> Result<String, RepositoryError> {
+        // Local: the lock that guards the read-modify-write is the same
+        // one that guards cas_workspace_revision, so a single delegate is
+        // atomic w.r.t. every other LocalStore caller. PgStore does the
+        // same in one transaction.
+        self.cas_workspace_revision(scope, run_id, expected_old_revision, new_revision)
+            .await
     }
 }
 

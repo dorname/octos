@@ -1208,6 +1208,23 @@ impl RecoveryStore for PgStore {
             .map_err(|e| RepositoryError::Other(e.to_string()))?;
         Ok(new_revision.to_string())
     }
+
+    async fn bump_workspace_revision(
+        &self,
+        scope: &Scope,
+        run_id: &str,
+        expected_old_revision: Option<&str>,
+        new_revision: &str,
+    ) -> Result<String, RepositoryError> {
+        // Pg: bump is a strict alias of CAS — the read-modify-write is
+        // already wrapped in one transaction, so adding a separate helper
+        // would only duplicate the SQL. Caller-facing naming difference
+        // is what makes this the runtime entry point: code that wants
+        // "advance my view of the workspace" calls `bump_*`; code that
+        // wants the raw predicate tests calls `cas_*`.
+        self.cas_workspace_revision(scope, run_id, expected_old_revision, new_revision)
+            .await
+    }
 }
 
 impl PgStore {
