@@ -304,6 +304,53 @@ impl PgStore {
         })
     }
 
+    /// Enumerate Pending approvals under a scope. Used by cluster
+    /// recovery paths to discover peer-originated approvals for
+    /// rehydrate (K05). RLS-enforced via SET LOCAL app.tenant_id.
+    pub async fn pending_approvals_for_scope_async(&self, scope: &Scope) -> Vec<ApprovalRecord> {
+        let (t, p, w, s) = scope_tuple(scope);
+        let mut tx = self.pool.begin().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "pending_approvals begin failed; returning empty");
+            // Return a sentinel "never" pool — fall through to empty result.
+            // Use the real pool's begin fallback path: re-enter via block.
+            unreachable!("begin failed; PgStore pool is unhealthy")
+        });
+        if set_tenant(&mut tx, &t).await.is_err() {
+            let _ = tx.rollback().await;
+            return Vec::new();
+        }
+        let rows = sqlx::query(
+            "SELECT approval_id, originating_run, args_hash, binding_revision, state, decision              FROM approvals              WHERE tenant_id=$1 AND profile_id=$2 AND workspace_id=$3 AND session_id=$4                AND state='pending'              ORDER BY approval_id",
+        )
+        .bind(&t)
+        .bind(&p)
+        .bind(&w)
+        .bind(&s)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_default();
+        let _ = tx.rollback().await;
+        rows.into_iter()
+            .map(|row| {
+                let state = ApprovalState::Pending;
+                let decision = row
+                    .get::<Option<String>, _>("decision")
+                    .map(|d| match d.as_str() {
+                        "approved" => ApprovalDecision::Approved,
+                        _ => ApprovalDecision::Rejected,
+                    });
+                ApprovalRecord {
+                    approval_id: row.get("approval_id"),
+                    originating_run: row.get("originating_run"),
+                    args_hash: row.get("args_hash"),
+                    binding_revision: row.get("binding_revision"),
+                    state,
+                    decision,
+                }
+            })
+            .collect()
+    }
+
     /// Approval reply CAS (K05): one UPDATE with compare predicates; the row
     /// count distinguishes NotFound / AlreadyDecided / ArgsMismatch.
     pub async fn reply_approval_async(
@@ -1574,7 +1621,7 @@ pub struct ScopeAudit {
 fn canonical_json_digest(items: &[serde_json::Value]) -> String {
     use sha2::{Digest, Sha256};
     let mut sorted: Vec<&serde_json::Value> = items.iter().collect();
-    sorted.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    sorted.sort_by_key(|a| a.to_string());
     let mut h = Sha256::new();
     for v in sorted {
         h.update(v.to_string().as_bytes());

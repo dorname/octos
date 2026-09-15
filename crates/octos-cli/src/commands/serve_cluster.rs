@@ -99,6 +99,28 @@ impl ApprovalDurableStore for PgApprovalDurable {
             })
         })
     }
+
+    fn list_pending_for_scope(&self, scope: &Scope) -> Vec<DurableApprovalRecord> {
+        let store = self.store.clone();
+        let scope = scope.clone();
+        let rt = self.rt.clone();
+        tokio::task::block_in_place(move || {
+            rt.block_on(async move {
+                store
+                    .pending_approvals_for_scope_async(&scope)
+                    .await
+                    .into_iter()
+                    .map(|r| DurableApprovalRecord {
+                        approval_id: r.approval_id,
+                        originating_run: r.originating_run,
+                        args_hash: r.args_hash,
+                        binding_revision: r.binding_revision,
+                        state: r.state,
+                    })
+                    .collect()
+            })
+        })
+    }
 }
 
 /// Resolve the authoritative cluster Scope for a wire session at serve

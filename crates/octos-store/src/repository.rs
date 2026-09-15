@@ -166,6 +166,16 @@ pub trait StoreView: Send + Sync {
     fn events_for(&self, scope: &Scope) -> Vec<SessionEvent>;
     fn run_state(&self, run_id: &str) -> Option<String>;
     fn approval(&self, scope: &Scope, approval_id: &str) -> Option<ApprovalRecord>;
+    /// Enumerate Pending approvals for a scope. Used by cluster pod
+    /// startup / lazy rehydrate paths to discover durable approvals
+    /// that originated on a peer and need to be re-registered into the
+    /// in-process PendingApprovalStore on first access (K05 cross-pod
+    /// recovery). Defaults to empty so backends that don't track a
+    /// per-scope index don't have to implement it.
+    fn pending_approvals_for_scope(&self, scope: &Scope) -> Vec<ApprovalRecord> {
+        let _ = scope;
+        Vec::new()
+    }
     fn outbox(&self) -> Vec<OutboxItem>;
 
     /// Approval reply CAS (K05): the first matching reply wins; replay,
