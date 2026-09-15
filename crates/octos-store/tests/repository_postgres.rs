@@ -238,13 +238,11 @@ async fn pg_dump_emits_per_table_inserts_and_tenant_set() {
 #[tokio::test]
 async fn pg_audit_two_stores_match_for_same_scope_after_dump_restore() {
     let src = fresh_store("audsrc").await;
-    let dst = fresh_store("auddst").await;
     let scope = scope("t-aud", "sess-aud-1");
 
     use octos_store::repository::{
-        CronScheduleStore, FiringState, LeaseStore, MisfirePolicy, NewApproval, NewCheckpoint,
-        NewInvocation, NewMessage, NewSessionEvent, OutboxItem, RecoveryStore, Schedule,
-        ScheduleFiring, UnitOfWork,
+        CronScheduleStore, LeaseStore, MisfirePolicy, NewApproval, NewCheckpoint, NewInvocation,
+        NewMessage, RecoveryStore, Schedule, UnitOfWork,
     };
 
     let mut uow = src.begin();
