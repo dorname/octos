@@ -1,0 +1,246 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: octos
+
+---
+# PostgreSQL for cluster mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg
+  template:
+    metadata:
+      labels:
+        app: pg
+    spec:
+      containers:
+      - name: pg
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: octos
+        - name: POSTGRES_DB
+          value: octos
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres", "-d", "octos"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: pgdata
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  selector:
+    app: pg
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+
+---
+# Non-sensitive config (DB URL, profile defaults, workspace path)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octos-config
+  namespace: octos
+data:
+  # === Required ===
+  DATABASE_URL: "postgres://postgres:octos@pg.octos.svc.cluster.local:5432/octos"
+  OCTOS_AUTH_TOKEN: "test-cluster-token-12345"
+
+  # === Profile defaults (applied by init-config.sh) ===
+  DEFAULT_PROFILE: "cluster-worker"
+  WORKSPACE_DIR: "/workspace"
+
+  # === LLM (provider-agnostic) ===
+  # Set LLM_API_KEY_ENV to the name of the env var holding the key.
+  # The actual key lives in Secret `llm-credentials`.
+  LLM_PROVIDER: "anthropic"
+  LLM_MODEL: "k3"
+  LLM_BASE_URL: "https://api.kimi.com/coding/"
+  LLM_API_KEY_ENV: "ANTHROPIC_API_KEY"
+
+  # === Logging ===
+  RUST_LOG: "info,sqlx=warn"
+
+---
+# Sensitive: API keys, must be created via:
+#   kubectl create secret generic llm-credentials \
+#     --from-literal=ANTHROPIC_API_KEY=sk-ant-xxxxx \
+#     -n octos
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-credentials
+  namespace: octos
+type: Opaque
+stringData:
+  # Replace with real key (or leave empty for no-LLM-demo mode)
+  ANTHROPIC_API_KEY: "REPLACE_ME"
+
+---
+# init-config.sh: runs on pod start, builds config.json + profile, runs PG migrations
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octos-init-script
+  namespace: octos
+data:
+  init-config.sh: |
+    #!/bin/sh
+    set -e
+    echo "=== octos k8s init ==="
+
+    # 1. Data dir
+    mkdir -p /tmp/octos-data
+    chmod 700 /tmp/octos-data
+
+    # 2. Top-level config (auth_token from env)
+    cat > /tmp/octos-data/config.json <<EOF
+    {
+      "version": 1,
+      "auth_token": "${OCTOS_AUTH_TOKEN}",
+      "default_profile": "${DEFAULT_PROFILE:-cluster-worker}"
+    }
+    EOF
+
+    # 3. Default profile (if absent)
+    PROFILE_DIR=/tmp/octos-data/profiles/${DEFAULT_PROFILE:-cluster-worker}
+    mkdir -p "$PROFILE_DIR"
+    if [ ! -f "$PROFILE_DIR/config.json" ]; then
+      cat > "$PROFILE_DIR/config.json" <<EOF
+    {
+      "id": "${DEFAULT_PROFILE:-cluster-worker}",
+      "name": "Cluster Worker",
+      "enabled": true,
+      "workspace_root": "${WORKSPACE_DIR:-/workspace}",
+      "config": {
+        "llm": {
+          "primary": {
+            "provider": "${LLM_PROVIDER:-anthropic}",
+            "api_type": "${LLM_PROVIDER:-anthropic}",
+            "model": "${LLM_MODEL:-k3}",
+            "base_url": "${LLM_BASE_URL:-}",
+            "api_key_env": "${LLM_API_KEY_ENV:-ANTHROPIC_API_KEY}"
+          }
+        }
+      }
+    }
+    EOF
+    fi
+
+    # 4. Workspace dir
+    mkdir -p "${WORKSPACE_DIR:-/workspace}"
+
+    # 5. PG migrations (cluster mode)
+    if [ -n "$DATABASE_URL" ]; then
+      echo "Running PG migrations..."
+      /opt/octos --instance-data-dir /tmp/octos-data migrate || \
+        echo "WARNING: migrate command failed (will retry lazily)"
+    fi
+
+    echo "=== init complete, starting octos ==="
+    exec /opt/octos "$@"
+
+---
+# Octos serve (cluster mode) with configmap-based init
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: octos
+  template:
+    metadata:
+      labels:
+        app: octos
+    spec:
+      containers:
+      - name: octos
+        image: alpine:3.21
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/init-config.sh"]
+        args:
+        - serve
+        - --port
+        - "8080"
+        - --instance-data-dir
+        - /tmp/octos-data
+        envFrom:
+        - configMapRef:
+            name: octos-config
+        - secretRef:
+            name: llm-credentials
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: octos-binary
+          mountPath: /opt/octos
+          readOnly: true
+          subPath: octos
+        - name: init-script
+          mountPath: /usr/local/bin/init-config.sh
+          readOnly: true
+          subPath: init-config.sh
+      volumes:
+      - name: octos-binary
+        hostPath:
+          path: /tmp/octos-k8s/octos
+          type: File
+      - name: init-script
+        configMap:
+          name: octos-init-script
+          defaultMode: 0o755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  selector:
+    app: octos
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP

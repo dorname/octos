@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octos-config
+  namespace: octos
+data:
+  DATABASE_URL: "postgres://postgres:octos@pg.octos.svc.cluster.local:5432/octos"
+  RUST_LOG: "info"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: octos
+---
+# PostgreSQL for k8s cluster mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg
+  template:
+    metadata:
+      labels:
+        app: pg
+    spec:
+      containers:
+      - name: pg
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: octos
+        - name: POSTGRES_DB
+          value: octos
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres", "-d", "octos"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: pgdata
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  selector:
+    app: pg
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+---
+# Octos serve (2 replicas for cluster mode)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: octos
+  template:
+    metadata:
+      labels:
+        app: octos
+    spec:
+      containers:
+      - name: octos
+        image: octos:k8s-stateless
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/octos"]
+        args: ["serve", "--port", "8080"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: octos-config
+              key: DATABASE_URL
+        - name: RUST_LOG
+          value: info
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  selector:
+    app: octos
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
