@@ -169,10 +169,12 @@ data:
     EOF
 
     # 3. Default profile (if absent)
-    PROFILE_DIR=/tmp/octos-data/profiles/${DEFAULT_PROFILE:-cluster-worker}
-    mkdir -p "$PROFILE_DIR"
-    if [ ! -f "$PROFILE_DIR/config.json" ]; then
-      cat > "$PROFILE_DIR/config.json" <<EOF
+    #    octos ProfileDefinition::load reads <data_dir>/profiles/<id>.json
+    #    (flat file, NOT <id>/config.json subdir). Use flat format here.
+    PROFILE_FILE=/tmp/octos-data/profiles/${DEFAULT_PROFILE:-cluster-worker}.json
+    NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ ! -f "$PROFILE_FILE" ]; then
+      cat > "$PROFILE_FILE" <<EOF
     {
       "id": "${DEFAULT_PROFILE:-cluster-worker}",
       "name": "Cluster Worker",
@@ -188,7 +190,9 @@ data:
             "api_key_env": "${LLM_API_KEY_ENV:-ANTHROPIC_API_KEY}"
           }
         }
-      }
+      },
+      "created_at": "$NOW",
+      "updated_at": "$NOW"
     }
     EOF
     fi
@@ -284,6 +288,16 @@ spec:
             name: octos-config
         - secretRef:
             name: llm-credentials
+        env:
+        - name: OCTOS_HOME
+          value: /tmp/octos-data
+        - name: RUST_LOG
+          value: "info,octos_cli=debug,octos_store=debug"
+        # Allow AppUI/WebSocket connections from common port-forward
+        # ports (9091, 8080) + the loopback variants. The serve port
+        # (8080) is auto-appended; 9091 is the user's port-forward.
+        - name: OCTOS_APPUI_ALLOWED_ORIGINS
+          value: "http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080"
         ports:
         - containerPort: 8080
         readinessProbe:
