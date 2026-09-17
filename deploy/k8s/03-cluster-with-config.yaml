@@ -196,18 +196,28 @@ data:
     # 4. Workspace dir
     mkdir -p "${WORKSPACE_DIR:-/workspace}"
 
-    # 5. PG migrations (cluster mode).
+    # 5. Fetch octos binary from host.docker.internal:8088.
+    #    The user runs `python3 -m http.server 8088` (or similar) in
+    #    the directory containing `octos` BEFORE applying this manifest.
+    #    docker-desktop makes the host reachable at host.docker.internal.
+    #    For Linux/minikube: replace with the host IP.
+    echo "Fetching octos binary from http://host.docker.internal:8088/octos..."
+    if wget -q -O /opt/octos/octos http://host.docker.internal:8088/octos; then
+      chmod +x /opt/octos/octos
+      echo "Binary installed: $(/opt/octos/octos --version 2>&1 | head -1)"
+    else
+      echo "ERROR: failed to fetch binary from host.docker.internal:8088."
+      echo "On the host, run: cd <dir-of-octos-binary> && python3 -m http.server 8088 &"
+      exit 1
+    fi
+
+    # 6. PG migrations (cluster mode).
     #    octos-cli does NOT currently expose a `migrate` subcommand.
     #    Instead, `attach_durable_approvals_pg` and `attach_cron_service_pg`
     #    in serve.rs call `store.migrate()` LAZILY on first DB op. This is
     #    by design (K06): migrations run when the durable backend is first
     #    touched, so a deployment that never parks an approval / never
     #    records a firing skips the migration entirely.
-    #
-    #    Implication: if octos serve never receives a request that hits
-    #    PG, the schema is NOT created. For deployments that need schema
-    #    eagerly (e.g. admin wants to inspect tables), see the `migrate`
-    #    subcommand RFC in docs/analysis/pg-persistence-matrix.md.
     if [ -n "$DATABASE_URL" ]; then
       echo "PG migrations will run lazily on first DB op (K06 design)."
     fi
@@ -222,7 +232,7 @@ metadata:
   name: octos
   namespace: octos
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: octos
@@ -231,11 +241,11 @@ spec:
       labels:
         app: octos
     spec:
-      # initContainer: prepares config + runs PG migrations BEFORE the
-      # main container starts. This is more robust than baking init into
-      # the entrypoint because k8s lifecycle hooks (e.g. crashloopbackoff
-      # backoff) treat the init container failure separately from the
-      # main container.
+      # initContainer: prepares config + injects binary via emptyDir.
+      # This avoids the hostPath brittleness (docker-desktop VM cannot
+      # see WSL's /tmp; Windows-only paths also don't work uniformly).
+      # The binary is base64-encoded in ConfigMap `octos-binary` and
+      # decoded into an emptyDir shared with the main container.
       initContainers:
       - name: init
         image: alpine:3.21
@@ -250,6 +260,8 @@ spec:
           mountPath: /tmp/octos-data
         - name: workspace
           mountPath: /workspace
+        - name: octos-binary
+          mountPath: /opt/octos
         - name: init-script
           mountPath: /usr/local/bin/init-config.sh
           readOnly: true
@@ -263,6 +275,8 @@ spec:
         - serve
         - --port
         - "8080"
+        - --host
+        - "0.0.0.0"
         - --instance-data-dir
         - /tmp/octos-data
         envFrom:
@@ -289,17 +303,13 @@ spec:
           mountPath: /tmp/octos-data
         - name: workspace
           mountPath: /workspace
-        # NOTE: binary is mounted at /opt/octos/octos (the file). To run it
-        # we need it executable. The hostPath directory must contain a
-        # pre-chmoded file. Build flow:
-        #   cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
-        #   mkdir -p /tmp/octos-k8s
-        #   cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s/octos
-        #   chmod +x /tmp/octos-k8s/octos
         - name: octos-binary
-          mountPath: /opt/octos/octos
+          mountPath: /opt/octos
           readOnly: true
-          subPath: octos
+          # The init-container decodes the binary from ConfigMap
+          # `octos-binary` into /opt/octos/octos and chmods +x it.
+          # No hostPath required — works on any cluster (docker-desktop,
+          # minikube, kind, real K8s).
       volumes:
       - name: octos-data
         persistentVolumeClaim:
@@ -308,12 +318,7 @@ spec:
         persistentVolumeClaim:
           claimName: workspace
       - name: octos-binary
-        hostPath:
-          # Single-node (docker-desktop / minikube) — production must use
-          # a real image registry. The binary MUST be present and executable
-          # at this path on the node before deployment.
-          path: /tmp/octos-k8s/octos
-          type: File
+        emptyDir: {}
       - name: init-script
         configMap:
           name: octos-init-script
