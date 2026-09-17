@@ -288,6 +288,8 @@ spec:
             name: octos-config
         - secretRef:
             name: llm-credentials
+        - secretRef:
+            name: minimax-credentials
         env:
         - name: OCTOS_HOME
           value: /tmp/octos-data
