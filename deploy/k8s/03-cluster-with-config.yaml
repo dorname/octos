@@ -102,7 +102,8 @@ stringData:
   ANTHROPIC_API_KEY: "REPLACE_ME"
 
 ---
-# init-config.sh: runs on pod start, builds config.json + profile, runs PG migrations
+# init-config.sh: runs as initContainer BEFORE octos serve starts.
+# Builds config.json + default profile, runs PG migrations.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -155,18 +156,26 @@ data:
     # 4. Workspace dir
     mkdir -p "${WORKSPACE_DIR:-/workspace}"
 
-    # 5. PG migrations (cluster mode)
+    # 5. PG migrations (cluster mode).
+    #    octos-cli does NOT currently expose a `migrate` subcommand.
+    #    Instead, `attach_durable_approvals_pg` and `attach_cron_service_pg`
+    #    in serve.rs call `store.migrate()` LAZILY on first DB op. This is
+    #    by design (K06): migrations run when the durable backend is first
+    #    touched, so a deployment that never parks an approval / never
+    #    records a firing skips the migration entirely.
+    #
+    #    Implication: if octos serve never receives a request that hits
+    #    PG, the schema is NOT created. For deployments that need schema
+    #    eagerly (e.g. admin wants to inspect tables), see the `migrate`
+    #    subcommand RFC in docs/analysis/pg-persistence-matrix.md.
     if [ -n "$DATABASE_URL" ]; then
-      echo "Running PG migrations..."
-      /opt/octos --instance-data-dir /tmp/octos-data migrate || \
-        echo "WARNING: migrate command failed (will retry lazily)"
+      echo "PG migrations will run lazily on first DB op (K06 design)."
     fi
 
-    echo "=== init complete, starting octos ==="
-    exec /opt/octos "$@"
+    echo "=== init complete ==="
 
 ---
-# Octos serve (cluster mode) with configmap-based init
+# Octos serve (cluster mode) with initContainer that runs the init script.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -182,11 +191,34 @@ spec:
       labels:
         app: octos
     spec:
+      # initContainer: prepares config + runs PG migrations BEFORE the
+      # main container starts. This is more robust than baking init into
+      # the entrypoint because k8s lifecycle hooks (e.g. crashloopbackoff
+      # backoff) treat the init container failure separately from the
+      # main container.
+      initContainers:
+      - name: init
+        image: alpine:3.21
+        command: ["/usr/local/bin/init-config.sh"]
+        envFrom:
+        - configMapRef:
+            name: octos-config
+        - secretRef:
+            name: llm-credentials
+        volumeMounts:
+        - name: octos-data
+          mountPath: /tmp/octos-data
+        - name: workspace
+          mountPath: /workspace
+        - name: init-script
+          mountPath: /usr/local/bin/init-config.sh
+          readOnly: true
+          subPath: init-config.sh
       containers:
       - name: octos
         image: alpine:3.21
         imagePullPolicy: IfNotPresent
-        command: ["/usr/local/bin/init-config.sh"]
+        command: ["/opt/octos/octos"]
         args:
         - serve
         - --port
@@ -213,17 +245,31 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 10
         volumeMounts:
+        - name: octos-data
+          mountPath: /tmp/octos-data
+        - name: workspace
+          mountPath: /workspace
+        # NOTE: binary is mounted at /opt/octos/octos (the file). To run it
+        # we need it executable. The hostPath directory must contain a
+        # pre-chmoded file. Build flow:
+        #   cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+        #   mkdir -p /tmp/octos-k8s
+        #   cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s/octos
+        #   chmod +x /tmp/octos-k8s/octos
         - name: octos-binary
-          mountPath: /opt/octos
+          mountPath: /opt/octos/octos
           readOnly: true
           subPath: octos
-        - name: init-script
-          mountPath: /usr/local/bin/init-config.sh
-          readOnly: true
-          subPath: init-config.sh
       volumes:
+      - name: octos-data
+        emptyDir: {}
+      - name: workspace
+        emptyDir: {}
       - name: octos-binary
         hostPath:
+          # Single-node (docker-desktop / minikube) — production must use
+          # a real image registry. The binary MUST be present and executable
+          # at this path on the node before deployment.
           path: /tmp/octos-k8s/octos
           type: File
       - name: init-script
