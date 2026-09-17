@@ -77,6 +77,25 @@ fn read_manifest() -> String {
 }
 
 #[test]
+fn test_k8s_manifest_uses_pvc_not_emptydir() {
+    // Bug 2 fix: PG data + octos-data + workspace must be PVC,
+    // NOT emptyDir (which would lose data on Pod restart).
+    let manifest = read_manifest();
+    assert!(
+        manifest.contains("persistentVolumeClaim"),
+        "manifest must use persistentVolumeClaim (data must survive Pod restart)"
+    );
+    assert!(
+        manifest.contains("claimName: pgdata"),
+        "pgdata PVC claim must be defined"
+    );
+    assert!(
+        manifest.contains("claimName: octos-data"),
+        "octos-data PVC claim must be defined"
+    );
+}
+
+#[test]
 fn test_k8s_manifest_uses_init_container() {
     let manifest = read_manifest();
     assert!(

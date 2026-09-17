@@ -4,6 +4,45 @@ metadata:
   name: octos
 
 ---
+# PersistentVolumeClaims: PG data + octos instance data + workspace.
+# Pod 重建后数据保留——这是修复 K8s bug 2 的关键。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgdata
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: octos-data
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi
+
+---
 # PostgreSQL for cluster mode
 apiVersion: apps/v1
 kind: Deployment
@@ -43,7 +82,8 @@ spec:
           periodSeconds: 5
       volumes:
       - name: pgdata
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: pgdata
 
 ---
 apiVersion: v1
@@ -262,9 +302,11 @@ spec:
           subPath: octos
       volumes:
       - name: octos-data
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: octos-data
       - name: workspace
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: workspace
       - name: octos-binary
         hostPath:
           # Single-node (docker-desktop / minikube) — production must use
