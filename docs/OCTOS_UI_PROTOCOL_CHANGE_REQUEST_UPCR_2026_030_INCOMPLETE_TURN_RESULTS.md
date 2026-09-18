@@ -66,8 +66,8 @@ exists, these resource operations, result persistence, parent continuations,
 closed-peer guards and snapshots resolve the same active profile runtime as
 session execution. Their request and result schemas do not change.
 
-- `specs/task-oup-json-partial-error.spec`
-- `specs/task-non-oup-incomplete-response.spec`
+- `logos/changes/archive/agent-spec-legacy/task-oup-json-partial-error.spec`
+- `logos/changes/archive/agent-spec-legacy/task-non-oup-incomplete-response.spec`
 - `scripts/tests/test-oup-runtime.py`: actual chat/ACP/OUP subprocesses,
   localhost provider/tool execution, failed JSON/text output, and cold replay.
 - `scripts/check-oup-bindings.py`: generated binding parity, C declarations,

@@ -1,7 +1,7 @@
 //! Integration tests for octos serve BrokenPipe-safe shutdown.
 //!
 //! These tests verify the four integration selectors from
-//! `specs/task-s-broken-pipe-shutdown.spec.md`:
+//! `logos/changes/archive/agent-spec-legacy/task-s-broken-pipe-shutdown.spec.md`:
 //! 1. subprocess_panic_stderr_broken_pipe_no_abort
 //! 2. serve_shutdown_broken_pipe_cleanup_marker_observed
 //! 3. serve_shutdown_order_preserved

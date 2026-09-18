@@ -1108,7 +1108,7 @@ const PLAN_TITLE_MAX_BYTES: usize = 120;
 
 /// Sentinels delimiting the preserved-plan block inside a compaction
 /// summary. STATE, not instructions: the wording defers to the newest user
-/// message on purpose — `specs/task-compaction-instruction-priority.spec.md`
+/// message on purpose — `logos/changes/archive/agent-spec-legacy/task-compaction-instruction-priority.spec.md`
 /// exists because imperatives inside summaries were followed over fresh
 /// user input, and an earlier cut of this feature ("resume from the first
 /// unchecked item") reproduced exactly that bug. The BEGIN sentinel doubles
