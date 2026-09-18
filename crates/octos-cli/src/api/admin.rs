@@ -1099,6 +1099,9 @@ pub async fn test_provider(
             model_hints: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
+            // Test-provider endpoint: the key comes from the request body,
+            // always a plain API key, never a stored OAuth credential.
+            credential: None,
         };
         match octos_llm::registry::lookup(&req.provider) {
             Some(entry) => (entry.create)(params)

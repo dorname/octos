@@ -1843,11 +1843,25 @@ pub fn create_provider_with_api_type(
         )
     })?;
 
-    // Resolve API key via config (auth store → env var).
-    let api_key = if entry.requires_api_key {
-        Some(config.get_api_key(entry.name)?)
+    // Resolve the credential via config (auth store → env var), keeping its
+    // KIND: a ChatGPT subscription OAuth token must reach the registry so
+    // the OpenAI factory routes it to the Codex backend — treated as a bare
+    // API key it 403s every model on api.openai.com.
+    let resolved = if entry.requires_api_key {
+        Some(config.resolve_credential(entry.name)?)
     } else {
-        config.get_api_key(entry.name).ok()
+        config.resolve_credential(entry.name).ok()
+    };
+    let (api_key, credential) = match resolved {
+        Some(crate::config::ResolvedCredential::ChatGptOAuth {
+            access_token,
+            account_id,
+        }) => (
+            Some(access_token),
+            Some(octos_llm::registry::CredentialKind::ChatGptOAuth { account_id }),
+        ),
+        Some(crate::config::ResolvedCredential::ApiKey(key)) => (Some(key), None),
+        None => (None, None),
     };
 
     if entry.requires_model && model.is_none() {
@@ -1904,6 +1918,16 @@ pub fn create_provider_with_api_type(
                 )
             })?;
         let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
+        // A ChatGPT subscription OAuth token must hit the Codex backend even
+        // under an explicit responses api_type (unless the user also pointed
+        // base_url at their own endpoint).
+        if base_url.is_none() {
+            if let Some(octos_llm::registry::CredentialKind::ChatGptOAuth { account_id }) =
+                &credential
+            {
+                provider = provider.with_chatgpt_oauth(account_id.clone());
+            }
+        }
         if let Some(url) = base_url {
             provider = provider.with_base_url(&url);
         }
@@ -1921,6 +1945,7 @@ pub fn create_provider_with_api_type(
         model_hints: config.model_hints.clone(),
         llm_timeout_secs,
         llm_connect_timeout_secs,
+        credential,
     };
 
     let provider = (entry.create)(params)?;

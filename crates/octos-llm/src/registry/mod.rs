@@ -104,6 +104,24 @@ pub struct CreateParams {
     pub llm_timeout_secs: Option<u64>,
     /// HTTP connect timeout in seconds (`None` → provider default).
     pub llm_connect_timeout_secs: Option<u64>,
+    /// Kind of the resolved credential (`None` → plain API key). ChatGPT
+    /// subscription OAuth tokens carry no `api.*` scopes and 403 on every
+    /// api.openai.com call — factories must route them to the Codex backend.
+    pub credential: Option<CredentialKind>,
+}
+
+/// How the resolved credential was obtained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// Platform API key (paste-token, env var, or keychain).
+    ApiKey,
+    /// ChatGPT subscription OAuth token (browser PKCE / device code login).
+    /// Valid only against the Codex backend
+    /// (`chatgpt.com/backend-api/codex`), not api.openai.com.
+    ChatGptOAuth {
+        /// ChatGPT workspace ID for the `chatgpt-account-id` header.
+        account_id: Option<String>,
+    },
 }
 
 impl CreateParams {
@@ -514,6 +532,19 @@ mod tests {
         assert!(e.requires_api_key);
         // bare gemini model names must NOT auto-route to vertex.
         assert_eq!(detect_provider("gemini-2.5-flash"), Some("gemini"));
+    }
+
+    #[test]
+    fn minimax_cn_entry_is_registered() {
+        let e = lookup("minimax-cn").expect("minimax-cn provider should be registered");
+        assert_eq!(e.name, "minimax-cn");
+        assert_eq!(e.api_key_env, Some("MINIMAX_CN_API_KEY"));
+        assert_eq!(e.default_base_url, Some("https://api.minimaxi.com/v1"));
+        assert!(e.is_known_key_env("MINIMAX_API_KEY"));
+        assert!(e.requires_api_key);
+        // Bare MiniMax model names must still route to the international family,
+        // not silently to the China variant.
+        assert_eq!(detect_provider("MiniMax-M3"), Some("minimax"));
     }
 
     #[test]

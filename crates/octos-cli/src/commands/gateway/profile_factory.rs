@@ -1500,6 +1500,10 @@ mod tests {
         let config = crate::config::Config {
             provider: Some("openai".to_string()),
             model: Some("gpt-4o-mini".to_string()),
+            // The test asserts the ENV-VAR path; the global auth store
+            // outranks env vars, so on a machine with a real `octos auth
+            // login -p openai` credential it would shadow the test key.
+            bypass_auth_store: true,
             ..Default::default()
         };
         let cfg = build_synthesis_config(&config, "openai").expect("resolves");
@@ -1526,6 +1530,10 @@ mod tests {
         let config = crate::config::Config {
             provider: Some("openai".to_string()),
             model: Some("gpt-4o-mini".to_string()),
+            // Never consult the global auth store: on a machine with a real
+            // `octos auth login -p openai` credential it would resolve a key
+            // and defeat this "unresolvable" scenario.
+            bypass_auth_store: true,
             ..Default::default()
         };
         // Without an API key the helper must return None so the plugin

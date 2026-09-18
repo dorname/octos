@@ -91,6 +91,7 @@ mod tests {
             model_hints: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
+            credential: None,
         }
     }
 

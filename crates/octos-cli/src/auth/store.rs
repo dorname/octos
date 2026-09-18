@@ -27,6 +27,12 @@ pub struct AuthCredential {
     pub provider: String,
     /// "oauth", "device_code", or "paste_token".
     pub auth_method: String,
+    /// ChatGPT workspace/account ID from the OAuth JWT (`chatgpt_account_id`
+    /// claim). Only present for ChatGPT subscription OAuth credentials; the
+    /// Codex backend requires it as the `chatgpt-account-id` header. Older
+    /// stores lack this field — callers fall back to parsing the JWT lazily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl AuthCredential {
@@ -162,6 +168,7 @@ mod tests {
             expires_at: None,
             provider: "anthropic".to_string(),
             auth_method: "paste_token".to_string(),
+            account_id: None,
         };
 
         store.set("anthropic", cred).unwrap();
@@ -181,6 +188,7 @@ mod tests {
             expires_at: None,
             provider: "openai".to_string(),
             auth_method: "oauth".to_string(),
+            account_id: None,
         };
 
         store.set("openai", cred).unwrap();
@@ -199,6 +207,7 @@ mod tests {
             expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
             provider: "test".to_string(),
             auth_method: "oauth".to_string(),
+            account_id: None,
         };
         assert!(expired.is_expired());
 
@@ -208,6 +217,7 @@ mod tests {
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
             provider: "test".to_string(),
             auth_method: "oauth".to_string(),
+            account_id: None,
         };
         assert!(!valid.is_expired());
 
@@ -217,6 +227,7 @@ mod tests {
             expires_at: None,
             provider: "test".to_string(),
             auth_method: "paste_token".to_string(),
+            account_id: None,
         };
         assert!(!no_expiry.is_expired());
     }
@@ -245,6 +256,7 @@ mod tests {
                     expires_at: None,
                     provider: "anthropic".into(),
                     auth_method: "paste_token".into(),
+                    account_id: None,
                 },
             )
             .unwrap();
@@ -276,6 +288,75 @@ mod tests {
     }
 
     #[test]
+    fn should_roundtrip_account_id_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = test_store(&tmp);
+
+        let cred = AuthCredential {
+            access_token: "jwt".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at: None,
+            provider: "openai".to_string(),
+            auth_method: "device_code".to_string(),
+            account_id: Some("acct-123".to_string()),
+        };
+        store.set("openai", cred).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("auth.json")).unwrap();
+        assert!(content.contains("acct-123"));
+        let data: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            data["credentials"]["openai"]["account_id"].as_str(),
+            Some("acct-123")
+        );
+    }
+
+    #[test]
+    fn should_omit_account_id_when_none() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = test_store(&tmp);
+
+        let cred = AuthCredential {
+            access_token: "sk-test".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            provider: "openai".to_string(),
+            auth_method: "paste_token".to_string(),
+            account_id: None,
+        };
+        store.set("openai", cred).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("auth.json")).unwrap();
+        assert!(
+            !content.contains("account_id"),
+            "None account_id must be skipped: {content}"
+        );
+    }
+
+    #[test]
+    fn should_default_account_id_to_none_for_legacy_credentials() {
+        // Credentials written before the account_id field existed must still load.
+        let json = r#"{
+            "credentials": {
+                "openai": {
+                    "access_token": "jwt",
+                    "refresh_token": "r",
+                    "provider": "openai",
+                    "auth_method": "device_code"
+                }
+            }
+        }"#;
+        let tmp = TempDir::new().unwrap();
+        let auth_home = tmp.path().join("octos");
+        std::fs::create_dir_all(&auth_home).unwrap();
+        std::fs::write(auth_home.join("auth.json"), json).unwrap();
+
+        let store = AuthStore::at(&auth_home).unwrap();
+        let cred = store.get("openai").unwrap();
+        assert_eq!(cred.account_id, None);
+    }
+
+    #[test]
     fn test_persistence() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("auth.json");
@@ -295,6 +376,7 @@ mod tests {
                         expires_at: None,
                         provider: "test".to_string(),
                         auth_method: "oauth".to_string(),
+                        account_id: None,
                     },
                 )
                 .unwrap();

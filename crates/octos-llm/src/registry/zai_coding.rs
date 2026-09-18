@@ -86,6 +86,7 @@ mod tests {
             .await;
 
         let provider = create(CreateParams {
+            credential: None,
             api_key: Some("test-key".into()),
             model: Some("glm-5.2".into()),
             base_url: Some(server.uri()),

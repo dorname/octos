@@ -13767,6 +13767,9 @@ fn build_test_llm_provider(
         model_hints: None,
         llm_timeout_secs: None,
         llm_connect_timeout_secs: None,
+        // Test-provider endpoint: the key comes from the request body,
+        // always a plain API key, never a stored OAuth credential.
+        credential: None,
     };
     match octos_llm::registry::lookup(family_id) {
         Some(entry) => (entry.create)(params).map_err(|error| format!("provider error: {error:#}")),

@@ -147,6 +147,7 @@ mod tests {
             .await;
 
         let provider = create(CreateParams {
+            credential: None,
             api_key: Some("test-key".into()),
             model: Some("claude-sonnet-4-6".into()),
             base_url: Some(server.uri()),

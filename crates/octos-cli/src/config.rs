@@ -1750,6 +1750,78 @@ pub fn resolve_config_file_path(
     home
 }
 
+/// A resolved provider credential, tagged by kind. ChatGPT subscription
+/// OAuth tokens (browser PKCE / device code login) carry no `api.*` scopes —
+/// sending them to api.openai.com 403s every model ("Missing scopes:
+/// api.model.read"). They only work against the Codex backend, so provider
+/// construction must route by kind, not treat every token as an API key.
+#[derive(Debug, Clone)]
+pub enum ResolvedCredential {
+    /// Platform API key (paste-token, env var, or keychain).
+    ApiKey(String),
+    /// ChatGPT subscription OAuth token, valid only against the Codex
+    /// backend (`chatgpt.com/backend-api/codex`).
+    ChatGptOAuth {
+        access_token: String,
+        /// ChatGPT workspace ID for the `chatgpt-account-id` header.
+        account_id: Option<String>,
+    },
+}
+
+impl ResolvedCredential {
+    /// The bearer token, regardless of kind.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::ApiKey(k) => k,
+            Self::ChatGptOAuth { access_token, .. } => access_token,
+        }
+    }
+}
+
+/// Refresh tokens this many seconds before expiry (clock-skew leeway).
+const REFRESH_LEEWAY_SECS: i64 = 60;
+
+/// Whether the credential expires within `secs` from now (or already has).
+/// Credentials without an expiry (paste tokens) never do.
+fn credential_expires_within(cred: &crate::auth::AuthCredential, secs: i64) -> bool {
+    cred.expires_at
+        .is_some_and(|exp| exp < chrono::Utc::now() + chrono::Duration::seconds(secs))
+}
+
+/// Tag a stored credential by kind. Only OpenAI login issues
+/// ChatGPT-subscription OAuth tokens today; everything else (paste-token,
+/// other providers) is a plain API key.
+fn classify_credential(provider: &str, cred: &crate::auth::AuthCredential) -> ResolvedCredential {
+    if provider == "openai" && matches!(cred.auth_method.as_str(), "oauth" | "device_code") {
+        return ResolvedCredential::ChatGptOAuth {
+            access_token: cred.access_token.clone(),
+            account_id: cred
+                .account_id
+                .clone()
+                .or_else(|| crate::auth::oauth::chatgpt_account_id(&cred.access_token)),
+        };
+    }
+    ResolvedCredential::ApiKey(cred.access_token.clone())
+}
+
+/// Env-var candidates for `provider`: the configured var plus registry-known
+/// sibling key names (only when the configured var is itself a known name),
+/// with every candidate secret-registered before any resolution path runs.
+fn secret_registered_candidates(provider: &str, env_var: &str) -> Vec<String> {
+    let mut candidates = vec![env_var.to_string()];
+    if let Some(entry) = octos_llm::registry::lookup(provider) {
+        if entry.is_known_key_env(env_var) {
+            for k in entry.key_env_names() {
+                if !candidates.iter().any(|c| c == k) {
+                    candidates.push(k.to_string());
+                }
+            }
+        }
+    }
+    octos_agent::register_secret_env_names(candidates.iter());
+    candidates
+}
+
 impl Config {
     /// Path to the runtime config file under the resolved data dir.
     pub fn data_dir_config_path(data_dir: &Path) -> PathBuf {
@@ -2055,19 +2127,7 @@ impl Config {
         // of the provider's known key names — an arbitrary custom `api_key_env`
         // override (e.g. a proxy key) stays exclusive so a missing override
         // never falls back to an unrelated ambient credential.
-        let mut candidates = vec![env_var.clone()];
-        if let Some(entry) = octos_llm::registry::lookup(provider) {
-            // Only expand to sibling key vars when the configured var is itself
-            // a declared key name (case-sensitive — see `is_known_key_env`).
-            if entry.is_known_key_env(&env_var) {
-                for k in entry.key_env_names() {
-                    if !candidates.iter().any(|c| c == k) {
-                        candidates.push(k.to_string());
-                    }
-                }
-            }
-        }
-        octos_agent::register_secret_env_names(candidates.iter());
+        let candidates = secret_registered_candidates(provider, &env_var);
 
         // Check auth store first. Auth is GLOBAL: it lives under the resolver's
         // `auth_home` (OCTOS_CONFIG_DIR if set, else the XDG default). This is
@@ -2107,6 +2167,124 @@ impl Config {
         Err(eyre::eyre!(
             "{env_var} not set or empty. Run `octos auth login -p {provider}` or set the env var"
         ))
+    }
+
+    /// Resolve the provider credential WITH its kind. Same precedence chain
+    /// as [`Self::get_api_key`] (auth store → `env_vars` → process env), but
+    /// the auth-store branch classifies the credential so provider
+    /// construction can route ChatGPT subscription OAuth tokens to the Codex
+    /// backend instead of api.openai.com (where they 403 every model).
+    ///
+    /// Blocking: an expired/expiring OAuth credential is refreshed with a
+    /// synchronous HTTP call (`reqwest::blocking` panics on a tokio runtime
+    /// thread), so async callers MUST go through `tokio::task::spawn_blocking`.
+    pub fn resolve_credential(&self, provider: &str) -> Result<ResolvedCredential> {
+        let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+        self.resolve_credential_with_auth_home(provider, &auth_home)
+    }
+
+    /// [`Self::resolve_credential`] against an explicit auth-store location.
+    /// Production code uses the resolver's global `auth_home`; tests inject a
+    /// temp dir here instead of serializing on HOME env overrides.
+    fn resolve_credential_with_auth_home(
+        &self,
+        provider: &str,
+        auth_home: &std::path::Path,
+    ) -> Result<ResolvedCredential> {
+        // A genuinely custom `api_key_env` means "use this variable": the
+        // provider-scoped auth store must not win, or a stored OAuth login
+        // would be sent to the custom endpoint the override targets. Mirrors
+        // `get_api_key_with_env`'s custom-override semantics.
+        if let Some(var) = &self.api_key_env {
+            if !Self::provider_knows_key_env(provider, var) {
+                return self.resolve_env_var_only(var).map(ResolvedCredential::ApiKey);
+            }
+        }
+
+        let env_var = self.api_key_env.clone().unwrap_or_else(|| {
+            octos_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
+        });
+        let candidates = secret_registered_candidates(provider, &env_var);
+
+        if !self.bypass_auth_store {
+            if let Ok(store) = crate::auth::AuthStore::at(auth_home) {
+                if let Some(cred) = store.get(provider).cloned() {
+                    return Self::resolve_stored_credential(store, provider, &cred);
+                }
+            }
+        }
+
+        for name in &candidates {
+            if let Some(value) = self.env_vars.get(name).and_then(|value| {
+                crate::auth::keychain::resolve_value(name, value).filter(|value| !value.is_empty())
+            }) {
+                return Ok(ResolvedCredential::ApiKey(value));
+            }
+        }
+
+        for name in &candidates {
+            if let Ok(value) = std::env::var(name) {
+                if !value.is_empty() {
+                    return Ok(ResolvedCredential::ApiKey(value));
+                }
+            }
+        }
+
+        Err(eyre::eyre!(
+            "{env_var} not set or empty. Run `octos auth login -p {provider}` or set the env var"
+        ))
+    }
+
+    /// Classify a stored credential, refreshing it first when expired or
+    /// inside the leeway window. Unlike `resolve_api_key` (which silently
+    /// skips an expired credential and misreports "not set"), an expired
+    /// login either auto-refreshes or fails with an actionable message.
+    fn resolve_stored_credential(
+        mut store: crate::auth::AuthStore,
+        provider: &str,
+        cred: &crate::auth::AuthCredential,
+    ) -> Result<ResolvedCredential> {
+        if !credential_expires_within(cred, REFRESH_LEEWAY_SECS) {
+            return Ok(classify_credential(provider, cred));
+        }
+
+        // Expired or expiring soon. OAuth logins carry a refresh token —
+        // use it; paste tokens never expire so they never reach this branch.
+        if cred.refresh_token.is_some()
+            && matches!(cred.auth_method.as_str(), "oauth" | "device_code")
+        {
+            match crate::auth::oauth::refresh_access_token_blocking(cred) {
+                Ok(new_cred) => {
+                    let classified = classify_credential(provider, &new_cred);
+                    // Best-effort persist: a failed write must not lose the
+                    // fresh token we already hold in memory.
+                    if let Err(e) = store.set(provider, new_cred) {
+                        tracing::warn!("failed to persist refreshed credential: {e}");
+                    }
+                    return Ok(classified);
+                }
+                Err(e) => {
+                    if !cred.is_expired() {
+                        // Inside the leeway window but still valid — use it.
+                        tracing::warn!("token refresh failed, using current token: {e}");
+                        return Ok(classify_credential(provider, cred));
+                    }
+                    return Err(e).wrap_err(format!(
+                        "{provider} login expired and token refresh failed. Run `octos auth login -p {provider}`"
+                    ));
+                }
+            }
+        }
+
+        if cred.is_expired() {
+            eyre::bail!(
+                "{provider} login expired (no refresh token stored). Run `octos auth login -p {provider}`"
+            );
+        }
+        Ok(classify_credential(provider, cred))
     }
 
     /// Validate the configuration, returning any warnings.
@@ -2869,6 +3047,7 @@ mod tests {
                     expires_at: None,
                     provider: "anthropic".to_string(),
                     auth_method: "paste_token".to_string(),
+                    account_id: None,
                 },
             )
             .unwrap();
@@ -2900,6 +3079,173 @@ mod tests {
             "global-xdg-token",
             "get_api_key must read the GLOBAL XDG auth store (shared login)"
         );
+    }
+
+    // ---- resolve_credential tests ----
+
+    fn stored_oauth_cred(method: &str, account_id: Option<&str>) -> crate::auth::AuthCredential {
+        crate::auth::AuthCredential {
+            access_token: "opaque-oauth-token".into(),
+            refresh_token: Some("refresh-tok".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            provider: "openai".into(),
+            auth_method: method.into(),
+            account_id: account_id.map(str::to_string),
+        }
+    }
+
+    fn store_with_cred(auth_home: &std::path::Path, cred: crate::auth::AuthCredential) {
+        let mut store = crate::auth::AuthStore::at(auth_home).unwrap();
+        store.set("openai", cred).unwrap();
+    }
+
+    #[test]
+    fn should_classify_device_code_credential_as_chatgpt_oauth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        store_with_cred(&auth_home, stored_oauth_cred("device_code", Some("acct-1")));
+
+        let config = Config::default();
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        match cred {
+            ResolvedCredential::ChatGptOAuth {
+                access_token,
+                account_id,
+            } => {
+                assert_eq!(access_token, "opaque-oauth-token");
+                assert_eq!(account_id.as_deref(), Some("acct-1"));
+            }
+            other => panic!("expected ChatGptOAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_classify_browser_oauth_credential_as_chatgpt_oauth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        store_with_cred(&auth_home, stored_oauth_cred("oauth", None));
+
+        let config = Config::default();
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        assert!(matches!(cred, ResolvedCredential::ChatGptOAuth { .. }));
+    }
+
+    #[test]
+    fn should_lazily_parse_account_id_from_jwt_when_stored_field_missing() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}"#,
+        );
+        let jwt = format!("e30.{payload}.sig");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        let mut cred = stored_oauth_cred("device_code", None);
+        cred.access_token = jwt;
+        store_with_cred(&auth_home, cred);
+
+        let config = Config::default();
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        match cred {
+            ResolvedCredential::ChatGptOAuth { account_id, .. } => {
+                assert_eq!(account_id.as_deref(), Some("acct-jwt"));
+            }
+            other => panic!("expected ChatGptOAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_classify_paste_token_as_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        let mut cred = stored_oauth_cred("paste_token", None);
+        cred.access_token = "sk-real-key".into();
+        store_with_cred(&auth_home, cred);
+
+        let config = Config::default();
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        assert!(matches!(cred, ResolvedCredential::ApiKey(k) if k == "sk-real-key"));
+    }
+
+    #[test]
+    fn should_resolve_env_vars_map_as_api_key_when_no_stored_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("nonexistent");
+
+        let mut config = Config::default();
+        config
+            .env_vars
+            .insert("OPENAI_API_KEY".into(), "sk-from-env-map".into());
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        assert!(matches!(cred, ResolvedCredential::ApiKey(k) if k == "sk-from-env-map"));
+    }
+
+    #[test]
+    fn should_error_with_relogin_hint_when_oauth_expired_without_refresh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        let mut cred = stored_oauth_cred("oauth", None);
+        cred.refresh_token = None;
+        cred.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store_with_cred(&auth_home, cred);
+
+        let config = Config::default();
+        let err = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("octos auth login"),
+            "error must guide to re-login, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn should_bypass_auth_store_for_custom_api_key_env_override() {
+        // A custom api_key_env (profile route / proxy endpoint) must NOT
+        // consult the provider-scoped auth store — a stored OAuth login
+        // would otherwise be sent to the custom endpoint the override
+        // targets. Mirrors `get_api_key_with_env` semantics.
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_home = tmp.path().join("octos");
+        store_with_cred(&auth_home, stored_oauth_cred("device_code", Some("acct-1")));
+
+        let mut config = Config::default();
+        config.api_key_env = Some("MY_PROXY_KEY".into());
+        config
+            .env_vars
+            .insert("MY_PROXY_KEY".into(), "sk-proxy".into());
+
+        let cred = config
+            .resolve_credential_with_auth_home("openai", &auth_home)
+            .unwrap();
+        assert!(matches!(cred, ResolvedCredential::ApiKey(k) if k == "sk-proxy"));
+    }
+
+    #[test]
+    fn should_detect_expiring_credentials_within_leeway() {        let mut cred = stored_oauth_cred("oauth", None);
+
+        cred.expires_at = None;
+        assert!(!credential_expires_within(&cred, 60));
+
+        cred.expires_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(!credential_expires_within(&cred, 60));
+
+        cred.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+        assert!(credential_expires_within(&cred, 60));
+
+        cred.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(credential_expires_within(&cred, 60));
     }
 
     /// Run `f` with HOME pointed at an empty temp dir (so the global auth store
@@ -3658,16 +4004,21 @@ mod tests {
         // api_key_env set to the provider's OWN default name is redundant
         // but legal — it must keep the full provider chain (auth store
         // included), not the custom-var-only path. Here the chain falls
-        // through to env_vars, same as get_api_key would.
-        let mut config = Config::default();
-        config
-            .env_vars
-            .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
-        let via_override = config
-            .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
-            .expect("resolves");
-        let via_default = config.get_api_key("openai").expect("resolves");
-        assert_eq!(via_override, via_default);
+        // through to env_vars, same as get_api_key would. Isolated HOME: on
+        // a machine with a real `octos auth login -p openai` credential, the
+        // auth-store branch would otherwise win (and races with tests that
+        // swap HOME, making the two calls disagree).
+        with_isolated_home(|| {
+            let mut config = Config::default();
+            config
+                .env_vars
+                .insert("OPENAI_API_KEY".to_string(), "from-chain".to_string());
+            let via_override = config
+                .get_api_key_with_env("openai", Some("OPENAI_API_KEY"))
+                .expect("resolves");
+            let via_default = config.get_api_key("openai").expect("resolves");
+            assert_eq!(via_override, via_default);
+        });
     }
 
     #[test]

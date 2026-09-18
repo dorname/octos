@@ -176,6 +176,8 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
         _ => token::paste_token_flow(provider)?,
     };
 
+    let note = subscription_note(&cred);
+
     let mut store = open_global_auth_store()?;
     store.set(provider, cred)?;
 
@@ -184,7 +186,49 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
         "OK".green().bold(),
         provider
     );
+    if let Some(note) = note {
+        println!("  {note}");
+        println!(
+            "  Other models (gpt-4o, gpt-4.1, o3, ...) need a platform API key from platform.openai.com."
+        );
+    }
     Ok(())
+}
+
+/// One-line ChatGPT subscription summary for a stored OpenAI OAuth
+/// credential (`None` for API-key/paste-token credentials and other
+/// providers). Used by both `login` (success hint) and `status`.
+fn subscription_note(cred: &crate::auth::AuthCredential) -> Option<String> {
+    if cred.provider != "openai" || !matches!(cred.auth_method.as_str(), "oauth" | "device_code")
+    {
+        return None;
+    }
+    let plan =
+        oauth::chatgpt_plan_type(&cred.access_token).unwrap_or_else(|| "unknown".to_string());
+    Some(format!(
+        "ChatGPT subscription (plan: {plan}) — served via the Codex backend; gpt-5/codex models only"
+    ))
+}
+
+/// The single status line for one stored credential. OAuth logins with a
+/// refresh token never hard-fail on expiry — they refresh on next use — so
+/// say that instead of a scary bare "expired".
+fn credential_status_line(name: &str, cred: &crate::auth::AuthCredential) -> String {
+    let method = &cred.auth_method;
+    let status = if cred.is_expired() {
+        if cred.refresh_token.is_some() {
+            "expired (auto-refresh on next use)".yellow().to_string()
+        } else {
+            "expired".red().to_string()
+        }
+    } else {
+        "active".green().to_string()
+    };
+    let expiry = cred
+        .expires_at
+        .map(|t| format!(" (expires {})", t.format("%Y-%m-%d %H:%M UTC")))
+        .unwrap_or_default();
+    format!("  {name}: {status} [{method}]{expiry}")
 }
 
 fn logout(provider: &str) -> Result<()> {
@@ -211,17 +255,10 @@ fn status() -> Result<()> {
 
     println!("{}", "Authenticated providers:".bold());
     for (name, cred) in creds {
-        let method = &cred.auth_method;
-        let status = if cred.is_expired() {
-            "expired".red().to_string()
-        } else {
-            "active".green().to_string()
-        };
-        let expiry = cred
-            .expires_at
-            .map(|t| format!(" (expires {})", t.format("%Y-%m-%d %H:%M UTC")))
-            .unwrap_or_default();
-        println!("  {name}: {status} [{method}]{expiry}");
+        println!("{}", credential_status_line(name, cred));
+        if let Some(note) = subscription_note(cred) {
+            println!("      {note}");
+        }
     }
     Ok(())
 }
@@ -951,6 +988,63 @@ mod tests {
     }
 
     use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
+
+    fn openai_cred(method: &str, plan: Option<&str>) -> crate::auth::AuthCredential {
+        use base64::Engine;
+        let payload = match plan {
+            Some(p) => format!(
+                r#"{{"https://api.openai.com/auth":{{"chatgpt_plan_type":"{p}","chatgpt_account_id":"acct-1"}}}}"#
+            ),
+            None => "{}".to_string(),
+        };
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        crate::auth::AuthCredential {
+            access_token: format!("e30.{p}.sig"),
+            refresh_token: Some("r".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            provider: "openai".into(),
+            auth_method: method.into(),
+            account_id: None,
+        }
+    }
+
+    #[test]
+    fn should_describe_subscription_for_openai_oauth_credential() {
+        let note = subscription_note(&openai_cred("device_code", Some("plus"))).unwrap();
+        assert!(note.contains("plus"), "{note}");
+        assert!(note.contains("Codex"), "{note}");
+        assert!(note.contains("gpt-5"), "{note}");
+    }
+
+    #[test]
+    fn should_not_describe_subscription_for_paste_token() {
+        assert!(subscription_note(&openai_cred("paste_token", None)).is_none());
+    }
+
+    #[test]
+    fn should_mark_expiring_oauth_as_auto_refresh_in_status_line() {
+        let mut cred = openai_cred("oauth", Some("pro"));
+        cred.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let line = credential_status_line("openai", &cred);
+        assert!(line.contains("auto-refresh"), "{line}");
+        assert!(line.contains("oauth"), "{line}");
+    }
+
+    #[test]
+    fn should_mark_expired_without_refresh_as_plain_expired() {
+        let mut cred = openai_cred("oauth", None);
+        cred.refresh_token = None;
+        cred.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let line = credential_status_line("openai", &cred);
+        assert!(line.contains("expired"), "{line}");
+        assert!(!line.contains("auto-refresh"), "{line}");
+    }
+
+    #[test]
+    fn should_show_active_for_valid_credential() {
+        let line = credential_status_line("openai", &openai_cred("device_code", None));
+        assert!(line.contains("active"), "{line}");
+    }
 
     #[test]
     fn keychain_target_scopes_by_name_and_by_content() {

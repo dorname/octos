@@ -129,6 +129,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_types: MINIMAX_API_TYPES,
     },
     ProviderInfo {
+        name: "minimax-cn",
+        display: "MiniMax (China)",
+        api_key_env: "MINIMAX_CN_API_KEY",
+        base_url: Some("https://api.minimaxi.com/v1"),
+        api_type: None,
+        api_types: &[],
+    },
+    ProviderInfo {
         name: "zai",
         display: "Z.AI (GLM)",
         api_key_env: "ZAI_API_KEY",
@@ -448,6 +456,7 @@ fn capture_api_key_from_reader(
             expires_at: None,
             provider: provider.to_string(),
             auth_method: "paste_token".to_string(),
+            account_id: None,
         },
     )?;
     Ok(KeyCaptureOutcome::Saved)
@@ -715,7 +724,15 @@ fn read_required_model(
 /// error — `--defaults` must never silently write "auto".
 fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) -> Result<String> {
     match provider {
-        "openai" => return Ok("gpt-4.1-mini".to_string()),
+        "openai" => {
+            // A ChatGPT subscription OAuth login can only call gpt-5/codex
+            // models (Codex backend) — the platform default would 403.
+            let auth_home = crate::config_context::resolve_config_context(None).auth_home;
+            let auth_method = crate::auth::AuthStore::at(&auth_home)
+                .ok()
+                .and_then(|store| store.get("openai").map(|c| c.auth_method.clone()));
+            return Ok(openai_default_model_for(auth_method.as_deref()).to_string());
+        }
         "anthropic" => return Ok("claude-sonnet-4-20250514".to_string()),
         _ => {}
     }
@@ -725,6 +742,16 @@ fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) ->
     eyre::bail!(
         "no known default model for provider '{provider}' — run `octos init` interactively and enter a model name"
     )
+}
+
+/// The OpenAI default model for a given stored auth method: subscription
+/// OAuth logins are limited to the gpt-5/codex family (Codex backend), so
+/// the platform default would fail for them.
+fn openai_default_model_for(auth_method: Option<&str>) -> &'static str {
+    match auth_method {
+        Some("oauth" | "device_code") => "gpt-5",
+        _ => "gpt-4.1-mini",
+    }
 }
 
 /// Load models from model_catalog.json, grouped by provider — from the
@@ -1246,6 +1273,16 @@ mod tests {
     }
 
     #[test]
+    fn should_default_openai_model_to_gpt5_for_subscription_login() {
+        // ChatGPT subscription OAuth logins can only call gpt-5/codex
+        // models (Codex backend) — the platform default would 403.
+        assert_eq!(openai_default_model_for(Some("oauth")), "gpt-5");
+        assert_eq!(openai_default_model_for(Some("device_code")), "gpt-5");
+        assert_eq!(openai_default_model_for(Some("paste_token")), "gpt-4.1-mini");
+        assert_eq!(openai_default_model_for(None), "gpt-4.1-mini");
+    }
+
+    #[test]
     fn should_offer_capture_when_stored_credential_is_expired() {
         // codex fold: an expired OAuth credential must NOT suppress the
         // offer — Config::get_api_key rejects expired credentials, so
@@ -1257,6 +1294,7 @@ mod tests {
             expires_at: Some(chrono::DateTime::from_timestamp(1, 0).unwrap()), // long expired
             provider: "openai".into(),
             auth_method: "oauth".into(),
+            account_id: None,
         };
         assert_eq!(
             key_capture_preflight(false, Some(&expired)),
@@ -1269,6 +1307,7 @@ mod tests {
             expires_at: None, // paste tokens never expire
             provider: "deepseek".into(),
             auth_method: "paste_token".into(),
+            account_id: None,
         };
         assert_eq!(
             key_capture_preflight(false, Some(&valid)),

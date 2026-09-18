@@ -10,6 +10,7 @@ pub fn paste_token_flow(provider: &str) -> Result<AuthCredential> {
         "anthropic" => "ANTHROPIC_API_KEY",
         "gemini" | "google" => "GEMINI_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
+        "minimax-cn" => "MINIMAX_CN_API_KEY",
         _ => "API_KEY",
     };
 
@@ -32,5 +33,6 @@ pub fn paste_token_flow(provider: &str) -> Result<AuthCredential> {
         expires_at: None,
         provider: provider.to_string(),
         auth_method: "paste_token".to_string(),
+        account_id: None,
     })
 }
