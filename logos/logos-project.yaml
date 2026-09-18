@@ -2,7 +2,19 @@ project:
   name: octos
   description: ""
   methodology: OpenLogos
-tech_stack: {}
+tech_stack:
+  language: Rust（edition 2024，rust 1.85+，deny(unsafe_code)）
+  async_runtime: tokio
+  tls: rustls（纯 Rust，无 OpenSSL 依赖）
+  http_framework: axum
+  embedded_storage: redb（EpisodeStore）
+  vector_index: hnsw_rs（HybridSearch 向量通道，0.7 向量 + 0.3 BM25）
+  llm_abstraction: 自研 LlmProvider trait + registry（4 原生 + N OpenAI 兼容家族 + local 家族；RetryProvider → ProviderChain → AdaptiveRouter 三层 failover）
+  sandbox: bwrap / Landlock / sandbox-exec / AppContainer / Docker 五后端（decide_sandbox 纯决策层，fail-closed）
+  channels: 17 个 IM 通道适配（teloxide 等各平台 SDK/HTTP，bus 保证行为一致）
+  pipeline: 自研 DOT 图引擎（octos-pipeline：checkpoint / parallel fan-out / human gate）
+  plugin_protocol: 自包含二进制 + JSON stdin/stdout（语言无关、进程隔离）
+  error_handling: eyre / color-eyre
 scenario_counter:
   # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
   # S02-S15 已由 change baseline-prd 在需求文档中分配(2026-09-18)
@@ -55,6 +67,103 @@ resource_index:
     desc: S01 ChatGPT 订阅登录与 Codex 后端对话测试用例。涉及 OAuth 登录、Codex 路由、凭证刷新时必读。
   - path: logos/resources/verify/acceptance-report.md
     desc: 验收报告。涉及 verify 验收结论与追溯关系时必读。
+  - path: logos/resources/prd/3-technical-plan/1-architecture/core-01-architecture-overview.md
+    desc: octos 技术架构概要（权威基线，以代码核验为准）。涉及系统上下文、L0-L5 crate 分层、三运行时视图、子系统架构（agent loop/工具沙箱/消息总线/LLM 栈/记忆/插件 MCP）、系统处理流程、技术选型、非功能约束、外部依赖测试策略、部署交接时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-00-scenario-overview.md
+    desc: 业务场景概览（技术实现视角）。涉及 S01-S15 场景状态、依赖关系、三 Phase 文档索引时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S02-first-run.md
+    desc: S02 开发者首次上手与认证时序图（P0）。涉及 init/doctor/auth login 设备码与 PKCE、凭证链、Codex 路由时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S03-cli-chat.md
+    desc: S03 CLI 交互式多轮任务执行时序图（P0）。涉及 agent loop、工具分发、SafePolicy、沙箱决策、压缩、hooks 时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S04-gateway-channel.md
+    desc: S04 团队 IM 通道接入与消息网关时序图（P0）。涉及通道适配、SessionKey、会话 actor、coalesce 分片时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S05-serve-api.md
+    desc: S05 REST API 服务与流式集成时序图（P0）。涉及 serve 启动、三层认证中间件、/api/ui-protocol/ws 对话链路时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S06-cron-automation.md
+    desc: S06 定时任务与无人值守自动化时序图（P1）。涉及 cron 调度、系统来源注入、deliver 投递、迭代兜底时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S07-pipeline.md
+    desc: S07 流水线编排多步工作流时序图（P1）。涉及 run_pipeline、DOT 校验、fan-out、checkpoint 恢复、human gate 时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S08-memory.md
+    desc: S08 记忆沉淀与检索复用时序图（P1，写入/读取双路径）。涉及 EpisodeStore、memory-refresh、HybridSearch 注入时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S09-skills.md
+    desc: S09 技能插件安装与使用时序图（P1）。涉及 discovery/gating、二进制协议、spawn_only 自动后台时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S10-mcp.md
+    desc: S10 MCP 服务器接入与工具扩展时序图（P1）。涉及 JSON-RPC 握手、schema 校验上限、注册与调用转发时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S11-sub-agent.md
+    desc: S11 子代理派生与并行协作时序图（P2 主路径）。涉及 spawn 族工具、子代理上下文隔离、wait/close 时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S12-llm-failover.md
+    desc: S12 LLM 故障转移与自适应路由时序图（P1）。涉及 RetryProvider/ProviderChain/AdaptiveRouter 分层、熔断与半开时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S13-acp-ide.md
+    desc: S13 ACP 协议接入 IDE 时序图（P2 主路径）。涉及 ACP 握手、session/new、编辑确认回路时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S14-admin-ops.md
+    desc: S14 多租户运维与管理面时序图（P2 主路径）。涉及 /api/admin 认证、profile 管理、健康指标巡检时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S15-security-config.md
+    desc: S15 安全策略与沙箱配置管理时序图（P2 主路径）。涉及沙箱模式决策、fail-closed 拒绝、ToolPolicy 边界验证时必读。
+scenarios:
+  - id: S01
+    name: ChatGPT 订阅登录与 Codex 后端对话
+    status: 已落地（change chatgpt-oauth-codex）
+  - id: S02
+    name: 开发者首次上手与认证
+    status: 文档基线完成（P0）
+  - id: S03
+    name: CLI 交互式多轮任务执行
+    status: 文档基线完成（P0）
+  - id: S04
+    name: 团队 IM 通道接入与消息网关
+    status: 文档基线完成（P0）
+  - id: S05
+    name: REST API 服务与流式集成
+    status: 文档基线完成（P0）
+  - id: S06
+    name: 定时任务与无人值守自动化
+    status: 文档基线完成（P1）
+  - id: S07
+    name: 流水线编排多步工作流
+    status: 文档基线完成（P1）
+  - id: S08
+    name: 记忆沉淀与检索复用
+    status: 文档基线完成（P1）
+  - id: S09
+    name: 技能插件安装与使用
+    status: 文档基线完成（P1）
+  - id: S10
+    name: MCP 服务器接入与工具扩展
+    status: 文档基线完成（P1）
+  - id: S11
+    name: 子代理派生与并行协作
+    status: 文档基线完成（P2 主路径）
+  - id: S12
+    name: LLM 故障转移与自适应路由
+    status: 文档基线完成（P1）
+  - id: S13
+    name: ACP 协议接入 IDE
+    status: 文档基线完成（P2 主路径）
+  - id: S14
+    name: 多租户运维与管理面
+    status: 文档基线完成（P2 主路径）
+  - id: S15
+    name: 安全策略与沙箱配置管理
+    status: 文档基线完成（P2 主路径）
+external_dependencies:
+  - name: LLM 提供商 API
+    purpose: 全部对话能力
+    test_strategy: mock-service（录制/桩 provider）；真实调用测试 #[ignore] 手动触发
+  - name: IM 平台（17 通道）
+    purpose: 消息收发
+    test_strategy: mock-service（通道适配层以假 InboundMessage 单测；端到端手动验证）
+  - name: MCP 服务器
+    purpose: 工具扩展
+    test_strategy: mock-service（内置测试 server fixture）
+  - name: 沙箱后端（bwrap/docker 等）
+    purpose: 命令隔离
+    test_strategy: env-disable + 纯决策层矩阵单测（HostOs × Probe 全组合可跨宿主测试）
+  - name: OAuth IdP（OpenAI 等）
+    purpose: 登录
+    test_strategy: mock-service + fixed-value（本地 callback 仿真）
+  - name: embedding provider
+    purpose: 记忆向量通道
+    test_strategy: env-disable（降级 BM25-only 路径即默认测试路径）
 conventions:
   - 遵循 OpenLogos 三层推进模型（Why → What → How）
   - 每次变更必须先创建 logos/changes/ 变更提案

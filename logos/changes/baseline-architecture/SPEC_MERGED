@@ -1,0 +1,25 @@
+merged_at: 2026-09-18
+merged_by: claude-code (AI, 用户已授权 merge+archive)
+deltas: 16
+targets:
+  - logos/resources/prd/3-technical-plan/1-architecture/core-01-architecture-overview.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-00-scenario-overview.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S02-first-run.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S03-cli-chat.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S04-gateway-channel.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S05-serve-api.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S06-cron-automation.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S07-pipeline.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S08-memory.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S09-skills.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S10-mcp.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S11-sub-agent.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S12-llm-failover.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S13-acp-ide.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S14-admin-ops.md
+  - logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S15-security-config.md
+verification:
+  delta_lint: PASS（7/7，16 mergeable / 0 invalid）
+  mermaid_render: 28/28 通过 mermaid-cli + Chrome for Testing 148 真实渲染校验
+  merge_fidelity: 16/16 合并结果与 delta 正文字节一致（diff 验证）
+  code_crosscheck: 4 路仓库调研（chat 调用链 / gateway 总线 / serve 认证 / pipeline·memory·plugin·MCP·failover）对照核验，已修正 5 处出入（WS ui-protocol 对话链路、auth.json XDG 路径、MCP 工具命名、user 消息落盘时机、/api/stream 不存在）
