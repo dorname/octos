@@ -5,7 +5,8 @@ project:
 tech_stack: {}
 scenario_counter:
   # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
-  next_id: 2
+  # S02-S15 已由 change baseline-prd 在需求文档中分配(2026-09-18)
+  next_id: 16
 modules:
   - id: core
     name: 核心功能
@@ -23,7 +24,17 @@ deployment_gates:
     smoke_required: true
     environments:
       - staging
-resource_index: []
+resource_index:
+  - path: logos/resources/prd/1-product-requirements/core-01-requirements.md
+    desc: octos 需求文档基线。涉及产品定位、用户痛点 P01-P10、场景 S01-S15 定义与验收条件、约束与不做清单时必读。
+  - path: logos/resources/prd/3-technical-plan/1-architecture/core-system-map.md
+    desc: core 系统结构图（逆向种子基线，verified:false）。涉及 crate 分层、依赖边、平台 crate 清单时参考。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-scenario-candidates.md
+    desc: core 场景候选清单（逆向种子基线，verified:false）。涉及 CLI 命令、REST 路由组、消息通道、内置工具全景时参考。
+  - path: logos/resources/test/core-S01-test-cases.md
+    desc: S01 ChatGPT 订阅登录与 Codex 后端对话测试用例。涉及 OAuth 登录、Codex 路由、凭证刷新时必读。
+  - path: logos/resources/verify/acceptance-report.md
+    desc: 验收报告。涉及 verify 验收结论与追溯关系时必读。
 conventions:
   - 遵循 OpenLogos 三层推进模型（Why → What → How）
   - 每次变更必须先创建 logos/changes/ 变更提案

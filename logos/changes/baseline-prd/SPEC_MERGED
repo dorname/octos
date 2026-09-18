@@ -1,0 +1,1 @@
+{"type":"delta_spec_merged","slug":"baseline-prd","merged_by":"merge-executor (AI session)","merged_at":"2026-09-18","post_merge_count":{"logos/resources/prd/1-product-requirements/core-01-requirements.md":{"before":0,"removed":0,"added":1,"actual":1,"ok":true}},"note":"全新文档 ADDED 合并;声明场景 S02-S15(编号接续 S01),scenario_counter.next_id 同步为 16"}
