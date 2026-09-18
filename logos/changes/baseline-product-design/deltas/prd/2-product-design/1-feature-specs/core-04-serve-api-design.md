@@ -1,0 +1,111 @@
+# Delta: prd/2-product-design/1-feature-specs — core-04-serve-api-design.md
+
+> target: logos/resources/prd/2-product-design/1-feature-specs/core-04-serve-api-design.md(全新文档)
+
+## ADDED — core-04 REST 服务与 IDE 接入 功能规格
+
+# core-04 REST 服务与 IDE 接入 — 功能规格
+
+> 覆盖场景：S05（REST API 服务与流式集成）、S13（ACP 协议接入 IDE）
+> 需求来源：core-01-requirements.md（Phase 1）
+> 配套原型：`core-04-serve-api-api-examples.md`
+
+## 一、S05: REST API 服务与流式集成 — 交互规格
+
+### 1.1 `octos serve`
+
+**命令格式**：`octos serve [--host <ADDR>] [--port <PORT>] [--cwd <PATH>] [--auth-token <TOKEN>]`
+
+**参数设计**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| --host | string | 否 | 127.0.0.1 | 监听地址（安全默认仅本机；对外需显式指定） |
+| --port | int | 否 | 50080 | 监听端口 |
+| --cwd | path | 否 | 当前目录 | 工作区根目录 |
+| --auth-token | string | 否 | — | 管理面 bearer token（也可用环境变量/配置提供） |
+
+**交互流程**：
+1. 用户运行 `octos serve`；CLI 加载配置 → 构建运行时 → axum router 挂载 23 个路由组（157 条路由）→ 绑定监听
+2. 启动输出监听地址与管理面入口；浏览器访问 `http://127.0.0.1:50080/` 打开 Web 仪表盘
+3. 客户端调用 REST 路由：公开路由（auth/version 等）→ 用户级路由（`/api/my/*`、files、tasks、stream 等，需用户凭证）→ 管理路由（`/api/admin/*`，需 admin token）
+4. 对话类请求进入 agent/session 运行时，流式接口以 SSE/分片形式持续返回增量，结束后完整消息落会话
+5. Ctrl-C 优雅停机
+
+**路由组概览**（完整清单以 `crates/octos-cli/src/api/router.rs` 为准）：
+
+| 分组 | 条数 | 面 | 认证 |
+|------|------|----|------|
+| /api/admin/* | 90 | 管理面：profiles / allowed-emails / monitor / audit / platform-skills 等 | admin token |
+| /api/my/* | 40 | 终端用户自助面：我的会话/配置/资源 | 用户凭证 |
+| /api/ui-protocol/* | 12 | 仪表盘前端协议传输 | 用户凭证 |
+| /api/auth/* | 10 | 登录/令牌/OAuth 流 | 公开 |
+| /api/files/* /api/tasks/* /api/stream/* 等 | 15+ | 文件、任务、流式 | 用户凭证 |
+| /api/version 等 | 若干 | 版本/健康 | 公开 |
+
+#### 验收条件（交互级）
+
+##### 正常：启动与仪表盘
+- **GIVEN** 已完成 init 与认证
+- **WHEN** 用户运行 `octos serve`
+- **THEN** 启动输出含监听地址 `http://127.0.0.1:50080`；浏览器访问返回仪表盘页面；`GET /api/version` 返回 200 与版本信息；退出码（停机后）为 0
+
+##### 正常：用户级流式调用
+- **GIVEN** serve 运行中，客户端持有有效用户凭证
+- **WHEN** 客户端调用流式对话路由并持续读取响应
+- **THEN** 响应按增量分片持续到达（流式），终止分片后完整消息已写入对应会话；断开后重连可查询到该会话历史
+
+##### 异常：仅本机绑定
+- **GIVEN** 用户以默认参数启动 serve
+- **WHEN** 从局域网另一台机器连接 `http://<host-ip>:50080`
+- **THEN** 连接被拒绝；启动输出中监听地址显示 127.0.0.1（对外暴露必须显式 `--host`）
+
+##### 异常：无凭证访问用户级路由
+- **GIVEN** serve 运行中
+- **WHEN** 客户端不带 token 请求 `/api/my/*` 路由
+- **THEN** 返回 401；带普通用户 token 请求 `/api/admin/*` 返回 403；响应体不泄露内部细节
+
+## 二、S13: ACP 协议接入 IDE — 交互规格
+
+### 2.1 `octos acp`
+
+**命令格式**：`octos acp`（stdio 模式，由 IDE 作为子进程拉起，非用户直接交互使用）
+
+**交互流程**：
+1. 用户在 IDE（如 Zed）的 agent 配置中登记外部 agent server：命令 `octos acp`（stdio 传输）
+2. IDE 拉起子进程，按 ACP 协议完成握手（initialize → 能力协商 → 新建会话）
+3. 用户在 IDE 面板发起对话；ACP 请求映射到 octos 会话运行时（同一 agent loop、工具与沙箱策略）
+4. agent 流式输出经 ACP 事件回显 IDE；文件编辑经 IDE 的 diff 确认界面呈现
+5. IDE 关闭面板/退出时终止子进程
+
+**Zed 配置示例**（settings.json 片段，键名以 Zed 当时版本为准）：
+
+```json
+{
+  "agent_servers": {
+    "octos": {
+      "command": "octos",
+      "args": ["acp"]
+    }
+  }
+}
+```
+
+#### 验收条件（交互级）
+
+##### 正常：IDE 内端到端问答
+- **GIVEN** Zed 已配置 octos agent server 且本机已认证
+- **WHEN** 用户在 Zed 的 agent 面板选择 octos 并提问"解释当前文件的 main 函数"
+- **THEN** IDE 拉起 `octos acp` 完成握手；回答流式回显面板；引用的文件路径可点击跳转
+
+##### 正常：IDE 内文件编辑确认
+- **GIVEN** 同上
+- **WHEN** agent 需要修改项目文件
+- **THEN** 修改以 IDE diff 视图呈现，用户确认后落盘；拒绝则 agent 收到拒绝反馈并继续对话
+
+##### 异常：octos 二进制不在 PATH
+- **GIVEN** IDE 配置的命令无法解析
+- **WHEN** IDE 拉起 agent server
+- **THEN** IDE 显示 agent server 启动失败；octos 不产生任何后台驻留进程
+
+**原型**：`core-04-serve-api-api-examples.md`
