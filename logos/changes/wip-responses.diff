@@ -1,0 +1,318 @@
+diff --git a/crates/octos-llm/src/openai_responses.rs b/crates/octos-llm/src/openai_responses.rs
+index f70ad5cf..4899b259 100644
+--- a/crates/octos-llm/src/openai_responses.rs
++++ b/crates/octos-llm/src/openai_responses.rs
+@@ -22,6 +22,21 @@ use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+ use crate::types::ProviderMetadata;
+ use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+ 
++/// ChatGPT Codex backend base URL — the ONLY endpoint that accepts ChatGPT
++/// subscription OAuth tokens. api.openai.com rejects them with 403 "Missing
++/// scopes" (the OAuth grant carries no `api.*` scopes). This is the same
++/// backend the official codex CLI talks to; our OAuth client id IS codex
++/// CLI's public client.
++pub const CODEX_BACKEND_BASE: &str = "https://chatgpt.com/backend-api/codex";
++
++/// Models reachable with a ChatGPT subscription login: the gpt-5 family and
++/// codex models. Platform-only models (gpt-4o, gpt-4.1, o3, ...) are NOT
++/// covered by a Plus/Pro subscription and 403 on the Codex backend.
++pub fn is_chatgpt_subscription_model(model: &str) -> bool {
++    let m = model.to_lowercase();
++    m.starts_with("gpt-5") || m.starts_with("codex")
++}
++
+ /// OpenAI provider using the Responses API.
+ pub struct OpenAIResponsesProvider {
+     client: Client,
+@@ -35,6 +50,11 @@ pub struct OpenAIResponsesProvider {
+     /// Only official OpenAI Responses endpoints receive reserved prompt-cache
+     /// request fields by default. Compatibility endpoints must opt in.
+     prompt_cache_affinity: bool,
++    /// ChatGPT workspace ID for the `chatgpt-account-id` header (Codex
++    /// backend only; required there, absent for platform API keys).
++    chatgpt_account_id: Option<String>,
++    /// Per-process session id for Codex backend telemetry/routing.
++    session_id: Option<String>,
+ }
+ 
+ impl OpenAIResponsesProvider {
+@@ -51,9 +71,51 @@ impl OpenAIResponsesProvider {
+             model: model.into(),
+             base_url: "https://api.openai.com/v1".to_string(),
+             prompt_cache_affinity: true,
++            chatgpt_account_id: None,
++            session_id: None,
+         }
+     }
+ 
++    /// Switch to the ChatGPT Codex backend for subscription OAuth tokens:
++    /// backend base URL, workspace account id, and a fresh session id.
++    pub fn with_chatgpt_oauth(mut self, account_id: Option<String>) -> Self {
++        self.base_url = CODEX_BACKEND_BASE.to_string();
++        self.chatgpt_account_id = account_id;
++        self.session_id = Some(uuid::Uuid::new_v4().to_string());
++        self
++    }
++
++    /// Whether requests target the Codex backend (changes request shape:
++    /// `store: false`, stream-only, `instructions` instead of system input).
++    fn is_codex_backend(&self) -> bool {
++        self.base_url == CODEX_BACKEND_BASE
++    }
++
++    /// Apply auth plus (Codex-only) routing headers to an outgoing request.
++    fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
++        let req = req
++            .header(
++                "Authorization",
++                format!("Bearer {}", self.api_key.expose_secret()),
++            )
++            .header("Content-Type", "application/json");
++        if !self.is_codex_backend() {
++            return req;
++        }
++        // The backend keys client behavior and quota off the originator;
++        // the OAuth client id we log in with is codex CLI's public client.
++        let mut req = req
++            .header("OpenAI-Beta", "responses=experimental")
++            .header("originator", "codex_cli_rs");
++        if let Some(account) = &self.chatgpt_account_id {
++            req = req.header("chatgpt-account-id", account);
++        }
++        if let Some(session) = &self.session_id {
++            req = req.header("session_id", session);
++        }
++        req
++    }
++
+     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+         let base_url = base_url.into();
+         self.prompt_cache_affinity = base_url.trim_end_matches('/') == "https://api.openai.com/v1";
+@@ -92,13 +154,29 @@ impl OpenAIResponsesProvider {
+         tools: &[ToolSpec],
+         config: &ChatConfig,
+     ) -> serde_json::Value {
+-        let input = build_input_messages(messages);
++        let codex = self.is_codex_backend();
++        let input = build_input_messages(messages, codex);
+ 
+         let mut body = serde_json::json!({
+             "model": &self.model,
+             "input": input,
+         });
+ 
++        if codex {
++            // Codex backend requirements: no server-side storage, encrypted
++            // reasoning replay, and system content via `instructions` (never
++            // as an input item). The field must be present even when empty.
++            body["store"] = false.into();
++            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
++            let instructions = messages
++                .iter()
++                .filter(|m| m.role == MessageRole::System)
++                .map(|m| m.content.as_str())
++                .collect::<Vec<_>>()
++                .join("\n\n");
++            body["instructions"] = instructions.into();
++        }
++
+         if let Some(max) = config.max_tokens {
+             body["max_output_tokens"] = max.into();
+         }
+@@ -138,9 +216,13 @@ impl OpenAIResponsesProvider {
+                 // The Responses API reasoning.effort has no "max"; clamp to high.
+                 crate::config::ReasoningEffort::Max => "high",
+             };
+-            body["reasoning"] = serde_json::json!({
++            let mut reasoning = serde_json::json!({
+                 "effort": effort_str,
+             });
++            if codex {
++                reasoning["summary"] = "auto".into();
++            }
++            body["reasoning"] = reasoning;
+         }
+ 
+         body
+@@ -211,17 +293,21 @@ impl LlmProvider for OpenAIResponsesProvider {
+         tools: &[ToolSpec],
+         config: &ChatConfig,
+     ) -> Result<ChatResponse> {
++        // The Codex backend is stream-only — accumulate a full response.
++        if self.is_codex_backend() {
++            let mut stream = self.chat_stream(messages, tools, config).await?;
++            let mut acc = crate::stream_accumulator::StreamAccumulator::new();
++            while let Some(event) = stream.next().await {
++                acc.process(&event);
++            }
++            return Ok(acc.finish());
++        }
++
+         let body = self.build_request(messages, tools, config);
+         self.trace_prompt_cache_input(&body, config);
+ 
+         let response = self
+-            .client
+-            .post(format!("{}/responses", self.base_url))
+-            .header(
+-                "Authorization",
+-                format!("Bearer {}", self.api_key.expose_secret()),
+-            )
+-            .header("Content-Type", "application/json")
++            .apply_headers(self.client.post(format!("{}/responses", self.base_url)))
+             .json(&body)
+             .send()
+             .await
+@@ -268,13 +354,10 @@ impl LlmProvider for OpenAIResponsesProvider {
+         // cut off. Stalls are bounded by the client's per-read timeout and the
+         // agent's stream-timeout guards (see build_streaming_http_client).
+         let response = self
+-            .stream_client
+-            .post(format!("{}/responses", self.base_url))
+-            .header(
+-                "Authorization",
+-                format!("Bearer {}", self.api_key.expose_secret()),
++            .apply_headers(
++                self.stream_client
++                    .post(format!("{}/responses", self.base_url)),
+             )
+-            .header("Content-Type", "application/json")
+             .json(&body)
+             .send()
+             .await
+@@ -336,7 +419,7 @@ impl LlmProvider for OpenAIResponsesProvider {
+ 
+ // ---- Input message building ----
+ 
+-fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
++fn build_input_messages(messages: &[Message], codex: bool) -> Vec<serde_json::Value> {
+     let mut input = Vec::new();
+     for msg in messages {
+         // Skip empty assistant messages with no tool calls
+@@ -346,6 +429,11 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+         {
+             continue;
+         }
++        // Codex backend: system content travels via `instructions`; a system
++        // role inside `input` is rejected.
++        if codex && msg.role == MessageRole::System {
++            continue;
++        }
+         build_input_items(msg, &mut input);
+     }
+     input
+@@ -1285,6 +1373,114 @@ mod tests {
+         assert_eq!(provider.model_id(), "o4-mini");
+         assert_eq!(provider.provider_name(), "openai");
+     }
++
++    #[test]
++    fn should_recognize_chatgpt_subscription_models() {
++        assert!(is_chatgpt_subscription_model("gpt-5"));
++        assert!(is_chatgpt_subscription_model("gpt-5.1"));
++        assert!(is_chatgpt_subscription_model("gpt-5.1-codex"));
++        assert!(is_chatgpt_subscription_model("gpt-5.3-codex"));
++        assert!(is_chatgpt_subscription_model("codex-mini-latest"));
++        assert!(is_chatgpt_subscription_model("GPT-5")); // case-insensitive
++        assert!(!is_chatgpt_subscription_model("gpt-4o"));
++        assert!(!is_chatgpt_subscription_model("gpt-4.1"));
++        assert!(!is_chatgpt_subscription_model("o3"));
++        assert!(!is_chatgpt_subscription_model("o4-mini"));
++    }
++
++    #[test]
++    fn should_switch_to_codex_backend_with_chatgpt_oauth() {
++        let provider =
++            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(Some("acct-1".into()));
++        assert_eq!(provider.base_url, CODEX_BACKEND_BASE);
++        assert!(provider.session_id.is_some());
++        assert!(provider.is_codex_backend());
++    }
++
++    #[test]
++    fn should_not_be_codex_backend_on_default_construction() {
++        let provider = OpenAIResponsesProvider::new("sk-key", "gpt-5");
++        assert!(!provider.is_codex_backend());
++    }
++
++    #[test]
++    fn should_build_codex_request_with_store_false_and_instructions() {
++        let provider =
++            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
++        let messages = vec![
++            msg(MessageRole::System, "be helpful"),
++            msg(MessageRole::User, "hello"),
++        ];
++        let config = ChatConfig::default();
++        let request = provider.build_request(&messages, &[], &config);
++
++        assert_eq!(request["store"].as_bool(), Some(false));
++        assert_eq!(
++            request["include"][0].as_str(),
++            Some("reasoning.encrypted_content")
++        );
++        assert_eq!(request["instructions"].as_str(), Some("be helpful"));
++        // The system message must NOT also appear in input (Codex backend
++        // carries it via `instructions` only).
++        let input = request["input"].as_array().unwrap();
++        assert_eq!(input.len(), 1);
++        assert_eq!(input[0]["role"].as_str(), Some("user"));
++    }
++
++    #[test]
++    fn should_add_reasoning_summary_in_codex_mode() {
++        let provider =
++            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
++        let messages = vec![msg(MessageRole::User, "think")];
++        let mut config = ChatConfig::default();
++        config.reasoning_effort = Some(crate::config::ReasoningEffort::High);
++        let request = provider.build_request(&messages, &[], &config);
++
++        assert_eq!(request["reasoning"]["effort"].as_str(), Some("high"));
++        assert_eq!(request["reasoning"]["summary"].as_str(), Some("auto"));
++    }
++
++    #[test]
++    fn should_apply_codex_headers_in_codex_mode() {
++        let provider = OpenAIResponsesProvider::new("oauth-jwt", "gpt-5")
++            .with_chatgpt_oauth(Some("acct-9".into()));
++        let req = provider
++            .apply_headers(provider.client.post("https://example.com"))
++            .build()
++            .unwrap();
++        let h = req.headers();
++        assert_eq!(h["Authorization"], "Bearer oauth-jwt");
++        assert_eq!(h["chatgpt-account-id"], "acct-9");
++        assert_eq!(h["OpenAI-Beta"], "responses=experimental");
++        assert_eq!(h["originator"], "codex_cli_rs");
++        assert!(h.contains_key("session_id"));
++    }
++
++    #[test]
++    fn should_not_apply_codex_headers_for_platform_api() {
++        let provider = OpenAIResponsesProvider::new("sk-key", "gpt-5");
++        let req = provider
++            .apply_headers(provider.client.post("https://example.com"))
++            .build()
++            .unwrap();
++        let h = req.headers();
++        assert_eq!(h["Authorization"], "Bearer sk-key");
++        assert!(!h.contains_key("chatgpt-account-id"));
++        assert!(!h.contains_key("OpenAI-Beta"));
++        assert!(!h.contains_key("originator"));
++        assert!(!h.contains_key("session_id"));
++    }
++
++    #[test]
++    fn should_emit_empty_instructions_when_codex_request_has_no_system_message() {
++        let provider =
++            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
++        let messages = vec![msg(MessageRole::User, "hi")];
++        let config = ChatConfig::default();
++        let request = provider.build_request(&messages, &[], &config);
++        // The Codex backend requires the field to be present.
++        assert_eq!(request["instructions"].as_str(), Some(""));
++    }
+ }
+ 
+ #[cfg(test)]
