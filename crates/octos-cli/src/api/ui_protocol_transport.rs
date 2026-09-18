@@ -40721,18 +40721,20 @@ fn frame_text_within_cap(text: String) -> Option<String> {
 ///   1. Parse the frame JSON. Parse failure -> return the original unchanged;
 ///      [`frame_text_within_cap`] then drops it (returns `None`) because it is
 ///      still over cap and cannot be rewritten.
-///   2. Find the LARGEST string field (the dominant payload) by JSON-escaped
-///      length, descending recursively into objects/arrays.
-///   3. Rewrite that field to a head+tail preview: keep the first H and last T
+///   2. Collect every string field by JSON-escaped length, tagged with a
+///      [`FieldTier`] (reasoning < tool I/O < conversation text), and cut the
+///      lowest tier first, all of its over-cap fields to one shared cap, so a
+///      reply is only shortened when reasoning and tool output cannot absorb
+///      the excess, and no field is ever blanked.
+///   3. Rewrite each cut field to a head+tail preview: keep the first H and last T
 ///      bytes (UTF-8 char-boundary safe — never split a codepoint), drop the
 ///      middle, insert `\n…… [<N> bytes truncated] ……\n` between head and
 ///      tail (N = dropped byte count of the ORIGINAL field). The field's
 ///      budget is computed by ESCAPED length so the rewritten frame is
-///      provably under the target. Already-previewed field PATHS are tracked
-///      in a `HashSet` so each is rewritten at most once (idempotent, no
-///      content-sniffing).
-///   4. Re-serialize; if still over (multiple dominant fields), truncate the
-///      next-largest field too; repeat until under cap.
+///      provably under the target. A field already carrying the marker is not
+///      collected again, so a frame is never previewed twice.
+///   4. Serialize once to verify; only if still over target fall through to
+///      the structural case.
 ///   5. STRUCTURAL case: if no string field can be further truncated but the
 ///      frame is still over target, find the LARGEST JSON array and drop its
 ///      middle/trailing elements (keeping valid JSON — elements are simply
@@ -40782,42 +40784,52 @@ fn preview_oversized_frame(text: String) -> String {
         return serde_json::to_string(&value).unwrap_or(text);
     }
 
-    // Pass 1: collect all truncatable strings, largest first.
-    let mut candidates: Vec<(Vec<PathSeg>, usize, usize)> = Vec::new();
+    // Pass 1: collect every truncatable string with its value tier, then cut
+    // tier by tier — reasoning, then tool I/O, then everything else (replies,
+    // prompts) — so a reply is only touched when the cheaper tiers cannot
+    // absorb the excess. Within a tier every field is capped at ONE shared
+    // escaped length (water-filling): fields under the cap stay whole, fields
+    // over it become head+tail previews of the cap. No field is ever blanked,
+    // which the old largest-first loop did whenever the rest of the frame was
+    // still over target (its leftover budget for the biggest field was 0).
+    let mut candidates: Vec<TruncationCandidate> = Vec::new();
     let mut path: Vec<PathSeg> = Vec::new();
-    collect_truncatable_strings(&value, &mut path, &mut candidates);
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    collect_truncatable_strings(&value, &mut path, FieldTier::Content, &mut candidates);
 
     let mut running_len = initial_len;
-    for (path, field_escaped_len, field_raw_len) in &candidates {
+    for tier in [FieldTier::Reasoning, FieldTier::ToolIo, FieldTier::Content] {
         if running_len <= TRUNCATED_FRAME_TARGET_BYTES {
             break;
         }
-        // Overhead = current frame minus this field's escaped contribution
-        // (escaped bytes + two surrounding quote bytes).
-        let overhead = running_len.saturating_sub(field_escaped_len + 2);
-        let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
-            .saturating_sub(overhead)
-            .saturating_sub(2);
-        let preview = match build_head_tail_preview(
-            field_at_path(&value, path)
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            *field_raw_len,
-            field_escaped_budget,
-        ) {
-            Some(preview) => preview,
-            None => UNPREVIEWABLE_STUB.to_owned(),
+        let excess = running_len - TRUNCATED_FRAME_TARGET_BYTES;
+        let tier_sizes: Vec<usize> = candidates
+            .iter()
+            .filter(|c| c.tier == tier)
+            .map(|c| c.escaped_len)
+            .collect();
+        let Some(cap) = shared_field_cap(&tier_sizes, excess) else {
+            continue;
         };
-        // Running estimate: new field escaped length is at most the budget
-        // we handed out (marker reserve included); estimate conservatively
-        // with the actual preview's escaped length instead — one cheap
-        // scan, no serialization.
-        let new_escaped = json_escaped_len_bytes(preview.as_bytes());
-        if !set_field_at_path(&mut value, path, Value::String(preview)) {
-            return text;
+        for candidate in candidates
+            .iter()
+            .filter(|c| c.tier == tier && c.escaped_len > cap)
+        {
+            let preview = build_head_tail_preview(
+                field_at_path(&value, &candidate.path)
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                candidate.raw_len,
+                cap,
+            )
+            // Unreachable: the cap never drops below MIN_FIELD_PREVIEW_ESCAPED_BYTES,
+            // which always holds the marker plus a head and a tail.
+            .unwrap_or_else(|| UNPREVIEWABLE_STUB.to_owned());
+            let new_escaped = json_escaped_len_bytes(preview.as_bytes());
+            if !set_field_at_path(&mut value, &candidate.path, Value::String(preview)) {
+                return text;
+            }
+            running_len = running_len - candidate.escaped_len + new_escaped;
         }
-        running_len = overhead + 2 + new_escaped;
     }
 
     // Structural fallback: strings alone could not fit (or did, and this
@@ -40857,34 +40869,106 @@ fn preview_oversized_frame(text: String) -> String {
     }
 }
 
-/// Single-walk collection of every truncatable string field: same
-/// eligibility rules as `collect_truncatable_strings` (large enough to be
-/// worth truncating, not already carrying the full truncation-marker
-/// sentinel) but gathers ALL candidates (path, escaped len, raw len) in
-/// one pass instead of re-walking per truncation round.
+/// How much a string field is worth keeping whole when a frame must shrink.
+/// Cut in declaration order: a model's reasoning trace first, then tool
+/// arguments/output (recoverable by re-running, and usually the bulk), and
+/// only then conversation text such as assistant replies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldTier {
+    Reasoning,
+    ToolIo,
+    Content,
+}
+
+impl FieldTier {
+    /// Tier of the value under `key` in an object, given the object's own tier
+    /// and whether it is a tool message (`"role": "tool"`). A nested value
+    /// never ranks above its container.
+    fn for_key(key: &str, container: FieldTier, in_tool_message: bool) -> FieldTier {
+        let own = match key {
+            "reasoning_content" | "reasoning" | "thinking" => FieldTier::Reasoning,
+            "arguments" | "output" | "stdout" | "stderr" | "tool_output" => FieldTier::ToolIo,
+            "content" if in_tool_message => FieldTier::ToolIo,
+            _ => FieldTier::Content,
+        };
+        own.min(container)
+    }
+}
+
+/// One string field that may be cut to a head+tail preview.
+struct TruncationCandidate {
+    path: Vec<PathSeg>,
+    escaped_len: usize,
+    raw_len: usize,
+    tier: FieldTier,
+}
+
+/// Smallest escaped length a field is ever cut to: the marker plus ~1 KiB of
+/// head and tail, enough to recognise what the field was.
+const MIN_FIELD_PREVIEW_ESCAPED_BYTES: usize = MARKER_ESCAPED_RESERVE_BYTES + 2 * 1024;
+
+/// The largest shared escaped-length cap that, applied to every field in
+/// `sizes`, saves at least `excess` bytes. When even the minimum preview size
+/// cannot save that much, returns the minimum (cut this tier as far as it goes
+/// and let the next tier absorb the rest). `None` when no field is big enough
+/// to cut at all.
+fn shared_field_cap(sizes: &[usize], excess: usize) -> Option<usize> {
+    let savings = |cap: usize| -> usize { sizes.iter().map(|&len| len.saturating_sub(cap)).sum() };
+    let largest = sizes.iter().copied().max()?;
+    if largest <= MIN_FIELD_PREVIEW_ESCAPED_BYTES {
+        return None;
+    }
+    if savings(MIN_FIELD_PREVIEW_ESCAPED_BYTES) <= excess {
+        return Some(MIN_FIELD_PREVIEW_ESCAPED_BYTES);
+    }
+    // savings() falls as the cap rises; find the highest cap that still saves
+    // `excess`. Invariant: savings(lo) >= excess, savings(hi) < excess.
+    let (mut lo, mut hi) = (MIN_FIELD_PREVIEW_ESCAPED_BYTES, largest);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if savings(mid) >= excess {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
+/// Single-walk collection of every truncatable string field (large enough to
+/// be worth truncating, not already carrying the full truncation-marker
+/// sentinel), tagged with its [`FieldTier`].
 fn collect_truncatable_strings(
     value: &Value,
     path: &mut Vec<PathSeg>,
-    out: &mut Vec<(Vec<PathSeg>, usize, usize)>,
+    tier: FieldTier,
+    out: &mut Vec<TruncationCandidate>,
 ) {
     match value {
         Value::String(s) => {
             let escaped = json_escaped_len_bytes(s.as_bytes());
             if escaped > MARKER_ESCAPED_RESERVE_BYTES && !contains_full_truncation_marker(s) {
-                out.push((path.clone(), escaped, s.len()));
+                out.push(TruncationCandidate {
+                    path: path.clone(),
+                    escaped_len: escaped,
+                    raw_len: s.len(),
+                    tier,
+                });
             }
         }
         Value::Array(items) => {
             for (idx, item) in items.iter().enumerate() {
                 path.push(PathSeg::Index(idx));
-                collect_truncatable_strings(item, path, out);
+                collect_truncatable_strings(item, path, tier, out);
                 path.pop();
             }
         }
         Value::Object(map) => {
+            let in_tool_message = map.get("role").and_then(Value::as_str) == Some("tool");
             for (key, item) in map {
                 path.push(PathSeg::Key(key.clone()));
-                collect_truncatable_strings(item, path, out);
+                let child_tier = FieldTier::for_key(key, tier, in_tool_message);
+                collect_truncatable_strings(item, path, child_tier, out);
                 path.pop();
             }
         }
