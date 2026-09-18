@@ -119,5 +119,5 @@ Run the focused contract and dispatch tests:
 cargo test -p octos-agent --test mcp_server arc_agent_task_v1 --no-default-features
 cargo test -p octos-cli --test mcp_serve_integration arc_agent_task
 cargo test -p octos-cli --test mcp_serve_integration legacy_prompt_session_remains_compatible_without_arc_task
-agent-spec lint specs/arc-agent-task-v1-mcp.spec.md --min-score 0.9
+# 历史命令(agent-spec 已弃用,合约已归档): agent-spec lint logos/changes/archive/agent-spec-legacy/arc-agent-task-v1-mcp.spec.md --min-score 0.9
 ```

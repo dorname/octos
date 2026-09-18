@@ -1,0 +1,31 @@
+project:
+  name: "octos"
+  description: ""
+  methodology: "OpenLogos"
+
+tech_stack: {}
+
+scenario_counter:
+  next_id: 1
+
+modules:
+  - id: core
+    name: 核心功能
+    lifecycle: launched
+    bootstrap: adopted
+    baseline_seed_state: required
+    skip_phases: [api, database, scenario]
+    deployment_required: true
+
+deployment_gates:
+  core:
+    deployment_required: true
+    smoke_required: true
+    environments:
+      - staging
+
+resource_index: []
+
+conventions:
+  - "遵循 OpenLogos 三层推进模型（Why → What → How）"
+  - "每次变更必须先创建 logos/changes/ 变更提案"

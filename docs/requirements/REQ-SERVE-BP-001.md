@@ -36,7 +36,7 @@
 
 ## Derived Task Contract
 
-- `specs/task-s-broken-pipe-shutdown.spec.md` — task contract + 6 条可执行
+- `logos/changes/archive/agent-spec-legacy/task-s-broken-pipe-shutdown.spec.md` — task contract + 6 条可执行
   Acceptance Criteria selectors（agent-spec 1.4.0 lint 100%）。
 
 ## Governance
@@ -45,7 +45,7 @@
 |---|---|---|
 | requirement 创建 | done | 本文件，REQ-SERVE-BP-001，Status: Accepted |
 | 接受态治理 | accepted | 外环(codex) 于 2026-08-26 逐条审阅 Statement/Rationale/Acceptance/Boundaries 后签收 |
-| task contract/spec | done | `specs/task-s-broken-pipe-shutdown.spec.md`，agent-spec 1.4.0 lint 100% |
+| task contract/spec | done | `logos/changes/archive/agent-spec-legacy/task-s-broken-pipe-shutdown.spec.md`，agent-spec 1.4.0 lint 100% |
 | agent-spec guard/verify 基线 | pending | agent-spec 1.4.0 只验证 task contract（`spec: task`），不解析 requirement；待 G2/G3/G4 修订后执行 |
 | 实现 | frozen | 脏树冻结（serve_console.rs 新增、serve.rs/main.rs/mod.rs 改动，未 commit） |
 | lifecycle 终验 | pending | 待实现解冻后执行 |

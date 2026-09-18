@@ -4,5 +4,28 @@
       "Bash(sed:*)",
       "Bash(git:*)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/openlogos/bin/openlogos-phase"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/openlogos/bin/guard-check"
+          }
+        ]
+      }
+    ]
   }
 }

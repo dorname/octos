@@ -72,12 +72,15 @@ test_a2.md
 !CLAUDE.md
 !CHANGELOG.md
 !.octos/AGENTS.md
-!specs/task-issue-2236-fenced-peer-build-cache.spec.md
-!specs/task-issue-2237-goal-create-admits-archived.spec.md
-!specs/task-olp-obs-p2-producers.spec.md
-!specs/task-approval-post-tool-continuation.spec.md
-!specs/kv-cache-friendly-compaction.spec.md
-!specs/task-compaction-instruction-priority.spec.md
+# OpenLogos workflow (adopted 2026-09-18, branch chore/migrate-agent-spec-to-openlogos):
+# methodology state, skills, change proposals and archived agent-spec contracts are
+# shared workflow infrastructure, not per-developer research output.
+!AGENTS.md
+!logos/**/*.md
+!.claude/commands/**/*.md
+!.claude/agents/**/*.md
+# Active-change guard marker is per-worktree session state, not shared history.
+logos/.openlogos-guard
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
