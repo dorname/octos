@@ -129,14 +129,6 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_types: MINIMAX_API_TYPES,
     },
     ProviderInfo {
-        name: "minimax-cn",
-        display: "MiniMax (China)",
-        api_key_env: "MINIMAX_CN_API_KEY",
-        base_url: Some("https://api.minimaxi.com/v1"),
-        api_type: None,
-        api_types: &[],
-    },
-    ProviderInfo {
         name: "zai",
         display: "Z.AI (GLM)",
         api_key_env: "ZAI_API_KEY",
