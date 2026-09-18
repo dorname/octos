@@ -4,7 +4,8 @@ project:
   methodology: OpenLogos
 tech_stack: {}
 scenario_counter:
-  next_id: 1
+  # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
+  next_id: 2
 modules:
   - id: core
     name: 核心功能
