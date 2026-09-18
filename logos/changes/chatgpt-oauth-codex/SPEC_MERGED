@@ -1,0 +1,1 @@
+{"type":"delta_spec_merged","slug":"chatgpt-oauth-codex","merged_by":"merge-executor (AI session)","merged_at":"2026-09-18","post_merge_count":{"logos/resources/test/core-S01-test-cases.md":{"before":0,"removed":0,"added":41,"actual":41,"ok":true}},"note":"added=40 UT + 1 ST[manual];二次补齐 UT-S01-18..40(store/config/commands/init/registry 层 WIP 测试)后 actual=41"}
