@@ -81,6 +81,9 @@ test_a2.md
 !.claude/agents/**/*.md
 # Active-change guard marker is per-worktree session state, not shared history.
 logos/.openlogos-guard
+# Baseline-seed run scratch (staging, journal, event log) is operational state.
+logos/resources/verify/baseline-seed-runs/
+logos/resources/verify/baseline-events.jsonl
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
