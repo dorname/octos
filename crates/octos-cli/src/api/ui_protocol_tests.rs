@@ -43951,3 +43951,104 @@ fn should_preview_rather_than_blank_replies_when_the_replies_alone_are_over_the_
         );
     }
 }
+
+// --- server/shutdown: stop a local --solo `octos serve` from a UI client ---
+
+/// A local `--solo` state that also carries an HTTP serve's stop switch, plus
+/// a receiver watching it — what `octos serve` (not `--stdio`) builds.
+fn local_serve_state_with_stop_switch(
+    dir: &std::path::Path,
+) -> (AppState, tokio::sync::watch::Receiver<bool>) {
+    let stop = Arc::new(tokio::sync::watch::channel(false).0);
+    let watching = stop.subscribe();
+    let state = AppState {
+        serve_shutdown: Some(stop),
+        ..local_profile_state(dir)
+    };
+    (state, watching)
+}
+
+fn advertises_server_shutdown(state: &AppState) -> bool {
+    ConnectionUiFeatures::default()
+        .advertised_capabilities(state)
+        .supported_methods
+        .iter()
+        .any(|method| method == APPUI_METHOD_SERVER_SHUTDOWN)
+}
+
+#[test]
+fn should_advertise_server_shutdown_only_on_a_local_solo_http_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (serve, _watching) = local_serve_state_with_stop_switch(dir.path());
+    assert!(
+        advertises_server_shutdown(&serve),
+        "a local --solo HTTP serve must offer server/shutdown"
+    );
+
+    // `--stdio` and non-serve states hold no stop switch: nothing to stop.
+    let no_switch = local_profile_state(dir.path());
+    assert!(!advertises_server_shutdown(&no_switch));
+
+    // Without the explicit --solo opt-in — a fleet host behind a proxy looks
+    // exactly like this — one client must never be able to stop everyone's
+    // server.
+    let (not_solo, _w) = local_serve_state_with_stop_switch(dir.path());
+    let not_solo = AppState {
+        solo_login_enabled: false,
+        ..not_solo
+    };
+    assert!(!advertises_server_shutdown(&not_solo));
+
+    let (tenant, _w) = local_serve_state_with_stop_switch(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        ..tenant
+    };
+    assert!(!advertises_server_shutdown(&tenant));
+}
+
+#[tokio::test]
+async fn should_flip_the_serve_stop_switch_when_server_shutdown_is_called() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut watching) = local_serve_state_with_stop_switch(dir.path());
+
+    let reply = handle_server_shutdown(&state).expect("a local solo serve accepts it");
+    assert_eq!(reply, json!({ "stopping": true }));
+
+    // The reply is written first, then the same switch Ctrl+C flips.
+    tokio::time::timeout(std::time::Duration::from_secs(2), watching.changed())
+        .await
+        .expect("the stop switch must flip shortly after the reply")
+        .expect("sender alive");
+    assert!(*watching.borrow(), "server/shutdown must request a stop");
+}
+
+#[tokio::test]
+async fn should_refuse_server_shutdown_and_stop_nothing_when_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, watching) = local_serve_state_with_stop_switch(dir.path());
+    let state = AppState {
+        solo_login_enabled: false,
+        ..state
+    };
+
+    let error = handle_server_shutdown(&state).expect_err("not available without --solo");
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("kind")),
+        Some(&json!("server_shutdown_unavailable"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !*watching.borrow(),
+        "a refused request must not stop the server"
+    );
+}
+
+#[test]
+fn should_bar_session_scoped_connections_from_server_shutdown() {
+    // A session-ingress connection is scoped to one session; stopping the
+    // whole server is out of its reach whatever the deployment.
+    assert!(!session_ingress_callable_method(
+        APPUI_METHOD_SERVER_SHUTDOWN
+    ));
+}

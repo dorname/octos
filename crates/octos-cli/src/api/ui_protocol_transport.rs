@@ -261,6 +261,9 @@ const APPROVAL_CANCELLED_REASON_PEER_CLOSED: &str = "peer_closed";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
+/// Stop this `octos serve`, exactly as Ctrl+C would. Local `--solo` HTTP
+/// servers only — see [`supports_server_shutdown`].
+const APPUI_METHOD_SERVER_SHUTDOWN: &str = "server/shutdown";
 const APPUI_METHOD_SESSION_STATUS_READ: &str =
     octos_core::ui_protocol::methods::SESSION_STATUS_READ;
 const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
@@ -406,6 +409,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
     APPUI_METHOD_SESSION_STATUS_READ,
     APPUI_METHOD_PROFILE_LOCAL_CREATE,
+    APPUI_METHOD_SERVER_SHUTDOWN,
     APPUI_METHOD_PROFILE_LLM_LIST,
     APPUI_METHOD_PROFILE_LLM_SELECT,
     APPUI_METHOD_MCP_STATUS_LIST,
@@ -2364,6 +2368,11 @@ impl ConnectionUiFeatures {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
                 && !supports_local_solo_profile_create(state)
             {
+                continue;
+            }
+            // Advertised only where it can run, so a client shows a Stop
+            // control exactly when pressing it would stop the server.
+            if *method == APPUI_METHOD_SERVER_SHUTDOWN && !supports_server_shutdown(state) {
                 continue;
             }
             // #1057: `onboarding/workspace_probe` is a local-solo onboarding
@@ -9470,6 +9479,42 @@ pub(crate) fn supports_local_solo_profile_create(state: &AppState) -> bool {
         && state.deployment_mode == crate::config::DeploymentMode::Local
         && state.profile_store.is_some()
         && state.user_store.is_some()
+}
+
+/// Whether a UI Protocol client may stop this server (`server/shutdown`).
+///
+/// Stopping ends the process for EVERY connected client and cancels their
+/// running turns, so it rides on the same keystone as the other dangerous
+/// local-only actions — an explicit `--solo` opt-in on a Local deployment
+/// ([`local_solo_danger_allowed`]) — and additionally needs a serve loop to
+/// stop: only HTTP `serve` installs [`AppState::serve_shutdown`]. A fleet or
+/// hosted server, where one client stopping the process would take everyone
+/// else down, never advertises or accepts it.
+pub(crate) fn supports_server_shutdown(state: &AppState) -> bool {
+    local_solo_danger_allowed(state) && state.serve_shutdown.is_some()
+}
+
+/// `server/shutdown`: stop this `octos serve` exactly as Ctrl+C would.
+fn handle_server_shutdown(state: &AppState) -> Result<Value, RpcError> {
+    let Some(stop) = state
+        .serve_shutdown
+        .clone()
+        .filter(|_| supports_server_shutdown(state))
+    else {
+        return Err(
+            RpcError::invalid_request("server/shutdown is not available on this server")
+                .with_data(json!({ "kind": "server_shutdown_unavailable" })),
+        );
+    };
+    tracing::warn!("server/shutdown requested by a UI Protocol client; stopping");
+    // Acknowledge first. The stop drains every connection, so flipping the
+    // switch synchronously could close this socket before the reply that tells
+    // the client its request was accepted has been written.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        stop.send_replace(true);
+    });
+    Ok(json!({ "stopping": true }))
 }
 
 /// Whether this server is a genuine local single-user box that may opt into
@@ -18289,6 +18334,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
+        APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
@@ -18773,6 +18819,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     if matches!(
         method,
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+            | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
             | APPUI_METHOD_PROFILE_LLM_CATALOG
             | APPUI_METHOD_PROFILE_LLM_LIST
@@ -18843,6 +18890,7 @@ fn session_ingress_callable_method(method: &str) -> bool {
     !matches!(
         method,
         APPUI_METHOD_PROFILE_LOCAL_CREATE
+            | APPUI_METHOD_SERVER_SHUTDOWN
             | octos_core::ui_protocol::methods::SESSION_LIST
             | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
             | octos_core::ui_protocol::methods::CONTENT_LIST
