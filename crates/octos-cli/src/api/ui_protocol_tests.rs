@@ -43876,6 +43876,42 @@ fn should_keep_every_assistant_reply_whole_when_reasoning_and_tool_output_can_ab
 }
 
 #[test]
+fn should_keep_every_message_and_reply_when_a_long_session_has_many_medium_fields() {
+    // The shape of a real long coding session: hundreds of turns, each
+    // reasoning trace and tool output only a few KiB, but ~5 MiB in total. A
+    // preview floor sized for one dominant field cannot fit this, and the
+    // structural fallback then silently drops half the message list.
+    let frame = oversized_hydrate_frame(300, 8 * 1024, 8 * 1024, 1024);
+    assert!(
+        frame.len() > 4 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 1200, "no message may be dropped");
+    for turn in 0..300 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}"))
+                && !reply.contains("bytes truncated"),
+            "reply {turn} must survive whole"
+        );
+    }
+}
+
+#[test]
 fn should_preview_rather_than_blank_replies_when_the_replies_alone_are_over_the_cap() {
     // Replies alone are ~2.4 MiB, so they must be cut too — but each keeps a
     // head and a tail with a marker, never the blank stub.

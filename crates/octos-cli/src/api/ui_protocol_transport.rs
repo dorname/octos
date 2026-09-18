@@ -40807,7 +40807,8 @@ fn preview_oversized_frame(text: String) -> String {
             .filter(|c| c.tier == tier)
             .map(|c| c.escaped_len)
             .collect();
-        let Some(cap) = shared_field_cap(&tier_sizes, excess) else {
+        let Some(cap) = shared_field_cap(&tier_sizes, excess, tier.min_preview_escaped_bytes())
+        else {
             continue;
         };
         for candidate in candidates
@@ -40821,8 +40822,8 @@ fn preview_oversized_frame(text: String) -> String {
                 candidate.raw_len,
                 cap,
             )
-            // Unreachable: the cap never drops below MIN_FIELD_PREVIEW_ESCAPED_BYTES,
-            // which always holds the marker plus a head and a tail.
+            // Unreachable: the cap never drops below the tier's floor, which
+            // always holds the marker plus a head and a tail.
             .unwrap_or_else(|| UNPREVIEWABLE_STUB.to_owned());
             let new_escaped = json_escaped_len_bytes(preview.as_bytes());
             if !set_field_at_path(&mut value, &candidate.path, Value::String(preview)) {
@@ -40903,27 +40904,37 @@ struct TruncationCandidate {
     tier: FieldTier,
 }
 
-/// Smallest escaped length a field is ever cut to: the marker plus ~1 KiB of
-/// head and tail, enough to recognise what the field was.
-const MIN_FIELD_PREVIEW_ESCAPED_BYTES: usize = MARKER_ESCAPED_RESERVE_BYTES + 2 * 1024;
+impl FieldTier {
+    /// Smallest escaped length a field of this tier is ever cut to (marker
+    /// included). Reasoning and tool I/O may shrink to a short head+tail
+    /// glimpse — a long session has hundreds of them, and a larger floor
+    /// leaves the frame over target, which drops whole messages in the
+    /// structural fallback. Conversation text keeps ~1 KiB.
+    fn min_preview_escaped_bytes(self) -> usize {
+        MARKER_ESCAPED_RESERVE_BYTES
+            + match self {
+                FieldTier::Reasoning | FieldTier::ToolIo => 256,
+                FieldTier::Content => 1024,
+            }
+    }
+}
 
-/// The largest shared escaped-length cap that, applied to every field in
-/// `sizes`, saves at least `excess` bytes. When even the minimum preview size
-/// cannot save that much, returns the minimum (cut this tier as far as it goes
-/// and let the next tier absorb the rest). `None` when no field is big enough
-/// to cut at all.
-fn shared_field_cap(sizes: &[usize], excess: usize) -> Option<usize> {
+/// The largest shared escaped-length cap (at least `floor`) that, applied to
+/// every field in `sizes`, saves at least `excess` bytes. When even `floor`
+/// cannot save that much, returns `floor` (cut this tier as far as it goes and
+/// let the next tier absorb the rest). `None` when no field is over `floor`.
+fn shared_field_cap(sizes: &[usize], excess: usize, floor: usize) -> Option<usize> {
     let savings = |cap: usize| -> usize { sizes.iter().map(|&len| len.saturating_sub(cap)).sum() };
     let largest = sizes.iter().copied().max()?;
-    if largest <= MIN_FIELD_PREVIEW_ESCAPED_BYTES {
+    if largest <= floor {
         return None;
     }
-    if savings(MIN_FIELD_PREVIEW_ESCAPED_BYTES) <= excess {
-        return Some(MIN_FIELD_PREVIEW_ESCAPED_BYTES);
+    if savings(floor) <= excess {
+        return Some(floor);
     }
     // savings() falls as the cap rises; find the highest cap that still saves
     // `excess`. Invariant: savings(lo) >= excess, savings(hi) < excess.
-    let (mut lo, mut hi) = (MIN_FIELD_PREVIEW_ESCAPED_BYTES, largest);
+    let (mut lo, mut hi) = (floor, largest);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
         if savings(mid) >= excess {
