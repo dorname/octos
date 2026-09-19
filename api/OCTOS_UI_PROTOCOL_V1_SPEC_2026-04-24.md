@@ -485,6 +485,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
 - `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
+- `server/shutdown` (accepted `UPCR-2026-032`; stops the serving process
+  through the same graceful path as SIGINT; advertised and callable only on a
+  local `--solo` HTTP serve, never to session-scoped connections, otherwise
+  typed `server_shutdown_unavailable`)
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
