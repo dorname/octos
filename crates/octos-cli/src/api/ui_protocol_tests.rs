@@ -43778,3 +43778,176 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
         "supplied vectors pass through untouched"
     );
 }
+
+// ---------------------------------------------------------------------
+// Oversized hydrate: shrink low-value fields first, never blank a reply.
+// A long coding session's `session/hydrate` reply is several MiB, spread
+// over hundreds of reasoning / tool-output / reply strings. Truncating
+// largest-first with a leftover budget blanked the biggest fields outright
+// — often the assistant's own replies — with `[oversized field omitted]`.
+// ---------------------------------------------------------------------
+
+/// A hydrate-shaped reply: `n` turns, each with a reasoning trace, a tool
+/// call + tool output, and an assistant reply, sized per the arguments.
+fn oversized_hydrate_frame(
+    turns: usize,
+    reasoning_len: usize,
+    tool_len: usize,
+    reply_len: usize,
+) -> String {
+    let mut messages = Vec::new();
+    for turn in 0..turns {
+        messages.push(json!({ "role": "user", "content": format!("question {turn}") }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": format!("R{turn}:{}", "r".repeat(reasoning_len)),
+            "tool_calls": [{ "id": format!("call-{turn}"), "type": "function",
+                "function": { "name": "shell", "arguments": format!("{{\"cmd\":\"{}\"}}", "a".repeat(tool_len / 4)) } }],
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": format!("call-{turn}"),
+            "content": format!("T{turn}:{}", "t".repeat(tool_len)),
+        }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": format!("REPLY_HEAD_{turn} {} REPLY_TAIL_{turn}", "w".repeat(reply_len)),
+        }));
+    }
+    let value = json!({ "jsonrpc": "2.0", "id": 7, "result": { "session_id": "local:test", "messages": messages } });
+    app_ui_codec::to_compact_json(&value).expect("serialize hydrate frame")
+}
+
+fn hydrate_messages(out: &str) -> Vec<Value> {
+    let parsed: Value = serde_json::from_str(out).expect("rewritten frame stays valid JSON");
+    parsed["result"]["messages"]
+        .as_array()
+        .expect("messages survive")
+        .clone()
+}
+
+#[test]
+fn should_keep_every_assistant_reply_whole_when_reasoning_and_tool_output_can_absorb_the_cut() {
+    // ~3 MiB: 40 turns x (30 KiB reasoning + ~37 KiB tool call/output + 8 KiB reply).
+    let frame = oversized_hydrate_frame(40, 30 * 1024, 30 * 1024, 8 * 1024);
+    assert!(
+        frame.len() > 2 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 160, "no message is dropped");
+    for turn in 0..40 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} must survive whole"
+        );
+        assert!(
+            !reply.contains("bytes truncated"),
+            "reply {turn} must not be cut"
+        );
+        let tool = messages[turn * 4 + 2]["content"].as_str().unwrap();
+        assert!(
+            tool.starts_with(&format!("T{turn}:")),
+            "tool output {turn} keeps its head"
+        );
+        let reasoning = messages[turn * 4 + 1]["reasoning_content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reasoning.starts_with(&format!("R{turn}:")),
+            "reasoning {turn} keeps its head"
+        );
+    }
+}
+
+#[test]
+fn should_keep_every_message_and_reply_when_a_long_session_has_many_medium_fields() {
+    // The shape of a real long coding session: hundreds of turns, each
+    // reasoning trace and tool output only a few KiB, but ~5 MiB in total. A
+    // preview floor sized for one dominant field cannot fit this, and the
+    // structural fallback then silently drops half the message list.
+    let frame = oversized_hydrate_frame(300, 8 * 1024, 8 * 1024, 1024);
+    assert!(
+        frame.len() > 4 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 1200, "no message may be dropped");
+    for turn in 0..300 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}"))
+                && !reply.contains("bytes truncated"),
+            "reply {turn} must survive whole"
+        );
+    }
+}
+
+#[test]
+fn should_preview_rather_than_blank_replies_when_the_replies_alone_are_over_the_cap() {
+    // Replies alone are ~2.4 MiB, so they must be cut too — but each keeps a
+    // head and a tail with a marker, never the blank stub.
+    let frame = oversized_hydrate_frame(12, 1024, 1024, 200 * 1024);
+    assert!(frame.len() > 2 * MAX_TEXT_FRAME_BYTES);
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    for turn in 0..12 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} ")),
+            "reply {turn} keeps its head"
+        );
+        assert!(
+            reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} keeps its tail"
+        );
+        assert!(
+            reply.contains("bytes truncated"),
+            "reply {turn} carries the marker"
+        );
+        assert!(
+            reply.len() > 16 * 1024,
+            "reply {turn} keeps a useful preview, got {}",
+            reply.len()
+        );
+    }
+}
