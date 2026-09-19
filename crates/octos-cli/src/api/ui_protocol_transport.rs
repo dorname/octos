@@ -9508,8 +9508,12 @@ fn handle_server_shutdown(state: &AppState) -> Result<Value, RpcError> {
     };
     tracing::warn!("server/shutdown requested by a UI Protocol client; stopping");
     // Acknowledge first. The stop drains every connection, so flipping the
-    // switch synchronously could close this socket before the reply that tells
-    // the client its request was accepted has been written.
+    // switch synchronously could close this socket before the reply is
+    // written. The flip is scheduled 250 ms from handling this request, while
+    // the WS loop writes the reply after we return: if this connection's
+    // outbound queue is backed up past that, the client may never read the
+    // ack. Harmless — the server still stops, and a repeated call is
+    // idempotent.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         stop.send_replace(true);

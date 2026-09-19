@@ -20404,6 +20404,7 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
         APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
         APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+        APPUI_METHOD_SERVER_SHUTDOWN,
         // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
         octos_core::ui_protocol::methods::SESSION_GOAL_GET,
         octos_core::ui_protocol::methods::SESSION_GOAL_SET,
