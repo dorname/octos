@@ -26764,6 +26764,70 @@ async fn turn_state_get_returns_unknown_for_missing() {
     // NOT an error.
     assert!(frame.get("result").is_some(), "missing turn must succeed");
     assert_eq!(frame["result"]["state"], "unknown");
+    // UPCR-2026-031: nothing in this process holds or is admitting the turn,
+    // so the server can say for certain it is not running it.
+    assert_eq!(frame["result"]["running"], false);
+}
+
+async fn turn_state_frame(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_turns: &SharedActiveTurns,
+    turn_id: TurnId,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        state,
+        &ledger,
+        active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "ts".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id,
+        },
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_not_claim_a_turn_is_stopped_while_its_start_is_still_being_admitted() {
+    // A slow `turn/start` has not reached the registry yet. A lookup in that
+    // window must stay a plain `unknown`: the turn may be about to run.
+    let session_id = SessionKey("local:turn-admitting".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    let _admitting = TurnAdmission::enter(&session_id, &turn_id);
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert!(
+        frame["result"].get("running").is_none(),
+        "no certainty while the start is in flight: {frame}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_say_a_turn_is_not_running_once_its_admission_has_ended_without_a_record() {
+    // The admission ended without registering the turn (refused, or its
+    // requester vanished before the accept). Now the answer is certain.
+    let session_id = SessionKey("local:turn-admission-ended".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    drop(TurnAdmission::enter(&session_id, &turn_id));
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert_eq!(frame["result"]["running"], false);
 }
 
 /// Serialise tests that mutate the process-global message-commit
