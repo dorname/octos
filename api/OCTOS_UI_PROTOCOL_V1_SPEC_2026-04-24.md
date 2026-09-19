@@ -420,7 +420,8 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
-- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`;
+  additive `running` certainty field `UPCR-2026-031`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
