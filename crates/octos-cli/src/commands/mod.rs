@@ -51,6 +51,7 @@ pub mod skills;
 mod status;
 mod steer;
 mod update;
+mod watchdog;
 
 use std::path::PathBuf;
 
@@ -100,6 +101,7 @@ pub use skills::SkillsCommand;
 pub use status::StatusCommand;
 pub use steer::SteerCommand;
 pub use update::UpdateCommand;
+pub use watchdog::WatchdogCommand;
 
 /// octos: Rust-native coding agent orchestration.
 #[derive(Debug, Parser)]
@@ -182,6 +184,8 @@ pub enum Command {
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
+    /// Supervise OctoLoop signals and bounded inner-loop continuation.
+    Watchdog(WatchdogCommand),
 
     /// Operator goal transitions (reopen a blocked/paused goal, archive a goal terminally).
     Goal(GoalCommand),
@@ -223,6 +227,7 @@ pub fn reserve_stdout(command: &Command) -> bool {
         // `doctor --json`. Without `--json` the human table stays on the
         // historical stdout routing.
         Command::Cache(cmd) => cmd.emits_json(),
+        Command::Watchdog(cmd) => cmd.emits_json(),
         _ => false,
     }
 }
@@ -431,6 +436,7 @@ impl Executable for Command {
             Self::Steer(cmd) => cmd.execute(),
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
+            Self::Watchdog(cmd) => cmd.execute(),
             Self::Goal(cmd) => cmd.execute(),
             Self::Ledger(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),

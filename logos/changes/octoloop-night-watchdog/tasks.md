@@ -11,7 +11,9 @@
 
 ## [code] 代码实现
 
-（本段在规格合并前留空；`openlogos merge` 完成后由 slice-planner 基于已合并规格与 UT-S17-01..20、ST-S17-01..14 划分真实代码切片，每片同时包含业务代码、对应测试与 OpenLogos reporter。）
+- [x] 批次 A：实现 Watchdog 配置校验、首次 EOF baseline、黑板/events 增量分类、稳定 signal id、进展指纹、轮转游标、原子状态、告警脱敏与三次无进展熔断；同步交付 UT-S17-01..05、UT-S17-10..16、UT-S17-18..20、ST-S17-01、ST-S17-06..08、ST-S17-12、ST-S17-14 及 OpenLogos reporter
+- [x] 批次 B：实现 herdr agent list 的 canonical cwd 精确发现、多候选 fail closed、outer-duty HELD 权威校验、accepted-only 投递状态机与单周期调度；同步交付 UT-S17-06..09、UT-S17-17、ST-S17-02..05、ST-S17-09..11、ST-S17-14 及 OpenLogos reporter
+- [x] 批次 C：接入 `octos watchdog run/run-once/status`，实现 systemd user unit、默认不启用的安装/卸载脚本与隔离 smoke runner；同步交付 ST-S17-13、SMOKE-S17-01..06，回归 UT-S17-01..20、ST-S17-01..14 并生成完整 OpenLogos 结果账本
 
 ## [deploy] 部署与冒烟
 - [ ] 在隔离测试环境安装并显式启用 systemd user service，验证 `Restart=always`、状态恢复、日志与 status

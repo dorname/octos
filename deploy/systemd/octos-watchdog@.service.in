@@ -1,0 +1,17 @@
+[Unit]
+Description=Octos OctoLoop watchdog (%i)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart="@OCTOS_BIN@" watchdog run --config "@CONFIG_HOME@/octos/watchdog/%i.toml"
+Restart=always
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+Environment="XDG_CONFIG_HOME=@CONFIG_HOME@"
+Environment="XDG_STATE_HOME=@STATE_HOME@"
+Environment="PATH=@EXEC_PATH@"
+
+[Install]
+WantedBy=default.target
