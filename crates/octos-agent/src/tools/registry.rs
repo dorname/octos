@@ -572,6 +572,34 @@ impl ToolRegistry {
         self.invalidate_cache();
     }
 
+    /// c3/K04: wrap every registered side-effect tool with
+    /// [`super::idempotent::IdempotentToolExecutor`] driven by `ledger`, so a
+    /// pod restart can reuse a confirmed result instead of re-firing the
+    /// external side effect. `side_effect_tool_names` lists which tools to
+    /// wrap; absent tools are silently skipped (no-op wrappers are also
+    /// skipped, so a no-`SideEffectLedger` install stays free of overhead).
+    pub fn wrap_with_idempotent_ledger(
+        &mut self,
+        ledger: Arc<dyn super::idempotent::SideEffectLedger>,
+        side_effect_tool_names: &[&str],
+    ) {
+        let mut wrapped: Vec<(String, Arc<dyn Tool>)> = Vec::new();
+        for name in side_effect_tool_names {
+            if let Some(inner) = self.tools.get(*name).cloned() {
+                let exec = super::idempotent::IdempotentToolExecutor::new(
+                    inner,
+                    Arc::clone(&ledger),
+                    format!("{name}@wrapped"),
+                );
+                wrapped.push(((*name).to_string(), Arc::new(exec)));
+            }
+        }
+        for (name, tool) in wrapped {
+            self.tools.insert(name, tool);
+        }
+        self.invalidate_cache();
+    }
+
     /// Return the names of every registered tool.
     ///
     /// Used by the validator runner's lightweight dispatcher to capture a
@@ -3577,5 +3605,85 @@ mod spec_order_tests {
         assert!(notebook_turn.is_tool_visible("notebook_only"));
         assert!(!ordinary_turn.is_tool_visible("notebook_only"));
         assert!(!base.is_tool_visible("notebook_only"));
+    }
+
+    /// K04 wiring: wrapping a tool with a SideEffectLedger substitutes the
+    /// tool's implementation with IdempotentToolExecutor, so a ReuseConfirmed
+    /// verdict reuses the confirmed result without re-firing the side
+    /// effect.
+    #[tokio::test]
+    async fn wrap_with_idempotent_ledger_routes_through_idempotent_executor() {
+        use super::super::idempotent::{SideEffectLedger, SideEffectVerdict};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct CountingTool(Arc<Mutex<u32>>);
+        #[async_trait]
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+                *self.0.lock().unwrap() += 1;
+                Ok(ToolResult {
+                    output: "fired".into(),
+                    success: true,
+                    ..Default::default()
+                })
+            }
+        }
+        struct MemLedger(Mutex<HashMap<String, SideEffectVerdict>>);
+        #[async_trait]
+        impl SideEffectLedger for MemLedger {
+            async fn consult(
+                &self,
+                id: &str,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+            ) -> SideEffectVerdict {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .copied()
+                    .unwrap_or(SideEffectVerdict::Fresh)
+            }
+            async fn confirmed_result(&self, _: &str) -> Option<String> {
+                Some("reused".into())
+            }
+            async fn mark_succeeded(&self, id: &str, _: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(id.into(), SideEffectVerdict::ReuseConfirmed);
+            }
+            async fn mark_unknown(&self, _: &str) {}
+        }
+
+        let calls = Arc::new(Mutex::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register_arc(Arc::new(CountingTool(Arc::clone(&calls))));
+        let ledger = Arc::new(MemLedger(Mutex::new(HashMap::new())));
+        reg.wrap_with_idempotent_ledger(ledger, &["shell"]);
+
+        let out1 = reg.execute("shell", &serde_json::json!({})).await.unwrap();
+        assert!(out1.success);
+        assert_eq!(*calls.lock().unwrap(), 1, "first call fires the tool");
+
+        // Second call: the ledger now reports ReuseConfirmed → tool not re-fired.
+        let out2 = reg.execute("shell", &serde_json::json!({})).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "K04: no re-fire on ReuseConfirmed"
+        );
+        assert_eq!(out2.output, "reused");
     }
 }

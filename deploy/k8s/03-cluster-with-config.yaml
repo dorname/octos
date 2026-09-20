@@ -1,0 +1,355 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: octos
+
+---
+# PersistentVolumeClaims: PG data + octos instance data + workspace.
+# Pod 重建后数据保留——这是修复 K8s bug 2 的关键。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgdata
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: octos-data
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace
+  namespace: octos
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi
+
+---
+# PostgreSQL for cluster mode
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg
+  template:
+    metadata:
+      labels:
+        app: pg
+    spec:
+      containers:
+      - name: pg
+        image: postgres:16-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: octos
+        - name: POSTGRES_DB
+          value: octos
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres", "-d", "octos"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: pgdata
+        persistentVolumeClaim:
+          claimName: pgdata
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+  namespace: octos
+spec:
+  selector:
+    app: pg
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+
+---
+# Non-sensitive config (DB URL, profile defaults, workspace path)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octos-config
+  namespace: octos
+data:
+  # === Required ===
+  DATABASE_URL: "postgres://postgres:octos@pg.octos.svc.cluster.local:5432/octos"
+  OCTOS_AUTH_TOKEN: "test-cluster-token-12345"
+
+  # === Profile defaults (applied by init-config.sh) ===
+  DEFAULT_PROFILE: "cluster-worker"
+  WORKSPACE_DIR: "/workspace"
+
+  # === LLM (provider-agnostic) ===
+  # Set LLM_API_KEY_ENV to the name of the env var holding the key.
+  # The actual key lives in Secret `llm-credentials`.
+  LLM_PROVIDER: "anthropic"
+  LLM_MODEL: "k3"
+  LLM_BASE_URL: "https://api.kimi.com/coding/"
+  LLM_API_KEY_ENV: "ANTHROPIC_API_KEY"
+
+  # === Logging ===
+  RUST_LOG: "info,sqlx=warn"
+
+---
+# Sensitive: API keys, must be created via:
+#   kubectl create secret generic llm-credentials \
+#     --from-literal=ANTHROPIC_API_KEY=sk-ant-xxxxx \
+#     -n octos
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-credentials
+  namespace: octos
+type: Opaque
+stringData:
+  # Replace with real key (or leave empty for no-LLM-demo mode)
+  ANTHROPIC_API_KEY: "REPLACE_ME"
+
+---
+# init-config.sh: runs as initContainer BEFORE octos serve starts.
+# Builds config.json + default profile, runs PG migrations.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: octos-init-script
+  namespace: octos
+data:
+  init-config.sh: |
+    #!/bin/sh
+    set -e
+    echo "=== octos k8s init ==="
+
+    # 1. Data dir
+    mkdir -p /tmp/octos-data
+    chmod 700 /tmp/octos-data
+
+    # 2. Top-level config (auth_token from env)
+    cat > /tmp/octos-data/config.json <<EOF
+    {
+      "version": 1,
+      "auth_token": "${OCTOS_AUTH_TOKEN}",
+      "default_profile": "${DEFAULT_PROFILE:-cluster-worker}"
+    }
+    EOF
+
+    # 3. Default profile (if absent)
+    #    octos ProfileDefinition::load reads <data_dir>/profiles/<id>.json
+    #    (flat file, NOT <id>/config.json subdir). Use flat format here.
+    PROFILE_FILE=/tmp/octos-data/profiles/${DEFAULT_PROFILE:-cluster-worker}.json
+    NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ ! -f "$PROFILE_FILE" ]; then
+      cat > "$PROFILE_FILE" <<EOF
+    {
+      "id": "${DEFAULT_PROFILE:-cluster-worker}",
+      "name": "Cluster Worker",
+      "enabled": true,
+      "workspace_root": "${WORKSPACE_DIR:-/workspace}",
+      "config": {
+        "llm": {
+          "primary": {
+            "provider": "${LLM_PROVIDER:-anthropic}",
+            "api_type": "${LLM_PROVIDER:-anthropic}",
+            "model": "${LLM_MODEL:-k3}",
+            "base_url": "${LLM_BASE_URL:-}",
+            "api_key_env": "${LLM_API_KEY_ENV:-ANTHROPIC_API_KEY}"
+          }
+        }
+      },
+      "created_at": "$NOW",
+      "updated_at": "$NOW"
+    }
+    EOF
+    fi
+
+    # 4. Workspace dir
+    mkdir -p "${WORKSPACE_DIR:-/workspace}"
+
+    # 5. Fetch octos binary from host.docker.internal:8088.
+    #    The user runs `python3 -m http.server 8088` (or similar) in
+    #    the directory containing `octos` BEFORE applying this manifest.
+    #    docker-desktop makes the host reachable at host.docker.internal.
+    #    For Linux/minikube: replace with the host IP.
+    echo "Fetching octos binary from http://host.docker.internal:8088/octos..."
+    if wget -q -O /opt/octos/octos http://host.docker.internal:8088/octos; then
+      chmod +x /opt/octos/octos
+      echo "Binary installed: $(/opt/octos/octos --version 2>&1 | head -1)"
+    else
+      echo "ERROR: failed to fetch binary from host.docker.internal:8088."
+      echo "On the host, run: cd <dir-of-octos-binary> && python3 -m http.server 8088 &"
+      exit 1
+    fi
+
+    # 6. PG migrations (cluster mode).
+    #    octos-cli does NOT currently expose a `migrate` subcommand.
+    #    Instead, `attach_durable_approvals_pg` and `attach_cron_service_pg`
+    #    in serve.rs call `store.migrate()` LAZILY on first DB op. This is
+    #    by design (K06): migrations run when the durable backend is first
+    #    touched, so a deployment that never parks an approval / never
+    #    records a firing skips the migration entirely.
+    if [ -n "$DATABASE_URL" ]; then
+      echo "PG migrations will run lazily on first DB op (K06 design)."
+    fi
+
+    echo "=== init complete ==="
+
+---
+# Octos serve (cluster mode) with initContainer that runs the init script.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: octos
+  template:
+    metadata:
+      labels:
+        app: octos
+    spec:
+      # initContainer: prepares config + injects binary via emptyDir.
+      # This avoids the hostPath brittleness (docker-desktop VM cannot
+      # see WSL's /tmp; Windows-only paths also don't work uniformly).
+      # The binary is base64-encoded in ConfigMap `octos-binary` and
+      # decoded into an emptyDir shared with the main container.
+      initContainers:
+      - name: init
+        image: alpine:3.21
+        command: ["/usr/local/bin/init-config.sh"]
+        envFrom:
+        - configMapRef:
+            name: octos-config
+        - secretRef:
+            name: llm-credentials
+        volumeMounts:
+        - name: octos-data
+          mountPath: /tmp/octos-data
+        - name: workspace
+          mountPath: /workspace
+        - name: octos-binary
+          mountPath: /opt/octos
+        - name: init-script
+          mountPath: /usr/local/bin/init-config.sh
+          readOnly: true
+          subPath: init-config.sh
+      containers:
+      - name: octos
+        image: alpine:3.21
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/octos/octos"]
+        args:
+        - serve
+        - --port
+        - "8080"
+        - --host
+        - "0.0.0.0"
+        - --instance-data-dir
+        - /tmp/octos-data
+        envFrom:
+        - configMapRef:
+            name: octos-config
+        - secretRef:
+            name: llm-credentials
+        - secretRef:
+            name: minimax-credentials
+        env:
+        - name: OCTOS_HOME
+          value: /tmp/octos-data
+        - name: RUST_LOG
+          value: "info,octos_cli=debug,octos_store=debug"
+        # Allow AppUI/WebSocket connections from common port-forward
+        # ports (9091, 8080) + the loopback variants. The serve port
+        # (8080) is auto-appended; 9091 is the user's port-forward.
+        - name: OCTOS_APPUI_ALLOWED_ORIGINS
+          value: "http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080"
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: octos-data
+          mountPath: /tmp/octos-data
+        - name: workspace
+          mountPath: /workspace
+        - name: octos-binary
+          mountPath: /opt/octos
+          readOnly: true
+          # The init-container decodes the binary from ConfigMap
+          # `octos-binary` into /opt/octos/octos and chmods +x it.
+          # No hostPath required — works on any cluster (docker-desktop,
+          # minikube, kind, real K8s).
+      volumes:
+      - name: octos-data
+        persistentVolumeClaim:
+          claimName: octos-data
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: workspace
+      - name: octos-binary
+        emptyDir: {}
+      - name: init-script
+        configMap:
+          name: octos-init-script
+          defaultMode: 0o755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: octos
+  namespace: octos
+spec:
+  selector:
+    app: octos
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP

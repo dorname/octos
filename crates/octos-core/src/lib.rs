@@ -11,6 +11,7 @@ pub mod app_ui;
 pub mod app_ui_codec;
 pub mod env_hygiene;
 mod error;
+pub mod execution_scope;
 pub mod gateway;
 pub mod git_worktree;
 mod message;

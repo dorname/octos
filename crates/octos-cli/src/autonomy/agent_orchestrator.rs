@@ -25754,6 +25754,94 @@ mod tests {
     /// (so NO ScatterJoinComplete existed yet), then the process exits. On
     /// restart, agent-1's child mark must NOT suppress the join: when the
     /// restored roster's sibling scan sees both children terminal, the
+    /// specs/task-c3-recoverable-execution-leases.spec.md Rule child-join
+    /// (K09): a child terminal forwarded TWICE (e.g. duplicate broker
+    /// delivery) must produce exactly one join — the parent runs the join
+    /// exactly once and usage settles exactly once. The dedupe keys must
+    /// collapse the duplicate; a duplicate delivery must not re-emit
+    /// either ChildCompleted or ScatterJoinComplete.
+    #[test]
+    fn duplicate_child_terminal_joins_parent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator.configure_supervisor_store(dir.path()).unwrap();
+        let session = SessionKey::with_profile("tenant-k09", "api", "k09-join-once");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-k09".to_owned(),
+        };
+        // Two siblings in one group; both go terminal, draining in two
+        // stages so the join must wait for the second sibling. After both
+        // are delivered and drained once, re-deliver "a" alone and confirm
+        // the second drain emits no ChildCompleted and no
+        // ScatterJoinComplete.
+        orchestrator.upsert_agent(upsert("a", "running")).unwrap();
+        orchestrator.upsert_agent(upsert("b", "running")).unwrap();
+        orchestrator.upsert_agent(upsert("a", "completed")).unwrap();
+        // First sibling terminal → ChildCompleted for "a". Sibling scan
+        // still sees "b" running, so NO ScatterJoinComplete yet.
+        let first_drain = orchestrator.drain_ready_continuations_for_session(
+            &session,
+            "tenant-k09",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let first_child_a = first_drain
+            .iter()
+            .filter(|i| i.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(first_child_a, 1, "first delivery of child a fires once");
+        let first_scatter = first_drain
+            .iter()
+            .filter(|i| i.reason == MasterContinuationReason::ScatterJoinComplete)
+            .count();
+        assert_eq!(first_scatter, 0, "join must wait for the second sibling");
+        // Second sibling terminal → ChildCompleted("b") + first
+        // ScatterJoinComplete (because both are now terminal).
+        orchestrator.upsert_agent(upsert("b", "completed")).unwrap();
+        let second_drain = orchestrator.drain_ready_continuations_for_session(
+            &session,
+            "tenant-k09",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let second_scatter = second_drain
+            .iter()
+            .filter(|i| i.reason == MasterContinuationReason::ScatterJoinComplete)
+            .count();
+        assert_eq!(
+            second_scatter, 1,
+            "second sibling terminal triggers first and only ScatterJoinComplete"
+        );
+        // Now DUPLICATE child terminal delivery: re-deliver "a" (already
+        // delivered) and re-deliver "b" (already delivered). The third
+        // drain must produce ZERO continuations — neither ChildCompleted
+        // nor ScatterJoinComplete — because delivered_child_marks and the
+        // join key collapse the duplicates.
+        orchestrator.upsert_agent(upsert("a", "completed")).unwrap();
+        orchestrator.upsert_agent(upsert("b", "completed")).unwrap();
+        let third_drain = orchestrator.drain_ready_continuations_for_session(
+            &session,
+            "tenant-k09",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            third_drain.is_empty(),
+            "K09: re-deliveries of already-delivered child terminals must              produce zero continuations; got {third_drain:?}"
+        );
+    }
+
     /// missing ScatterJoinComplete still enqueues and drains.
     #[test]
     fn scatter_join_survives_restart_after_child_only_crash() {

@@ -84,6 +84,12 @@ logos/.openlogos-guard
 # Baseline-seed run scratch (staging, journal, event log) is operational state.
 logos/resources/verify/baseline-seed-runs/
 logos/resources/verify/baseline-events.jsonl
+# K8s 无状态化改造：分析文档 + 部署说明（随 dorname-k8s-dev 演进）
+!docs/analysis/octos-k8s-plugin-factory-plan-2026-09-14.md
+!docs/analysis/octos-k8s-state-inventory-p0-2026-09-15.md
+!docs/analysis/octos-k8s-goal01-final-report.md
+!docs/analysis/pg-persistence-matrix.md
+!deploy/**/*.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
@@ -194,3 +200,4 @@ tsconfig.tsbuildinfo
 # `git add -A` here otherwise sweeps hundreds of artifact files — and any
 # workspace dirs the soaks `git init` — into a commit.
 /scratchpad/
+specs/task-c5-cron-durable-firing.spec.md

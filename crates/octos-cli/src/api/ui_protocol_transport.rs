@@ -20361,8 +20361,64 @@ async fn open_session_result(
     for notification in open_compaction_events {
         let _ = ledger.append_notification_from(notification, connection_id);
     }
+    // K06: WS reconnect / resync. The in-memory ledger replay is the
+    // primary path. When it fails with cursor-out-of-range (the client
+    // last-acked a seq that the in-memory ring + disk snapshot no
+    // longer cover — e.g. Pod restart + disk loss, or the client
+    // reconnecting to a different Pod), fall back to the durable PG
+    // `session_events` table via `replay_from_pg`.
     let (mut replay, replay_baseline_seq) =
-        ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
+        match ledger.replay_after_with_head(&params.session_id, params.after.as_ref()) {
+            Ok((events, head)) => (events, head),
+            Err(in_memory_err) => {
+                // Only fall back to PG when the client asked for replay
+                // (params.after is Some). A "live only" open (after=None)
+                // has nothing to replay — the in-memory path already
+                // returns an empty Vec with the current head.
+                let Some(after) = params.after.as_ref() else {
+                    return Err(in_memory_err);
+                };
+                match ledger.replay_from_pg(&params.session_id, after.seq).await {
+                    Ok((events, head)) => {
+                        tracing::info!(
+                            session_id = %params.session_id.0,
+                            after_seq = after.seq,
+                            events = events.len(),
+                            head_seq = head,
+                            "K06: WS reconnect replayed from PG after in-memory miss"
+                        );
+                        // K06 write path: the in-memory ring may
+                        // contain events that PG does not (appended
+                        // since the last flush). Flush them now so
+                        // the next reconnect (to this Pod or another)
+                        // reads from PG. Best-effort: a failed flush
+                        // logs and does not fail the reconnect.
+                        let flushed = ledger
+                            .flush_session_to_pg(&params.session_id)
+                            .await
+                            .unwrap_or(0);
+                        if flushed > 0 {
+                            tracing::info!(
+                                session_id = %params.session_id.0,
+                                flushed,
+                                "K06: flushed in-memory events to PG after reconnect"
+                            );
+                        }
+                        (events, head)
+                    }
+                    Err(pg_err) => {
+                        tracing::warn!(
+                            session_id = %params.session_id.0,
+                            after_seq = after.seq,
+                            in_memory_error = ?in_memory_err,
+                            pg_error = ?pg_err,
+                            "K06: both in-memory and PG replay failed"
+                        );
+                        return Err(in_memory_err);
+                    }
+                }
+            }
+        };
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
@@ -23116,6 +23172,45 @@ async fn handle_turn_start_with_accept(
             state: turn_state.clone(),
         },
     );
+
+    // UPCR-2026-030 (c1): bind the authenticated identity + wire session to
+    // an authoritative cluster Scope and expose the run's server-allocated
+    // `run_id` on the accept reply (additive — absent `run_id` stays valid
+    // for older clients). The scope is bound once here; downstream
+    // ledger/registry reads keep their existing SessionKey identity until
+    // c2 switches them to Scope keys. Tenant/profile come ONLY from the
+    // authenticated connection, never from a client payload. Binding never
+    // blocks a valid turn: on scope-binding failure the accept simply omits
+    // `run_id`.
+    let accept_result = {
+        let tenant_id = connection_profile_id.or(routed_profile_id);
+        match tenant_id {
+            Some(tenant) => {
+                let thread_id = turn_id.0.to_string();
+                match super::execution_context::open_turn_scope(
+                    tenant,
+                    &profile_for_stamp,
+                    &session_id,
+                    &thread_id,
+                    None,
+                ) {
+                    Ok(ctx) => {
+                        let mut v = accept_result;
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "run_id".to_string(),
+                                Value::String(ctx.execution.run_id().to_string()),
+                            );
+                        }
+                        v
+                    }
+                    Err(_) => accept_result,
+                }
+            }
+            None => accept_result,
+        }
+    };
+
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {

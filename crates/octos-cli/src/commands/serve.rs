@@ -738,6 +738,59 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
+        // c2 cluster mode: when `DATABASE_URL` is set, serve runs against
+        // PostgreSQL and approvals become durable (the in-process oneshot is
+        // only the wake-up accelerator). Wired BEFORE any connection can park
+        // an approval. Single-node serve (no DATABASE_URL) stays in-process.
+        #[cfg(feature = "postgres")]
+        {
+            if let Ok(url) = std::env::var("DATABASE_URL") {
+                if !url.trim().is_empty() {
+                    crate::commands::serve_cluster::attach_durable_approvals_pg(&url).await?;
+                    // N3: attach the PG-backed cron service for cluster mode.
+                    // The service is constructed but NOT started here — the
+                    // caller (profile.rs or the gateway runtime) calls
+                    // `start()` on it. The scope uses the default tenant
+                    // resolution (the per-connection authenticated identity
+                    // refines tenant/profile at request time — c1's entry
+                    // binding in `execution_context`). The controller_id is
+                    // the hostname (or a UUID when hostname is unavailable)
+                    // so K10 single-claim works across Pods.
+                    let scope = {
+                        use octos_core::execution_scope::{AuthenticatedIdentity, bind_scope};
+                        let identity = AuthenticatedIdentity {
+                            tenant_id: "default".into(),
+                            profile_id: "_main".into(),
+                        };
+                        bind_scope(&identity, "cluster-cron", None).expect("bind cron scope")
+                    };
+                    let controller_id = std::env::var("HOSTNAME")
+                        .unwrap_or_else(|_| uuid::Uuid::now_v7().to_string());
+                    let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+                    let cron_service_pg = crate::commands::serve_cluster::attach_cron_service_pg(
+                        &url,
+                        &scope,
+                        &controller_id,
+                        cron_tx,
+                    )
+                    .await?;
+                    // N3: start the PG-backed cron service. The service
+                    // spawns a tokio timer task that re-arms via
+                    // `Arc::clone(self)` — the task self-holds an
+                    // `Arc<CronServicePg>` so the service is not
+                    // dropped when `run_async` returns. The shutdown
+                    // path flips `running` to false via
+                    // `shutdown_signal` and the task drops its self-held
+                    // Arc on the next tick.
+                    cron_service_pg.clone().start().await;
+                    tracing::info!(
+                        target = "octos::cluster",
+                        controller_id = %controller_id,
+                        "cron service (PG) attached and started"
+                    );
+                }
+            }
+        }
         let cwd = match &self.cwd {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,

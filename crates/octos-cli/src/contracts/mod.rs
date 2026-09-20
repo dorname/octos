@@ -116,3 +116,22 @@ pub(crate) fn contract_stores() -> Arc<UiProtocolContractStores> {
         .get_or_init(|| Arc::new(UiProtocolContractStores::default()))
         .clone()
 }
+
+/// c2 cluster wiring: install a durable approval backend on the process-global
+/// contract stores at serve startup. The store uses an internal `OnceLock` for
+/// the durable sink, so this is safe to call any time before the first
+/// approval is requested; calling it twice (or after a request parked) returns
+/// `false` — a startup-ordering bug cluster mode must treat as fatal.
+///
+/// Single-node `chat`/`gateway` never call this: approvals stay in-process.
+/// Only compiled with the `postgres` feature (the sole caller is the
+/// cluster-mode serve startup in `commands::serve_cluster`).
+#[cfg(feature = "postgres")]
+pub(crate) fn attach_durable_approvals(
+    durable: std::sync::Arc<dyn approvals::ApprovalDurableStore>,
+    scope_for: approvals::ScopeResolver,
+) -> bool {
+    contract_stores()
+        .approvals
+        .attach_durable(durable, scope_for)
+}
