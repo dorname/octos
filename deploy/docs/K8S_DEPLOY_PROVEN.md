@@ -275,3 +275,85 @@ kubectl create secret generic llm-credentials \
 # 然后 rollout restart：
 kubectl rollout restart deployment/octos -n octos
 ```
+
+## 停止与再部署
+
+### 停止（按力度）
+
+**A. 只停 Pod，保留 PVC / ConfigMap / Secret（可快速再拉起）：**
+
+```bash
+kubectl -n octos scale deploy/octos --replicas=0
+kubectl -n octos scale deploy/pg --replicas=0
+pkill -f 'port-forward.*octos' || true
+```
+
+**B. 按清单卸载资源（namespace 可能仍在；PVC 是否删除以 yaml 为准）：**
+
+```bash
+pkill -f 'port-forward.*octos' || true
+kubectl delete -f deploy/k8s/03-cluster-with-config.yaml
+```
+
+**C. 整命名空间清掉（含 PG / workspace 等持久数据）：**
+
+```bash
+kubectl delete namespace octos
+```
+
+同时停掉本机给 init 拉 binary 的 HTTP（manifest 默认 `:8088`；若 live
+ConfigMap 改过端口则以实际为准，例如 Windows 上的 `:18088`）。
+
+### 再部署（cluster + musl postgres binary）
+
+```bash
+cd <repo-root>   # 含 logos/logos.config.json / deploy/ 的目录
+
+# 1. 构建（cluster 必须带 postgres，见 #2436）
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli \
+  --no-default-features --features api,postgres
+
+# 2. 提供 binary HTTP（init 从 host.docker.internal 拉取）
+#    默认端口与 03-cluster-with-config.yaml 一致：8088
+#    WSL2 + Docker Desktop：WSL 里 listen 常进不了集群；优先在 Windows 侧
+#    对含 octos 文件的目录执行：python -m http.server 8088 --bind 0.0.0.0
+mkdir -p /tmp/octos-k8s-bin
+cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s-bin/octos
+# （若坚持在 WSL 起 HTTP 且集群已 patch 为 18088，则端口必须与 ConfigMap 一致）
+
+# 3. 应用
+./deploy/scripts/deploy-k8s.sh cluster
+# 或：kubectl apply -f deploy/k8s/03-cluster-with-config.yaml
+kubectl -n octos rollout status deploy/octos --timeout=300s
+
+# 4. 访问（任选本地端口；须与 OCTOS_APPUI_ALLOWED_ORIGINS 对齐）
+kubectl -n octos port-forward svc/octos 50080:8080
+curl -sf http://127.0.0.1:50080/health
+# App: http://127.0.0.1:50080/app/
+```
+
+若 port-forward 使用 **50080**（而非文档早期的 9091），确认 Deployment 的
+`OCTOS_APPUI_ALLOWED_ORIGINS` 含：
+
+`http://127.0.0.1:50080,http://localhost:50080`
+
+（serve 只会自动放行**容器绑定端口** 8080 的 loopback，不会自动放行 PF 端口。）
+
+```bash
+kubectl -n octos set env deploy/octos \
+  OCTOS_APPUI_ALLOWED_ORIGINS='http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080,http://127.0.0.1:50080,http://localhost:50080'
+kubectl -n octos rollout status deploy/octos --timeout=300s
+```
+
+### port-forward 端口被占用
+
+`bind: address already in use` 时，WSL 的 `pkill` 可能杀不到 Windows 侧
+`kubectl.exe` 监听。先清占用再转发：
+
+```bash
+pkill -f 'port-forward.*50080' || true
+# Windows PowerShell：
+# Get-NetTCPConnection -LocalPort 50080 -State Listen -ErrorAction SilentlyContinue |
+#   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+kubectl -n octos port-forward svc/octos 50080:8080
+```

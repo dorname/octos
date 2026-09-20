@@ -55,16 +55,25 @@ cargo build --release -p octos-cli
 ./target/release/octos serve --stdio --solo --danger-full-access
 ```
 
-## 卸载
+## 卸载 / 停止
 
 ```bash
-# k8s 卸载
+# 软停（保留 PVC/配置）：scale replicas=0
+kubectl -n octos scale deploy/octos --replicas=0
+kubectl -n octos scale deploy/pg --replicas=0
+
+# k8s 按清单卸载
 kubectl delete -f deploy/k8s/03-cluster-with-config.yaml
 kubectl delete -f deploy/k8s/01-baseline.yaml
+# 全清：kubectl delete namespace octos
 
 # docker compose 卸载
 cd deploy/docker && docker compose down
 ```
+
+停止与再部署的完整步骤（binary HTTP、port-forward、AppUI origin）见
+[docs/K8S_DEPLOY_PROVEN.md](docs/K8S_DEPLOY_PROVEN.md#停止与再部署) 与
+[docs/K8S_INSTALL.md](docs/K8S_INSTALL.md#停止与再部署)。
 
 ## 详细文档
 

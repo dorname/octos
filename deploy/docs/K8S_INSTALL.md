@@ -13,6 +13,7 @@
 7. [验证](#验证)
 8. [故障排查](#故障排查)
 9. [升级与回滚](#升级与回滚)
+10. [停止与再部署](#停止与再部署)
 
 ---
 
@@ -441,14 +442,26 @@ kubectl rollout undo deployment/octos -n octos
 
 ### 清理
 
-```bash
-# 卸载所有 k8s 资源
-kubectl delete -f deploy/k8s/03-cluster-with-config.yaml
-kubectl delete -f deploy/k8s/01-baseline.yaml
+见下一节 [停止与再部署](#停止与再部署)（含「只停 Pod」与「删 namespace」分级操作）。
 
-# 删除 namespace
-kubectl delete namespace octos
-```
+---
+
+## 停止与再部署
+
+本地 docker-desktop / ns `octos` 的实操清单（含 port-forward、binary HTTP、
+AppUI origin）以 **[K8S_DEPLOY_PROVEN.md](./K8S_DEPLOY_PROVEN.md#停止与再部署)** 为准。
+
+摘要：
+
+| 力度 | 命令要点 | 保留什么 |
+|------|----------|----------|
+| 软停 | `kubectl -n octos scale deploy/{octos,pg} --replicas=0` | PVC / CM / Secret |
+| 卸清单 | `kubectl delete -f deploy/k8s/03-cluster-with-config.yaml` | 视 yaml；常仍留 PVC |
+| 全清 | `kubectl delete namespace octos` | 无 |
+
+再部署：`cargo build … --features api,postgres` → 本机 HTTP 提供 musl binary →
+`./deploy/scripts/deploy-k8s.sh cluster` → `port-forward` → 核对
+`OCTOS_APPUI_ALLOWED_ORIGINS` 与浏览器 origin（PF 端口需显式加入）。
 
 ---
 
