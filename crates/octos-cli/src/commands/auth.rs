@@ -199,8 +199,7 @@ async fn login(provider: &str, device_code: bool) -> Result<()> {
 /// credential (`None` for API-key/paste-token credentials and other
 /// providers). Used by both `login` (success hint) and `status`.
 fn subscription_note(cred: &crate::auth::AuthCredential) -> Option<String> {
-    if cred.provider != "openai" || !matches!(cred.auth_method.as_str(), "oauth" | "device_code")
-    {
+    if cred.provider != "openai" || !matches!(cred.auth_method.as_str(), "oauth" | "device_code") {
         return None;
     }
     let plan =

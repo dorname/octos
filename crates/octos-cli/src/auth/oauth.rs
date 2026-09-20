@@ -127,7 +127,10 @@ mod tests {
         assert_eq!(device.user_code, "ABCD-1234");
         assert_eq!(device.interval, 5);
         assert!(device.expires_at.is_some());
-        assert_eq!(device.verification_uri, "https://auth.openai.com/codex/device");
+        assert_eq!(
+            device.verification_uri,
+            "https://auth.openai.com/codex/device"
+        );
     }
 
     #[test]
@@ -199,9 +202,8 @@ mod tests {
             auth_method: "device_code".into(),
             account_id: None,
         };
-        let new_jwt = test_jwt(
-            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-new"}}"#,
-        );
+        let new_jwt =
+            test_jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-new"}}"#);
         let token = TokenResponse {
             access_token: new_jwt,
             refresh_token: Some("new-refresh".into()),
@@ -447,7 +449,9 @@ async fn exchange_device_code(code: &str, verifier: &str) -> Result<TokenRespons
         eyre::bail!("device code token exchange failed: {body}");
     }
 
-    resp.json().await.wrap_err("failed to parse device token response")
+    resp.json()
+        .await
+        .wrap_err("failed to parse device token response")
 }
 
 /// Decode a JWT payload without verifying the signature. The token is the
@@ -537,7 +541,9 @@ fn refresh_access_token_inner(old: &AuthCredential) -> Result<AuthCredential> {
         eyre::bail!("token refresh failed: {body}");
     }
 
-    let token: TokenResponse = resp.json().wrap_err("failed to parse refresh token response")?;
+    let token: TokenResponse = resp
+        .json()
+        .wrap_err("failed to parse refresh token response")?;
     Ok(merge_refreshed_credential(old, token))
 }
 
@@ -573,7 +579,10 @@ struct DeviceCodeResponse {
     user_code: String,
     #[serde(default = "default_verification_uri")]
     verification_uri: String,
-    #[serde(default = "default_interval", deserialize_with = "deserialize_u64_from_string")]
+    #[serde(
+        default = "default_interval",
+        deserialize_with = "deserialize_u64_from_string"
+    )]
     interval: u64,
     #[serde(default)]
     expires_at: Option<chrono::DateTime<Utc>>,

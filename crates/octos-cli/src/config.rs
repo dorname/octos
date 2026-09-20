@@ -2195,7 +2195,9 @@ impl Config {
         // `get_api_key_with_env`'s custom-override semantics.
         if let Some(var) = &self.api_key_env {
             if !Self::provider_knows_key_env(provider, var) {
-                return self.resolve_env_var_only(var).map(ResolvedCredential::ApiKey);
+                return self
+                    .resolve_env_var_only(var)
+                    .map(ResolvedCredential::ApiKey);
             }
         }
 
@@ -2389,10 +2391,7 @@ impl Config {
 /// Resolve an auth-store token for `provider`, including siblings that share
 /// the same `api_key_env` (e.g. `octos auth login -p minimax` must satisfy
 /// `family_id=minimax-token`, which also reads `MINIMAX_API_KEY`).
-fn auth_store_token_for_provider(
-    store: &crate::auth::AuthStore,
-    provider: &str,
-) -> Option<String> {
+fn auth_store_token_for_provider(store: &crate::auth::AuthStore, provider: &str) -> Option<String> {
     let mut tried = std::collections::HashSet::new();
     let mut candidates = vec![provider.to_string()];
     if let Some(entry) = octos_llm::registry::lookup(provider) {
@@ -3172,9 +3171,8 @@ mod tests {
     #[test]
     fn should_lazily_parse_account_id_from_jwt_when_stored_field_missing() {
         use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}"#,
-        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}"#);
         let jwt = format!("e30.{payload}.sig");
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3268,7 +3266,8 @@ mod tests {
     }
 
     #[test]
-    fn should_detect_expiring_credentials_within_leeway() {        let mut cred = stored_oauth_cred("oauth", None);
+    fn should_detect_expiring_credentials_within_leeway() {
+        let mut cred = stored_oauth_cred("oauth", None);
 
         cred.expires_at = None;
         assert!(!credential_expires_within(&cred, 60));

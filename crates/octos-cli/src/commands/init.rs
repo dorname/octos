@@ -1270,7 +1270,10 @@ mod tests {
         // models (Codex backend) — the platform default would 403.
         assert_eq!(openai_default_model_for(Some("oauth")), "gpt-5");
         assert_eq!(openai_default_model_for(Some("device_code")), "gpt-5");
-        assert_eq!(openai_default_model_for(Some("paste_token")), "gpt-4.1-mini");
+        assert_eq!(
+            openai_default_model_for(Some("paste_token")),
+            "gpt-4.1-mini"
+        );
         assert_eq!(openai_default_model_for(None), "gpt-4.1-mini");
     }
 

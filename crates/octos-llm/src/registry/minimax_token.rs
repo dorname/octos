@@ -48,9 +48,12 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     // the caller omits base_url. Without this, `AnthropicProvider::new`
     // silently targets api.anthropic.com and MiniMax keys 401 with
     // "Please carry the API secret key in the 'X-Api-Key' field".
-    let url = p
-        .base_url
-        .unwrap_or_else(|| ENTRY.default_base_url.expect("ENTRY declares default").into());
+    let url = p.base_url.unwrap_or_else(|| {
+        ENTRY
+            .default_base_url
+            .expect("ENTRY declares default")
+            .into()
+    });
     let mut provider = AnthropicProvider::new(&key, &model)
         .with_provider_label("minimax-token")
         .with_base_url(&url);

@@ -36,9 +36,9 @@ fn test_no_scattered_deploy_files() {
     let root = repo_root();
 
     let forbidden_globs = [
-        "k8s-*.yaml",       // pre-task scattered k8s manifests
+        "k8s-*.yaml",          // pre-task scattered k8s manifests
         "docker-compose*.yml", // pre-task scattered compose
-        "deploy*.sh",       // pre-task top-level deploy scripts
+        "deploy*.sh",          // pre-task top-level deploy scripts
     ];
 
     for entry in std::fs::read_dir(&root).unwrap() {
@@ -67,7 +67,11 @@ fn test_deploy_script_variants() {
     assert!(root.join("deploy/scripts/deploy-k8s.sh").is_file());
     for v in &["01-baseline", "02-hostpath-dev", "03-cluster-with-config"] {
         let manifest = root.join(format!("deploy/k8s/{v}.yaml"));
-        assert!(manifest.is_file(), "missing manifest: {}", manifest.display());
+        assert!(
+            manifest.is_file(),
+            "missing manifest: {}",
+            manifest.display()
+        );
     }
 }
 
@@ -137,12 +141,7 @@ fn test_k8s_install_prerequisites() {
         .find(|s| s.starts_with("前置条件"))
         .expect("前置条件 section missing");
 
-    for keyword in &[
-        "kubectl",
-        "postgres:16-alpine",
-        "8080",
-        "5432",
-    ] {
+    for keyword in &["kubectl", "postgres:16-alpine", "8080", "5432"] {
         assert!(
             prereq_section.contains(keyword),
             "前置条件 section missing keyword: {keyword}"

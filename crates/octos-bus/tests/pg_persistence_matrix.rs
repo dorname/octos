@@ -45,10 +45,7 @@ fn read_doc() -> String {
 fn test_pg_matrix_doc_covers_all_tables() {
     let doc = read_doc();
     for table in PG_TABLES {
-        assert!(
-            doc.contains(table),
-            "matrix doc missing PG table: {table}"
-        );
+        assert!(doc.contains(table), "matrix doc missing PG table: {table}");
     }
 }
 
@@ -60,20 +57,15 @@ fn test_pg_matrix_doc_never_pg_categories() {
     // table, and per-category sections. Each category must appear
     // somewhere in the doc.
     for cat in &["profiles", "admin_audit", "ui-protocol", "usage_ledger"] {
-        assert!(
-            doc.contains(cat),
-            "doc missing category: {cat}"
-        );
+        assert!(doc.contains(cat), "doc missing category: {cat}");
     }
 }
 
 // === k8s manifest structural checks ===
 
 fn read_manifest() -> String {
-    std::fs::read_to_string(
-        repo_root().join("deploy/k8s/03-cluster-with-config.yaml"),
-    )
-    .expect("03-cluster-with-config.yaml must exist")
+    std::fs::read_to_string(repo_root().join("deploy/k8s/03-cluster-with-config.yaml"))
+        .expect("03-cluster-with-config.yaml must exist")
 }
 
 #[test]
@@ -161,10 +153,7 @@ fn test_k8s_manifest_yaml_parse() {
     let manifest = read_manifest();
 
     // Count document separators (`---` on its own line). 8 docs => 7 separators.
-    let sep_count = manifest
-        .lines()
-        .filter(|l| l.trim() == "---")
-        .count();
+    let sep_count = manifest.lines().filter(|l| l.trim() == "---").count();
     assert!(
         sep_count >= 7,
         "expected at least 7 `---` separators (8 docs), got {sep_count}"

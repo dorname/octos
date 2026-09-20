@@ -1390,8 +1390,8 @@ mod tests {
 
     #[test]
     fn should_switch_to_codex_backend_with_chatgpt_oauth() {
-        let provider =
-            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(Some("acct-1".into()));
+        let provider = OpenAIResponsesProvider::new("oauth-jwt", "gpt-5")
+            .with_chatgpt_oauth(Some("acct-1".into()));
         assert_eq!(provider.base_url, CODEX_BACKEND_BASE);
         assert!(provider.session_id.is_some());
         assert!(provider.is_codex_backend());
@@ -1405,8 +1405,7 @@ mod tests {
 
     #[test]
     fn should_build_codex_request_with_store_false_and_instructions() {
-        let provider =
-            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
+        let provider = OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
         let messages = vec![
             msg(MessageRole::System, "be helpful"),
             msg(MessageRole::User, "hello"),
@@ -1429,8 +1428,7 @@ mod tests {
 
     #[test]
     fn should_add_reasoning_summary_in_codex_mode() {
-        let provider =
-            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
+        let provider = OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
         let messages = vec![msg(MessageRole::User, "think")];
         let mut config = ChatConfig::default();
         config.reasoning_effort = Some(crate::config::ReasoningEffort::High);
@@ -1473,8 +1471,7 @@ mod tests {
 
     #[test]
     fn should_emit_empty_instructions_when_codex_request_has_no_system_message() {
-        let provider =
-            OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
+        let provider = OpenAIResponsesProvider::new("oauth-jwt", "gpt-5").with_chatgpt_oauth(None);
         let messages = vec![msg(MessageRole::User, "hi")];
         let config = ChatConfig::default();
         let request = provider.build_request(&messages, &[], &config);
