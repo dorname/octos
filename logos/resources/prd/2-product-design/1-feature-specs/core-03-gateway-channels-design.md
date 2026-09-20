@@ -108,6 +108,29 @@
 - **WHEN** 命令解析校验
 - **THEN** CLI 报错提示必须三选一提供调度参数，退出码非 0，不创建任务
 
+### 2.2 与 S17 Watchdog 的边界
+
+Watchdog 不是第二个 cron 调度器，也不修改 cron 的 next-run 或成功状态。只有项目显式启用 S17 且 cron 工作进入受监督的 OctoLoop goal 时，Watchdog 才把 `budget_limited`、`blocked` 或 escalation 作为外环门铃输入。
+
+| 情况 | cron 责任 | Watchdog 责任 |
+|------|-----------|----------------|
+| 普通任务成功/失败 | 记录本次结果并计算下次触发 | 不介入 |
+| 提供商重试耗尽 | 标记失败，可投递失败摘要 | 仅在出现受支持事件时告警，不替 cron 重跑 |
+| goal `budget_limited` | 不伪装成功、不无限重试 | 唤醒当前 outer-duty holder 裁决 |
+| Watchdog 未启用或停机 | cron 行为保持原样 | 无守护保证，状态命令明确显示 inactive |
+
+#### 验收条件（协同级）
+
+##### 正常：cron 与 Watchdog 不重复调度
+- **GIVEN** 同一受监督任务已经由 cron 触发，goal 转为 `budget_limited`
+- **WHEN** Watchdog 消费该事件
+- **THEN** 只产生一个外环门铃；cron 的下一触发时间不变；Watchdog 不创建新的 cron execution
+
+##### 异常：Watchdog 不可用
+- **GIVEN** Watchdog 服务未运行
+- **WHEN** 普通 cron 到点
+- **THEN** cron 仍按既有语义执行并记录结果；系统不得声称具备 S17 夜间活性保证
+
 ## 三、S14: 多租户运维与管理面 — 交互规格
 
 ### 3.1 管理面形态

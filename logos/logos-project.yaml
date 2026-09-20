@@ -18,7 +18,8 @@ tech_stack:
 scenario_counter:
   # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
   # S02-S15 已由 change baseline-prd 在需求文档中分配(2026-09-18)
-  next_id: 17
+  # S16 已由 change k8s-cluster-deploy 使用，S17 已由 change octoloop-night-watchdog 使用(2026-09-20)
+  next_id: 18
 modules:
   - id: core
     name: 核心功能
@@ -38,11 +39,13 @@ deployment_gates:
       - staging
 resource_index:
   - path: logos/resources/prd/1-product-requirements/core-01-requirements.md
-    desc: octos 需求文档基线。涉及产品定位、用户痛点 P01-P10、场景 S01-S15 定义与验收条件、约束与不做清单时必读。
+    desc: octos 需求文档基线。涉及产品定位、用户痛点 P01-P11、场景 S01-S17 定义与验收条件、约束与不做清单时必读。
   - path: logos/resources/prd/2-product-design/1-feature-specs/core-02-cli-onboarding-design.md
     desc: CLI 信息架构与上手/对话/安全配置功能规格。涉及 S02、S03、S15 的交互设计、命令参数、退出码约定时必读。
   - path: logos/resources/prd/2-product-design/1-feature-specs/core-03-gateway-channels-design.md
-    desc: 网关与通道功能规格。涉及 S04、S06、S14 的通道配置、消息分片、cron、管理面交互时必读。
+    desc: 网关与通道功能规格。涉及 S04、S06、S14 的通道配置、消息分片、cron、管理面交互，以及 S06 与 S17 Watchdog 调度边界时必读。
+  - path: logos/resources/prd/2-product-design/1-feature-specs/core-08-octoloop-watchdog-design.md
+    desc: S17 OctoLoop 夜间监督功能规格。涉及 Watchdog CLI、配置、信号分类、herdr/outer-duty 发现、持久游标、进展指纹与三次无进展熔断时必读。
   - path: logos/resources/prd/2-product-design/1-feature-specs/core-04-serve-api-design.md
     desc: REST 服务与 IDE 接入功能规格。涉及 S05、S13 的 serve 参数、路由分组、ACP 交互时必读。
   - path: logos/resources/prd/2-product-design/1-feature-specs/core-05-orchestration-design.md
@@ -68,9 +71,9 @@ resource_index:
   - path: logos/resources/verify/acceptance-report.md
     desc: 验收报告。涉及 verify 验收结论与追溯关系时必读。
   - path: logos/resources/prd/3-technical-plan/1-architecture/core-01-architecture-overview.md
-    desc: octos 技术架构概要（权威基线，以代码核验为准）。涉及系统上下文、L0-L5 crate 分层、三运行时视图、子系统架构（agent loop/工具沙箱/消息总线/LLM 栈/记忆/插件 MCP）、系统处理流程、技术选型、非功能约束、外部依赖测试策略、部署交接时必读。
+    desc: octos 技术架构概要（权威基线，以代码核验为准）。涉及系统上下文、L0-L5 crate 分层、三运行时视图、子系统架构，以及 S17 Watchdog 的事实源、适配器、投递一致性与授权边界时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-00-scenario-overview.md
-    desc: 业务场景概览（技术实现视角）。涉及 S01-S15 场景状态、依赖关系、三 Phase 文档索引时必读。
+    desc: 业务场景概览（技术实现视角）。涉及 S01-S17 场景状态、依赖关系、三 Phase 文档索引时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S02-first-run.md
     desc: S02 开发者首次上手与认证时序图（P0）。涉及 init/doctor/auth login 设备码与 PKCE、凭证链、Codex 路由时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S03-cli-chat.md
@@ -80,7 +83,7 @@ resource_index:
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S05-serve-api.md
     desc: S05 REST API 服务与流式集成时序图（P0）。涉及 serve 启动、三层认证中间件、/api/ui-protocol/ws 对话链路时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S06-cron-automation.md
-    desc: S06 定时任务与无人值守自动化时序图（P1）。涉及 cron 调度、系统来源注入、deliver 投递、迭代兜底时必读。
+    desc: S06 定时任务与无人值守自动化时序图（P1）。涉及 cron 调度、deliver 投递、普通迭代耗尽，以及受监督 goal 的 budget_limited 外环裁决边界时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S07-pipeline.md
     desc: S07 流水线编排多步工作流时序图（P1）。涉及 run_pipeline、DOT 校验、fan-out、checkpoint 恢复、human gate 时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S08-memory.md
@@ -99,6 +102,20 @@ resource_index:
     desc: S14 多租户运维与管理面时序图（P2 主路径）。涉及 /api/admin 认证、profile 管理、健康指标巡检时必读。
   - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S15-security-config.md
     desc: S15 安全策略与沙箱配置管理时序图（P2 主路径）。涉及沙箱模式决策、fail-closed 拒绝、ToolPolicy 边界验证时必读。
+  - path: logos/resources/prd/2-product-design/1-feature-specs/core-07-k8s-cluster-design.md
+    desc: S16 K8s 集群无状态化功能规格。涉及 baseline/hostpath/cluster 部署形态、Scope、租约恢复与跨 Pod 审批时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S16-k8s-cluster.md
+    desc: S16 K8s 多副本无状态化部署时序图与拓扑。涉及滚动升级后会话续接、租约接管、PG 回放时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S17-octoloop-night-watchdog.md
+    desc: S17 OctoLoop 夜间监督与有界续推时序图。涉及 ACK/负信号唤醒外环、idle 未 ACK 续推内环、重启恢复、事件轮转与授权边界时必读。
+  - path: logos/resources/prd/3-technical-plan/3-deployment/core-01-deployment-plan.md
+    desc: core 部署方案。涉及 K8s S16 与 systemd user service S17 的环境、配置、回滚和 smoke 输入时必读。
+  - path: logos/resources/test/core-S17-test-cases.md
+    desc: S17 Watchdog 单元与场景测试规格。涉及 UT-S17-01..20、ST-S17-01..14、OpenLogos reporter 与覆盖门禁时必读。
+  - path: logos/resources/test/smoke/core-S16-smoke-test-cases.md
+    desc: S16 K8s 部署冒烟测试规格。涉及 Service、version、PG 迁移和删 Pod 续活时必读。
+  - path: logos/resources/test/smoke/core-S17-smoke-test-cases.md
+    desc: S17 Watchdog 部署冒烟测试规格。涉及 unit 崩溃恢复、ACK/budget_limited/idle 门铃、三次无进展熔断与重启去重时必读。
 scenarios:
   - id: S01
     name: ChatGPT 订阅登录与 Codex 后端对话
@@ -145,6 +162,12 @@ scenarios:
   - id: S15
     name: 安全策略与沙箱配置管理
     status: 文档基线完成（P2 主路径）
+  - id: S16
+    name: K8s 多副本无状态化部署与故障恢复
+    status: 文档基线完成（P0）
+  - id: S17
+    name: OctoLoop 夜间监督与有界续推
+    status: 规格已合并（P0）
 external_dependencies:
   - name: LLM 提供商 API
     purpose: 全部对话能力
@@ -172,9 +195,3 @@ baseline_index:
     source_hash: b4fbf33f014642fa1e00d8aaf8ec6ef52d070b2611f2fe78dee2c6687feff9cc
     denominator: 148
     generated_at: 2026-09-18T05:42:15.128Z
-  - path: logos/resources/prd/2-product-design/1-feature-specs/core-07-k8s-cluster-design.md
-    desc: S16 K8s 集群无状态化功能规格。涉及 baseline/hostpath/cluster 部署形态、Scope、租约恢复与跨 Pod 审批时必读。
-  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S16-k8s-cluster.md
-    desc: S16 K8s 多副本无状态化部署时序图与拓扑。涉及滚动升级后会话续接、租约接管、PG 回放时必读。
-  - path: logos/resources/prd/3-technical-plan/3-deployment/core-01-deployment-plan.md
-    desc: core 部署方案（docker / k8s baseline·hostpath·cluster）。涉及环境变量、迁移、回滚与 SMOKE-S16 冒烟输入时必读。

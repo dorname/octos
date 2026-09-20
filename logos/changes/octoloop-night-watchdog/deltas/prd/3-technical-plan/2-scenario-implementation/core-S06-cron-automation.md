@@ -1,3 +1,9 @@
+# Delta: prd/3-technical-plan/2-scenario-implementation — core-S06-cron-automation.md
+
+> target: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S06-cron-automation.md
+
+## MODIFIED — S06: 定时任务与无人值守自动化 — 时序图
+
 # S06: 定时任务与无人值守自动化 — 时序图
 
 > 场景来源：core-01-requirements.md §四 S06（P1）；交互设计：core-03-gateway-channels-design.md §二

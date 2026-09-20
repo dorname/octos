@@ -1,3 +1,9 @@
+# Delta: prd/3-technical-plan/2-scenario-implementation — core-00-scenario-overview.md
+
+> target: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-00-scenario-overview.md
+
+## MODIFIED — 业务场景概览（技术实现）
+
 # 业务场景概览（技术实现）
 
 > 最后更新：2026-09-20
