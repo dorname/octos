@@ -201,3 +201,15 @@ tsconfig.tsbuildinfo
 # workspace dirs the soaks `git init` — into a commit.
 /scratchpad/
 specs/task-c5-cron-durable-firing.spec.md
+
+# S16 k8s cluster deploy local artifacts (2026-09-20) — musl binary staging
+# dir served to the init container (deploy/k8s/03-cluster-with-config.yaml)
+# and the postgres data dir bind-mounted by the cluster manifests.
+# Local-only, ~200MB each; never track.
+/.octos-k8s-bin/
+/target-k8s-postgres/
+
+# OLP outer-loop & agent tooling local state (board/loop live under .octos/,
+# already covered by *.md above; these are run journals and session state)
+/.agent-spec/runs/
+/.omc/
