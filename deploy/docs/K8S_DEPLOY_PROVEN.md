@@ -69,6 +69,9 @@ cd /tmp/octos-host && python3 -m http.server 8088 --bind 0.0.0.0 &
 
 binary 通过 emptyDir 共享给主容器。
 
+> 系统化说明（三层路径语义对照表、`:18088` Windows 侧实况、判定标准）见
+> [K8S_INSTALL.md · WSL2 + Docker Desktop：binary 提供方式](./K8S_INSTALL.md#wsl2--docker-desktopbinary-提供方式重要)。
+
 ### 问题 2：init script shell 语法错误
 
 ```
@@ -275,6 +278,41 @@ kubectl create secret generic llm-credentials \
 # 然后 rollout restart：
 kubectl rollout restart deployment/octos -n octos
 ```
+
+## PVC 残留 profile 会覆盖 ConfigMap 的 LLM 配置（优先级语义）
+
+`DEFAULT_PROFILE` 等 ConfigMap 变量**只在 profile 文件不存在时**生效——init
+脚本对 profile 采取"存在即跳过"策略。而 `octos-data` PVC 的寿命独立于
+Deployment：删 pod、`rollout restart` 甚至 `kubectl delete -f` 都**不会**
+删掉 PVC 上已写入的 `profiles/<id>.json`。
+
+结果：你改了 ConfigMap 的 `LLM_MODEL`/`LLM_PROVIDER` → `kubectl apply` →
+新 pod 起来**仍用旧模型**。这不是配置没生效，是 PVC 上的旧 profile 文件
+优先级更高。
+
+**判定**（看 pod 实际加载的 profile，而不是 ConfigMap）：
+
+```bash
+kubectl -n octos exec deploy/octos --   cat /tmp/octos-data/profiles/cluster-worker.json
+```
+
+**清理手段（按力度）**：
+
+```bash
+# A. 只删指定 profile 文件（下一次 init 会按 ConfigMap 重建）
+kubectl -n octos exec deploy/octos --   rm /tmp/octos-data/profiles/cluster-worker.json
+kubectl -n octos rollout restart deploy/octos
+
+# B. 删整个 octos-data PVC（LLM key 若只存 profile env_vars 会一并丢失；
+#    存在 K8s Secret 里的不受影响）
+kubectl -n octos delete pvc octos-data
+kubectl -n octos delete pod -l app=octos   # 令 PVC 重新绑定并重建
+
+# C. 全清（连 PG 数据、workspace 一起）：kubectl delete namespace octos
+```
+
+> 注意：admin 等通过 API/UI 创建的 profile 同样落在该 PVC；仅删
+> `cluster-worker.json` 不会动它们。
 
 ## 停止与再部署
 

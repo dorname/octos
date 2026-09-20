@@ -33,6 +33,28 @@ echo "=== Deploying variant: $VARIANT ==="
 echo "Manifest: $MANIFEST"
 echo ""
 
+
+# ---- cluster variant: refuse to deploy with placeholder LLM secret (#issue2) ----
+if [[ "$VARIANT" == "cluster" ]]; then
+  LIVE_KEY="$(kubectl -n octos get secret llm-credentials \
+    -o jsonpath='{.data.ANTHROPIC_API_KEY}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  if [[ -z "$LIVE_KEY" ]]; then
+    echo "ERROR: secret llm-credentials not found in namespace octos." >&2
+    echo "  Create it first: kubectl create secret generic llm-credentials" >&2
+    echo "    --from-literal=ANTHROPIC_API_KEY=<your-real-key> -n octos" >&2
+    exit 1
+  fi
+  if [[ "$LIVE_KEY" == "REPLACE_ME" ]]; then
+    echo "ERROR: secret llm-credentials still holds the REPLACE_ME placeholder." >&2
+    echo "  serve would boot healthy but every LLM call would 401." >&2
+    echo "  Replace it: kubectl create secret generic llm-credentials" >&2
+    echo "    --from-literal=ANTHROPIC_API_KEY=<your-real-key> -n octos" >&2
+    echo "    --dry-run=client -o yaml | kubectl apply -f -" >&2
+    exit 1
+  fi
+  KEYLEN=${#LIVE_KEY}; echo "Secret llm-credentials: real key present, len=$KEYLEN."
+fi
+
 echo "=== Step 1: namespace + PG ==="
 kubectl apply -f "$MANIFEST"
 

@@ -129,8 +129,15 @@ data:
 ---
 # Sensitive: API keys, must be created via:
 #   kubectl create secret generic llm-credentials \
-#     --from-literal=ANTHROPIC_API_KEY=sk-ant-xxxxx \
+#     --from-literal=ANTHROPIC_API_KEY=<your-real-key> \
 #     -n octos
+#
+# PLACEHOLDER GUARD: the literal REPLACE_ME below only exists so a fresh
+# `kubectl apply` does not fail with "not found". A secret left at the
+# placeholder lets serve boot healthy but EVERY LLM call returns 401
+# (invalid_authentication_error) -- see K8S_DEPLOY_PROVEN.md "LLM API Key"
+# section. deploy/scripts/deploy-k8s.sh (cluster variant) refuses to
+# deploy while the live secret still holds the placeholder.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -138,7 +145,7 @@ metadata:
   namespace: octos
 type: Opaque
 stringData:
-  # Replace with real key (or leave empty for no-LLM-demo mode)
+  # Placeholder -- MUST be replaced with a real key before first use.
   ANTHROPIC_API_KEY: "REPLACE_ME"
 
 ---

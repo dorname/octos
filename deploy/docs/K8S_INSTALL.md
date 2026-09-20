@@ -8,12 +8,14 @@
 2. [前置条件](#前置条件)
 3. [镜像构建](#镜像构建)
 4. [三种部署变体](#三种部署变体)
-5. [配置注入（ConfigMap + Secret）](#配置注入)
-6. [部署步骤](#部署步骤)
-7. [验证](#验证)
-8. [故障排查](#故障排查)
-9. [升级与回滚](#升级与回滚)
-10. [停止与再部署](#停止与再部署)
+5. [WSL2 + Docker Desktop：binary 提供方式（重要）](#wsl2--docker-desktopbinary-提供方式重要)
+6. [配置注入（ConfigMap + Secret）](#配置注入)
+7. [部署步骤](#部署步骤)
+8. [部署后 Smoke（SMOKE-S16）](#部署后-smokesmoke-s16)
+9. [验证](#验证)
+10. [故障排查](#故障排查)
+11. [升级与回滚](#升级与回滚)
+12. [停止与再部署](#停止与再部署)
 
 ---
 
@@ -223,6 +225,83 @@ kubectl create secret generic llm-credentials \
 
 ---
 
+## WSL2 + Docker Desktop：binary 提供方式（重要）
+
+在 WSL2 + Docker Desktop for Windows 环境下，**无法用 bind-mount（hostPath）向
+cluster init 提供 octos binary**。这是三类部署变体中最常见的第一个坑。
+
+### 为什么 bind-mount 不可用（路径语义三层不一致）
+
+hostPath 的路径是**以 Docker Desktop 的 LinuxKit VM 为视角**解析的，而
+WSL2 场景下至少存在三套互不一致的文件系统视图：
+
+| 你写入的位置 | 你以为 VM 能看到 | 实际结果 |
+|---|---|---|
+| WSL 的 `/tmp/octos-k8s/octos` | 同名路径 | ❌ VM 的 `/tmp` 是自己的 tmpfs，看不到 WSL 的 `/tmp`（tmpfs 各自独立） |
+| WSL 的 `/home/.../octos` | VM 同名路径 | ❌ 默认未配置 WSL→VM 的文件共享；VM 根文件系统不含 WSL 发行版目录 |
+| Windows 的 `C:\tmp\octos-k8s\octos` | `/tmp/octos-k8s/octos` | ❌ VM 内的挂载点与 Windows 盘符映射随 Docker Desktop 版本变化，**没有稳定可写的固定路径**，`type: File` 检查常报 `not a file` |
+
+实测报错形态（`kubectl describe pod`）：
+
+```
+MountVolume.SetUp failed for volume "octos-binary":
+  hostPath type check failed: /tmp/octos-k8s/octos is not a file
+```
+
+因此 cluster 变体（`03-cluster-with-config.yaml`）自 #2436 起**不再使用
+hostPath**，改由 init container 通过 HTTP 从宿主拉取 binary（见下）。
+
+### 正确做法：宿主 HTTP 服务 + init wget
+
+init 脚本在 alpine 容器里执行：
+
+```sh
+wget -q -O /opt/octos/octos http://host.docker.internal:8088/octos
+chmod +x /opt/octos/octos
+```
+
+宿主侧在**含 musl binary 的目录**起一个 HTTP 服务，**必须 `--bind 0.0.0.0`**：
+
+```bash
+# WSL 内（推荐起点）
+mkdir -p /tmp/octos-k8s-bin
+cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s-bin/octos
+cd /tmp/octos-k8s-bin && python3 -m http.server 8088 --bind 0.0.0.0
+```
+
+为什么必须 `0.0.0.0`：pod 内 `host.docker.internal` 解析到的是
+**Docker 网桥视角的宿主地址**（如 `192.168.65.254` / WSL eth1 地址），
+不是 `127.0.0.1`；服务只绑 loopback 时 init 会报
+`wget: can't connect to remote host ... Connection refused`。
+
+### Windows 侧端口实况（:18088 案例）
+
+在部分 WSL2 + Docker Desktop 组合里，**WSL 内 listen 的 8088 进不了集群**
+（`host.docker.internal` 只能到达 Windows 宿主侧）。此时把 HTTP 服务放到
+**Windows 侧**执行（PowerShell，在含 `octos` 文件的目录）：
+
+```powershell
+python -m http.server 8088 --bind 0.0.0.0
+```
+
+若 8088 在 Windows 侧已被占用（或防火墙策略限制），可改用 18088 并
+**同步修改** ConfigMap `octos-init-script` 中 init 脚本的 wget URL：
+
+```bash
+kubectl -n octos edit configmap octos-init-script   # 8088 → 18088
+kubectl -n octos rollout restart deploy/octos
+```
+
+判定标准：init container 日志出现
+`Binary installed: octos <version>` 即 binary 提供链路打通；若报
+`ERROR: failed to fetch binary`，按本节顺序排查（绑定地址 → 服务侧别 →
+端口一致性）。
+
+更多实况细节（含当时六个真实故障的完整复现）见
+[K8S_DEPLOY_PROVEN.md](./K8S_DEPLOY_PROVEN.md)。
+
+---
+
 ## 配置注入
 
 ### ConfigMap 配置项
@@ -264,8 +343,9 @@ kubectl create secret generic llm-credentials \
    /tmp/octos-data/profiles/<DEFAULT_PROFILE>/config.json
 4. 创建 workspace 目录
 5. 如果设置了 DATABASE_URL：
-   - 主动跑 `octos migrate`（PG migrations）
-6. exec octos serve "$@"
+   - 不主动跑迁移——octos 没有 `migrate` 子命令，PG 建表是 **lazy migrate**
+     （serve 在首次 DB 操作时执行迁移，须 binary 带 `--features postgres`）
+6. 从宿主 HTTP 拉 binary（WSL 场景见上文专节），然后 exec octos serve "$@"
 ```
 
 ---
@@ -308,6 +388,39 @@ curl http://127.0.0.1:8080/health
 ```
 
 ---
+
+## 部署后 Smoke（SMOKE-S16）
+
+部署不是以 `kubectl get pods` 全 Ready 为终点——**必须跑一次 smoke**。本仓
+入口脚本：`scripts/smoke-s16-k8s.sh`（OpenLogos SMOKE-S16-* runner，针对
+docker-desktop 本地 `octos` namespace）。
+
+```bash
+./scripts/smoke-s16-k8s.sh
+# 结果写入 logos/resources/verify/smoke-results.jsonl（每次全量覆写）
+```
+
+判定标准（4 项全 PASS 才算部署闭环）：
+
+| ID | 场景 | 判定 |
+|---|---|---|
+| SMOKE-S16-01 | deploy/octos Available + port-forward 后 `GET /health` 返回 `"status":"healthy"` | 存活面 |
+| SMOKE-S16-02 | `GET /api/version` 返回 `"service":"octos"` | API 面正确标识 |
+| SMOKE-S16-03 | PG `pg_tables` 中 `sessions,session_events,approvals,run_leases,schedules` 五表齐备 | **迁移面（lazy migrate 已触发）** |
+| SMOKE-S16-04 | 删 pod → rollout 恢复 → `/health` 再度 healthy | 自愈面（PVC 数据不丢） |
+
+其中 S16-03 直接回答"cluster Ready 后 PG 是否真的有表"——lazy migrate 在
+首次 DB 操作时才建表，光看 pod Ready 无法证明；必须以查表为准。
+
+环境变量：`OCTOS_SMOKE_NS`（默认 `octos`）、`OCTOS_SMOKE_K8S_SERVER`
+（显式 API 地址，如 `https://127.0.0.1:6443`，WSL docker-desktop 场景自动
+探测）。端口转发固定占 `127.0.0.1:50080`。
+
+> 关于"PG 空表"的历史根因：早期 musl binary 未带 `--features postgres`
+> （issue 系 #2436），attach 逻辑整块缺失，建表永不发生；该根因已由
+> fcacde31 修复（构建命令统一要求 `--features api,postgres`），断言由
+> 0b7ad0c9 更新。今天若 S16-03 仍 fail，先核对 binary 构建参数，再查
+> DATABASE_URL 连通性，最后才是 lazy migrate 触发路径。
 
 ## 验证
 
@@ -393,17 +506,14 @@ kubectl logs -n octos <pod> | grep -i "llm\|api_key\|provider"
 
 ### 4. PG 表没创建
 
-**根因**：octos serve 的 migrations 是惰性的（第一次 DB 操作时触发）。
+**根因**：PG 建表是 lazy migrate——migrations 在首次 DB 操作时才执行，pod Ready 不代表
+已建表；历史上更常见的主因是 musl binary 未带 `--features postgres`
+（#2436，已由 fcacde31 修复构建要求）。
 
-**解决**：在 init 脚本中显式调用 `octos migrate`：
-
-```yaml
-# init container
-initContainers:
-- name: migrate
-  image: octos:k8s-stateless
-  command: ["octos", "--instance-data-dir", "/tmp/octos-data", "migrate"]
-```
+**解决**：不要找 `octos migrate` 子命令（不存在）。按序核对：
+1) 构建命令含 `--features api,postgres`；2) `DATABASE_URL` 可达；
+3) 跑 `./scripts/smoke-s16-k8s.sh`，以 SMOKE-S16-03 查表结果为准
+   （见上文"部署后 Smoke"节）。
 
 ### 5. hostPath 在多节点集群不工作
 
