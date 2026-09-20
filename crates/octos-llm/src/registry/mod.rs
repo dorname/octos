@@ -601,7 +601,7 @@ mod tests {
         let entry = lookup("minimax-token").expect("minimax-token must be registered in ALL");
         assert_eq!(entry.name, "minimax-token");
         assert!(
-            all_names().iter().any(|n| *n == "minimax-token"),
+            all_names().contains(&"minimax-token"),
             "all_names() must contain minimax-token"
         );
     }
@@ -622,6 +622,7 @@ mod tests {
             model_hints: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
+            credential: None,
         })
         .expect("create with key + model must succeed");
         assert_eq!(provider.provider_name(), "minimax-token");

@@ -98,6 +98,7 @@ mod tests {
             model_hints: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
+            credential: None,
         })
         .unwrap();
         assert_eq!(provider.provider_name(), "minimax-token");
@@ -117,6 +118,7 @@ mod tests {
             model_hints: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
+            credential: None,
         })
         .expect("create without base_url must succeed");
         let meta = provider.provider_metadata();

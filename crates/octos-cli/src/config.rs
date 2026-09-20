@@ -3253,8 +3253,10 @@ mod tests {
         let auth_home = tmp.path().join("octos");
         store_with_cred(&auth_home, stored_oauth_cred("device_code", Some("acct-1")));
 
-        let mut config = Config::default();
-        config.api_key_env = Some("MY_PROXY_KEY".into());
+        let mut config = Config {
+            api_key_env: Some("MY_PROXY_KEY".into()),
+            ..Default::default()
+        };
         config
             .env_vars
             .insert("MY_PROXY_KEY".into(), "sk-proxy".into());

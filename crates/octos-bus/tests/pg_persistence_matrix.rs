@@ -56,7 +56,7 @@ fn test_pg_matrix_doc_never_pg_categories() {
     // doc structure has "永远不接 PG" in the Intent summary, the TL;DR
     // table, and per-category sections. Each category must appear
     // somewhere in the doc.
-    for cat in &["profiles", "admin_audit", "ui-protocol", "usage_ledger"] {
+    for cat in NEVER_PG_CATEGORIES {
         assert!(doc.contains(cat), "doc missing category: {cat}");
     }
 }
@@ -136,14 +136,19 @@ fn test_k8s_manifest_binary_path_consistent() {
         "serve command should invoke /opt/octos/octos: {serve_command}"
     );
 
-    // ...and the binary must be mounted at exactly /opt/octos/octos (file)
-    let binary_mount = manifest
+    // ...and the binary must land at exactly /opt/octos/octos. The cluster
+    // manifest moved off hostPath file mounts (#2436 recovery): the binary
+    // arrives either via the init script (wget from the host HTTP server
+    // straight to the serve path) or via the base64 ConfigMap emptyDir
+    // mounted at /opt/octos — either way the landing path must match the
+    // serve command path above.
+    let init_fetches_binary = manifest.lines().any(|l| l.contains("-O /opt/octos/octos"));
+    let dir_mount = manifest
         .lines()
-        .find(|l| l.contains("mountPath:") && l.contains("/opt/octos/octos"))
-        .expect("binary must be mounted at /opt/octos/octos");
+        .any(|l| l.contains("mountPath: /opt/octos"));
     assert!(
-        binary_mount.contains("/opt/octos/octos"),
-        "binary mount should be /opt/octos/octos: {binary_mount}"
+        init_fetches_binary || dir_mount,
+        "binary must land at /opt/octos/octos (init wget fetch or emptyDir mount at /opt/octos)"
     );
 }
 
@@ -209,18 +214,17 @@ fn test_init_script_writes_profile_config() {
 }
 
 #[test]
-fn test_init_script_documents_lazy_migration() {
+fn test_init_script_documents_pg_migration_timing() {
     let script = read_init_script();
-    // K06 design: migrations run lazily on first DB op.
-    // The init script should document this so operators don't expect
-    // eager migrations.
-    let has_doc = script.contains("Lazily")
-        || script.contains("lazily")
-        || script.contains("lazy")
-        || script.contains("K06")
-        || script.contains("惰性");
+    // Cluster design moved migrations off lazy-on-first-op (K06) to eager
+    // at attach: `store.migrate()` runs when serve attaches the PG stores
+    // (attach_durable_approvals_pg, #2436). The init script must document
+    // WHEN migrations run so operators don't double-run them or expect
+    // lazy behavior.
+    let documents_timing = (script.contains("migrat") || script.contains("迁移"))
+        && (script.contains("attach") || script.contains("immediately"));
     assert!(
-        has_doc,
-        "init script must document lazy migration behavior (K06 design)"
+        documents_timing,
+        "init script must document PG migration timing (migrate at attach)"
     );
 }

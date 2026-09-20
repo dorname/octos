@@ -9026,7 +9026,7 @@ async fn should_refresh_actions_after_install_force_replace_and_remove() {
             .unwrap();
     assert_eq!(listed_v2["count"], json!(1));
     assert_eq!(listed_v2["actions"][0]["id"], json!("document.version2"));
-    assert!(listed_v2.to_string().find("document.version1").is_none());
+    assert!(!listed_v2.to_string().contains("document.version1"));
 
     let remove = RpcRequest::new(
         "remove",
@@ -21812,7 +21812,9 @@ async fn interrupt_in_flight_turn_aborts_emits_one_terminal() {
     if let Some(ack) = transition.ack {
         ack.send(()).expect("ack delivered");
     }
-    assert_eq!(ack_rx.await.expect("handler observes ack"), ());
+    // Awaiting the ack channel succeeds — the unit payload carries no data
+    // to compare, so the assertion is on receipt itself.
+    ack_rx.await.expect("handler observes ack");
 
     // A second transition must be a no-op — no double-emit possible.
     let second = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
