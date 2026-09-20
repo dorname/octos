@@ -20,7 +20,7 @@
 
 ## [deploy] 本地 k8s 验证（verify PASS 且人类确认后）
 
-- [x] 按部署方案在 docker-desktop `octos` ns 完成 smoke 清单（见 agent-store 验证笔记；正式 `openlogos smoke` 仍需人类确认）
-  - SMOKE-S16-01/02 PASS
-  - SMOKE-S16-03 PASS（postgres feature binary 后）
-  - SMOKE-S16-04 部分：Pod recreate + health/WS 恢复；历史回放未做完整断言
+- [x] 按部署方案在 docker-desktop `octos` ns 完成 smoke 清单
+  - SMOKE-S16-01/02/03/04 PASS（`scripts/smoke-s16-k8s.sh`）
+  - `openlogos smoke` Gate 3.8 PASS（2026-09-20；磁盘满崩溃后已恢复 binary HTTP@Windows:18088 + Pod recreate）
+  - 产物：`SMOKE_PASS` / `smoke-report.md` / `smoke-results.jsonl` / `core-S16-smoke-test-cases.md`
