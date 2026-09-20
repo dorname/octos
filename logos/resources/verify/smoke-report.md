@@ -6,9 +6,9 @@
 
 | Metric | Value |
 |--------|-------|
-| Defined cases | 4 |
-| Executed cases | 4 |
-| Passed | 4 |
+| Defined cases | 10 |
+| Executed cases | 10 |
+| Passed | 10 |
 | Failed | 0 |
 | Skipped | 0 |
 | Uncovered | 0 |

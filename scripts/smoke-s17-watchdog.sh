@@ -27,7 +27,13 @@ EVENTS="${TMP}/events.jsonl"
 FAILURES=0
 
 mkdir -p "$(dirname "$RESULT_PATH")"
-: >"$RESULT_PATH"
+# 账本是累计的:只剔除本场景(S17)旧记录,保留其他场景(如 S16)的历史证据。
+if [[ -f "$RESULT_PATH" ]]; then
+  grep -vE '"scenario": ?"S17"' "$RESULT_PATH" >"${RESULT_PATH}.keep" || true
+  mv "${RESULT_PATH}.keep" "$RESULT_PATH"
+else
+  : >"$RESULT_PATH"
+fi
 : >"$PROMPTS"
 : >"$EVENTS"
 
@@ -85,6 +91,11 @@ if [[ ! -x "$OCTOS_BIN" ]]; then
   done
   exit 1
 fi
+# unit 带 PrivateTmp=yes：/tmp、/var/tmp 在服务命名空间内不可见。openlogos smoke
+# 沙箱会把 workspace 复制到 /tmp 下运行，因此必须把服务二进制转进 /run 隔离现场。
+cp "$OCTOS_BIN" "${TMP}/octos"
+chmod 755 "${TMP}/octos"
+OCTOS_BIN="${TMP}/octos"
 if ! systemctl --user show-environment >/dev/null 2>&1; then
   record SMOKE-S17-01 fail "当前环境无可用的 systemd --user bus"
   for id in 02 03 04 05 06; do

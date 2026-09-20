@@ -16,5 +16,5 @@
 - [x] 批次 C：接入 `octos watchdog run/run-once/status`，实现 systemd user unit、默认不启用的安装/卸载脚本与隔离 smoke runner；同步交付 ST-S17-13、SMOKE-S17-01..06，回归 UT-S17-01..20、ST-S17-01..14 并生成完整 OpenLogos 结果账本
 
 ## [deploy] 部署与冒烟
-- [ ] 在隔离测试环境安装并显式启用 systemd user service，验证 `Restart=always`、状态恢复、日志与 status
-- [ ] 按部署方案验证卸载/回滚后不删除黑板、goal ledger、checkpoint 或业务提交，并生成 deployment report / `DEPLOY_DONE`
+- [x] 在隔离测试环境安装并显式启用 systemd user service，验证 `Restart=always`、状态恢复、日志与 status
+- [x] 按部署方案验证卸载/回滚后不删除黑板、goal ledger、checkpoint 或业务提交，并生成 deployment report / `DEPLOY_DONE`

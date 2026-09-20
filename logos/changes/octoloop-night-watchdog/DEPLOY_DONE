@@ -1,0 +1,7 @@
+DEPLOY_DONE
+
+环境:隔离 WSL2 systemd user(/run/octos-watchdog-deploy.*,PrivateTmp 约束已处理)
+证据:logos/resources/verify/deployment-report.md
+要点:安装默认不启用 / enable --now 后 active / kill -KILL 由 Restart=always 拉起且 cursor 保持 /
+卸载 --keep-state 后黑板、goal ledger、checkpoint、业务提交与监督 state 全部保留。
+注:openlogos 0.10.6 无 deploy-done 子命令,本标记由部署验收脚本 DEPLOY_VERIFY_PASS 结果背书。
