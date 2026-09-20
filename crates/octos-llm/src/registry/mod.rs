@@ -75,6 +75,7 @@ mod groq;
 mod local;
 mod minimax;
 mod minimax_cn;
+mod minimax_token;
 mod moonshot;
 mod moonshot_coding;
 mod nvidia;
@@ -227,6 +228,8 @@ static ALL: &[ProviderEntry] = &[
     // the China endpoint before the base family's name/aliases.
     minimax_cn::ENTRY,
     minimax::ENTRY,
+    // Anthropic-compatible MiniMax Token Plan (distinct endpoint from `minimax`).
+    minimax_token::ENTRY,
     zai_coding::ENTRY,
     zhipu::ENTRY,
     zai::ENTRY,
@@ -255,6 +258,21 @@ pub fn all_entries() -> &'static [ProviderEntry] {
 /// dead-end on "no API key" for these families.
 pub fn is_keyless(family: &str) -> bool {
     lookup(family).is_some_and(|entry| !entry.requires_api_key)
+}
+
+/// Default `route.api_type` for an AppUI upsert when the client omits one.
+///
+/// Anthropic Messages families (`anthropic`, `zai`, `minimax-token`, …) must
+/// default to `"anthropic"` so `create_provider_with_api_type`'s protocol
+/// bypass matches the factory — hardcoding `"openai"` made MiniMax Token
+/// Plan / Z.AI lanes look like OpenAI routes and, when combined with the
+/// anthropic bypass, produced misleading `anthropic/<model>` 401 labels.
+pub fn default_route_api_type(family: &str) -> &'static str {
+    use crate::discovery::{DiscoveryProtocol, ModelDiscovery};
+    match lookup(family).map(|entry| entry.model_discovery) {
+        Some(ModelDiscovery::Supported(DiscoveryProtocol::AnthropicMessages)) => "anthropic",
+        _ => "openai",
+    }
 }
 
 /// All valid provider names (canonical + aliases).
@@ -463,7 +481,9 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 20);
+        // 21 = 19 legacy families + minimax_cn + minimax_token
+        // (minimax_token registered by task-minimax-token-registry-wiring).
+        assert_eq!(all_entries().len(), 21);
     }
 
     /// Keyless = provider construction succeeds with no API key. The
@@ -568,5 +588,59 @@ mod tests {
     #[test]
     fn detect_unknown_model() {
         assert_eq!(detect_provider("some-random-model"), None);
+    }
+
+    // specs/task-minimax-token-registry-wiring.spec.md — the minimax_token.rs
+    // family file existed since f4095784 but was never registered (no `mod`
+    // declaration, no `ALL` entry), so `lookup("minimax-token")` returned None
+    // and every profile with family_id=minimax-token failed session/open with
+    // "unknown provider".
+
+    #[test]
+    fn should_resolve_minimax_token_when_lookup_by_name() {
+        let entry = lookup("minimax-token").expect("minimax-token must be registered in ALL");
+        assert_eq!(entry.name, "minimax-token");
+        assert!(
+            all_names().iter().any(|n| *n == "minimax-token"),
+            "all_names() must contain minimax-token"
+        );
+    }
+
+    #[test]
+    fn should_resolve_minimax_token_when_lookup_by_alias() {
+        let entry = lookup("minimax-anthropic").expect("minimax-anthropic alias must resolve");
+        assert_eq!(entry.name, "minimax-token");
+    }
+
+    #[test]
+    fn should_create_provider_when_key_and_model_given() {
+        let entry = lookup("minimax-token").expect("registered");
+        let provider = (entry.create)(CreateParams {
+            api_key: Some("test-key".into()),
+            model: Some("MiniMax-M3".into()),
+            base_url: None,
+            model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .expect("create with key + model must succeed");
+        assert_eq!(provider.provider_name(), "minimax-token");
+        assert_eq!(provider.model_id(), "MiniMax-M3");
+    }
+
+    #[test]
+    fn should_route_minimax_models_to_native_family_when_detecting() {
+        // minimax-token declares no detect_patterns: MiniMax-* model names
+        // must keep routing to the native `minimax` family.
+        assert_eq!(detect_provider("MiniMax-M3"), Some("minimax"));
+    }
+
+    #[test]
+    fn should_default_anthropic_api_type_for_minimax_token_family() {
+        assert_eq!(default_route_api_type("minimax-token"), "anthropic");
+        assert_eq!(default_route_api_type("zai"), "anthropic");
+        assert_eq!(default_route_api_type("anthropic"), "anthropic");
+        assert_eq!(default_route_api_type("minimax"), "openai");
+        assert_eq!(default_route_api_type("openai"), "openai");
     }
 }

@@ -1898,6 +1898,12 @@ pub fn create_provider_with_api_type(
         });
         let mut provider =
             octos_llm::anthropic::AnthropicProvider::new(&key, &m).with_base_url(&url);
+        // Keep the family identity in lane labels / 401 messages
+        // (`minimax-token/MiniMax-M3`, not a misleading `anthropic/MiniMax-M3`).
+        // Custom providers keep the "custom" label via create_custom_provider.
+        if name != "anthropic" {
+            provider = provider.with_provider_label(entry.name);
+        }
         if let Some(t) = llm_timeout_secs {
             let c = llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
             provider = provider.with_http_timeout(t, c);
@@ -2246,6 +2252,32 @@ mod custom_provider_tests {
             0.1,
             "and therefore price cache reads at 0.1x, not the 1.0x residual",
         );
+    }
+
+    #[test]
+    fn should_label_minimax_token_lane_when_api_type_anthropic_bypass_is_used() {
+        let mut config = Config {
+            api_key_env: Some("MINIMAX_API_KEY".to_string()),
+            ..Default::default()
+        };
+        config
+            .env_vars
+            .insert("MINIMAX_API_KEY".to_string(), "mm-key".to_string());
+        let provider = create_provider_with_api_type(
+            "minimax-token",
+            &config,
+            Some("MiniMax-M3".to_string()),
+            Some("https://api.minimaxi.com/anthropic".to_string()),
+            Some("anthropic"),
+        )
+        .expect("minimax-token + api_type=anthropic must construct");
+        assert_eq!(
+            provider.provider_name(),
+            "minimax-token",
+            "anthropic protocol bypass must keep the family label so 401s say \
+             minimax-token/MiniMax-M3, not anthropic/MiniMax-M3"
+        );
+        assert_eq!(provider.model_id(), "MiniMax-M3");
     }
 
     #[test]

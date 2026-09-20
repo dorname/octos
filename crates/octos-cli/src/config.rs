@@ -2140,10 +2140,8 @@ impl Config {
         if !self.bypass_auth_store {
             let auth_home = crate::config_context::resolve_config_context(None).auth_home;
             if let Ok(store) = crate::auth::AuthStore::at(&auth_home) {
-                if let Some(cred) = store.get(provider) {
-                    if !cred.is_expired() {
-                        return Ok(cred.access_token.clone());
-                    }
+                if let Some(token) = auth_store_token_for_provider(&store, provider) {
+                    return Ok(token);
                 }
             }
         }
@@ -2386,6 +2384,43 @@ impl Config {
 
         warnings
     }
+}
+
+/// Resolve an auth-store token for `provider`, including siblings that share
+/// the same `api_key_env` (e.g. `octos auth login -p minimax` must satisfy
+/// `family_id=minimax-token`, which also reads `MINIMAX_API_KEY`).
+fn auth_store_token_for_provider(
+    store: &crate::auth::AuthStore,
+    provider: &str,
+) -> Option<String> {
+    let mut tried = std::collections::HashSet::new();
+    let mut candidates = vec![provider.to_string()];
+    if let Some(entry) = octos_llm::registry::lookup(provider) {
+        for alias in entry.aliases {
+            candidates.push((*alias).to_string());
+        }
+        if let Some(key_env) = entry.api_key_env {
+            for other in octos_llm::registry::all_entries() {
+                if other.api_key_env == Some(key_env) {
+                    candidates.push(other.name.to_string());
+                    for alias in other.aliases {
+                        candidates.push((*alias).to_string());
+                    }
+                }
+            }
+        }
+    }
+    for name in candidates {
+        if !tried.insert(name.clone()) {
+            continue;
+        }
+        if let Some(cred) = store.get(&name) {
+            if !cred.is_expired() && !cred.access_token.is_empty() {
+                return Some(cred.access_token.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Migrate config to current version. Returns true if anything changed.

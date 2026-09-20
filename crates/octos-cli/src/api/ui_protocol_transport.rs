@@ -13177,7 +13177,9 @@ async fn raw_profile_llm_upsert(
         base_url: nonempty(params.selection.route.base_url),
         api_key_env: nonempty(params.selection.route.api_key_env)
             .or_else(|| dashboard_family_api_key_env(&family_id)),
-        api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
+        api_type: nonempty(params.selection.route.api_type).or_else(|| {
+            Some(octos_llm::registry::default_route_api_type(&family_id).into())
+        }),
     };
     if let (Some(api_key_env), Some(api_key)) = (
         route.api_key_env.as_ref(),
@@ -13539,7 +13541,9 @@ async fn raw_profile_llm_test(
         base_url: nonempty(params.selection.route.base_url),
         api_key_env: nonempty(params.selection.route.api_key_env)
             .or_else(|| dashboard_family_api_key_env(&family_id)),
-        api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
+        api_type: nonempty(params.selection.route.api_type).or_else(|| {
+            Some(octos_llm::registry::default_route_api_type(&family_id).into())
+        }),
     };
 
     let resolved_key = secret_from_value(params.api_key).or_else(|| {

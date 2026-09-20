@@ -38,8 +38,10 @@ curl http://localhost:8080/health
 ./deploy/scripts/deploy-k8s.sh baseline
 
 # 部署 hostpath 版本（开发用，需要本地 binary）
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
-mkdir -p /tmp/octos-k8s && cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s/
+# cluster / hostpath 必须带 postgres，否则 DATABASE_URL 会被忽略（#2436）
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli \
+  --no-default-features --features "api,postgres"
+mkdir -p /tmp/octos-k8s-bin && cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s-bin/
 ./deploy/scripts/deploy-k8s.sh hostpath
 
 # 部署 cluster 版本（完整 ConfigMap + Secret）

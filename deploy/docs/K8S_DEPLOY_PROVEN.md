@@ -132,10 +132,103 @@ spec:
 
 > 注：未来要做多副本需要支持 `ReadWriteMany` 共享存储 + 协调锁机制（PG advisory lock 等）—— 不在本地部署目标范围。
 
+### 问题 6：`rollout restart` 后新 pod CrashLoopBackOff，rollout 永久卡住
+
+```
+OCTOS_DATA_DIR_LOCKED: another octos server already owns data directory /tmp/octos-data
+```
+
+（与问题 5 同一报错，但触发路径不同。）
+
+**根因**：Deployment 用默认 `RollingUpdate` 策略（`maxSurge: 25%`）。
+即使 `replicas: 1`，rollout 期间也会**先起新 pod、再杀旧 pod**——新旧
+两个 pod 短暂并存，新 pod 撞上旧 pod 持有的 `/tmp/octos-data` lockfile，
+直接退出 → CrashLoopBackOff → 新 pod 永远不 Ready → rollout 无法完成，
+Service 一直把流量发给**旧 pod（旧 binary/旧前端）**。
+`kubectl rollout status` 会一直 hang。
+
+**修复**：octos Deployment 显式声明 `strategy: Recreate`——先完全终止
+旧 pod（释放 lockfile + RWO 挂载），再启动新 pod。单节点本地部署可接受
+秒级停机：
+
+```yaml
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+```
+
+**验证**：`kubectl apply` 后 `kubectl rollout status deployment/octos -n octos`
+能正常完成，且只有 1 个 octos pod。
+
+### 问题 7：rollout 后前端报 "Unable to establish the UI Protocol connection"
+
+前端 SPA（`localhost:9091/app/chat`）页面能开，但发消息报 UI Protocol
+连接失败。
+
+**根因**：`kubectl port-forward` 的目标 pod 被 rollout 替换后，端口转发
+进程会死亡（"lost connection to pod"）或随宿主 shell 退出——此时
+localhost:9091 没有任何监听。浏览器里已打开的 SPA 是内存中的旧页面，
+发消息时 WS 握手 TCP 被拒，浏览器不暴露具体原因，前端 10 秒启动超时后
+抛出该通用错误。
+
+**修复**：每次 rollout / pod 重建后**重启 port-forward**：
+
+```bash
+kubectl port-forward -n octos svc/octos 9091:8080 &
+```
+
+然后刷新浏览器页面。若仍报错，检查：
+
+```bash
+# 1. port-forward 进程活着、9091 有监听
+curl http://localhost:9091/health
+# 2. 服务端 WS 握手正常（带 token 应返回 101）
+curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  -H "Origin: http://localhost:9091" \
+  "http://localhost:9091/api/ui-protocol/ws?token=$OCTOS_AUTH_TOKEN"
+# 3. 以上都正常但浏览器仍失败 → 浏览器 token 失效，重新登录
+```
+
+**WSL2 特别注意（2026-09-17 实战）**：浏览器在 Windows 侧，而
+port-forward 跑在 WSL 里时，NAT 模式下 WSL 的 localhostForwarding 只把
+**IPv4** `127.0.0.1:9091` 转发到 WSL；Windows 的 `localhost` 优先解析到
+IPv6 `[::1]`，而 `[::1]:9091` 上可能有已失效的僵尸转发（accept 连接但
+永不响应）——浏览器 TCP 连接"成功"后握手挂死，前端 10 秒超时抛同一条
+通用错误。表现为：`curl http://127.0.0.1:9091/health` 通、
+`curl http://localhost:9091/health` 超时。此时**浏览器改用
+`http://127.0.0.1:9091/app/chat`**（`http://127.0.0.1:9091` 已在
+`OCTOS_APPUI_ALLOWED_ORIGINS` 白名单内），或 `wsl --shutdown` 后重启
+port-forward 清除僵尸转发。
+
+### 问题 8：前端报 UI Protocol 连接失败，实为 `session/open` RPC 报 unknown provider
+
+前端横幅 "Unable to establish the UI Protocol connection" 是**通用启动超时**文案，
+WS 传输层其实可能完全正常。实战排查路径（按序排除）：
+
+1. WS 升级到 `/api/ui-protocol/ws` 返回 **101**（传输层正常）
+2. `client_hello` 拿到 `server_hello`（能力协商正常）
+3. `session/open` 返回 `-32603: failed to bootstrap ProfileRuntime ... unknown
+   provider: minimax-token` —— **真正根因**
+
+**根因**：`crates/octos-llm/src/registry/minimax_token.rs` 家族文件存在但
+`registry/mod.rs` 从未注册（缺 `mod minimax_token;` 和 `ALL` 条目），而 PVC 上
+admin profile 的 `llm.primary.family_id` 已指向 `minimax-token`（修复见
+specs/task-minimax-token-registry-wiring.spec.md）。`session/open` 需要 bootstrap
+profile 的 LLM provider，lookup 失败 → RPC 错误 → 前端断开重试 → 10 秒超时横幅。
+
+**修复**：注册家族并重新构建部署 binary（`+48fb033b` 起已含）。
+**排查手法**：在 9091 上临时跑一个记录首包的 TCP relay（转发到 19091 的
+kubectl port-forward），即可看到浏览器真实的 upgrade 请求与每个 WS RPC 帧。
+
+**教训**：页面能开 ≠ WS 通；WS 通（101）≠ session/open 成功。三层要分开验证。
+
 ## 关键改动（已 commit）
 
 `deploy/k8s/03-cluster-with-config.yaml`：
 - ✅ `replicas: 1`（替代 2）
+- ✅ `strategy: Recreate`（替代默认 RollingUpdate，见问题 6）
 - ✅ `command` 加 `--host 0.0.0.0`（替代默认 127.0.0.1）
 - ✅ `octos-binary` volume：hostPath → emptyDir
 - ✅ init script 步骤 5 改为 wget 从 host.docker.internal:8088 拉 binary

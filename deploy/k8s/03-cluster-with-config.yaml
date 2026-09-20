@@ -155,9 +155,15 @@ data:
     set -e
     echo "=== octos k8s init ==="
 
-    # 1. Data dir
-    mkdir -p /tmp/octos-data
+    # 1. Data dir + profile roots (inbox avoids steer-sweep WARN spam — #2437)
+    mkdir -p /tmp/octos-data/profiles
     chmod 700 /tmp/octos-data
+    PROFILE_ID="${DEFAULT_PROFILE:-cluster-worker}"
+    mkdir -p "/tmp/octos-data/profiles/${PROFILE_ID}/data/inbox"
+    # Existing PVC profiles (e.g. admin) also need inbox before gateway starts.
+    for d in /tmp/octos-data/profiles/*/data; do
+      [ -d "$d" ] && mkdir -p "$d/inbox"
+    done
 
     # 2. Top-level config (auth_token from env)
     cat > /tmp/octos-data/config.json <<EOF
@@ -171,12 +177,12 @@ data:
     # 3. Default profile (if absent)
     #    octos ProfileDefinition::load reads <data_dir>/profiles/<id>.json
     #    (flat file, NOT <id>/config.json subdir). Use flat format here.
-    PROFILE_FILE=/tmp/octos-data/profiles/${DEFAULT_PROFILE:-cluster-worker}.json
+    PROFILE_FILE=/tmp/octos-data/profiles/${PROFILE_ID}.json
     NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if [ ! -f "$PROFILE_FILE" ]; then
       cat > "$PROFILE_FILE" <<EOF
     {
-      "id": "${DEFAULT_PROFILE:-cluster-worker}",
+      "id": "${PROFILE_ID}",
       "name": "Cluster Worker",
       "enabled": true,
       "workspace_root": "${WORKSPACE_DIR:-/workspace}",
@@ -216,14 +222,13 @@ data:
     fi
 
     # 6. PG migrations (cluster mode).
-    #    octos-cli does NOT currently expose a `migrate` subcommand.
-    #    Instead, `attach_durable_approvals_pg` and `attach_cron_service_pg`
-    #    in serve.rs call `store.migrate()` LAZILY on first DB op. This is
-    #    by design (K06): migrations run when the durable backend is first
-    #    touched, so a deployment that never parks an approval / never
-    #    records a firing skips the migration entirely.
+    #    Require a binary built with `--features postgres` (#2436). When
+    #    DATABASE_URL is set, `serve` attaches PgStore at startup and
+    #    `store.migrate()` runs immediately in attach_durable_approvals_pg /
+    #    attach_cron_service_pg. Without the feature the env is ignored and
+    #    `\dt` stays empty.
     if [ -n "$DATABASE_URL" ]; then
-      echo "PG migrations will run lazily on first DB op (K06 design)."
+      echo "DATABASE_URL set — serve will migrate PG at attach (needs --features postgres)."
     fi
 
     echo "=== init complete ==="
@@ -237,6 +242,16 @@ metadata:
   namespace: octos
 spec:
   replicas: 1
+  # Recreate, NOT the default RollingUpdate: with replicas=1 + a
+  # ReadWriteOnce PVC at /tmp/octos-data + octos's data-dir lockfile, a
+  # rolling update's maxSurge starts the new pod BEFORE the old one
+  # terminates; the new pod dies on OCTOS_DATA_DIR_LOCKED and the rollout
+  # wedges forever (old pod keeps serving a stale binary). Recreate fully
+  # terminates the old pod — releasing the lockfile and the RWO mount —
+  # before starting the new one. Brief downtime is acceptable for
+  # single-node local deploys.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: octos

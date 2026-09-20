@@ -121,7 +121,7 @@ docker build -t octos:k8s-stateless .
 
 ```bash
 # 1. 用 musl 编译
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 
 # 2. 用 docker import 创建镜像
 echo "FROM alpine:3.21
@@ -178,7 +178,7 @@ curl http://127.0.0.1:8080/health
 
 ```bash
 # 1. 编译
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 
 # 2. 准备 binary 目录
 mkdir -p /tmp/octos-k8s
@@ -276,7 +276,7 @@ kubectl create secret generic llm-credentials \
 ```bash
 # 1. 编译 musl binary
 cd /home/kyle/octos
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 
 # 2. Build docker image
 docker build -t octos:k8s-stateless .

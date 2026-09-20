@@ -44,12 +44,86 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
                 ENTRY.name
             )
         })?;
-    let mut provider = AnthropicProvider::new(&key, &model).with_provider_label("minimax-token");
-    if let Some(url) = p.base_url {
-        provider = provider.with_base_url(&url);
-    }
+    // Mirror zai / zai_coding: always pin the Token Plan Anthropic root when
+    // the caller omits base_url. Without this, `AnthropicProvider::new`
+    // silently targets api.anthropic.com and MiniMax keys 401 with
+    // "Please carry the API secret key in the 'X-Api-Key' field".
+    let url = p
+        .base_url
+        .unwrap_or_else(|| ENTRY.default_base_url.expect("ENTRY declares default").into());
+    let mut provider = AnthropicProvider::new(&key, &model)
+        .with_provider_label("minimax-token")
+        .with_base_url(&url);
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
     Ok(Arc::new(provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use octos_core::Message;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::ChatConfig;
+
+    #[tokio::test]
+    async fn should_target_minimax_anthropic_root_when_base_url_omitted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "mm-token-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                    )
+                    .append_header("Content-Type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        // Override only for the probe — production create uses ENTRY.default
+        // when base_url is None; here we point at the mock while still
+        // asserting the x-api-key header MiniMax requires.
+        let provider = create(CreateParams {
+            api_key: Some("mm-token-key".into()),
+            model: Some("MiniMax-M3".into()),
+            base_url: Some(server.uri()),
+            model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .unwrap();
+        assert_eq!(provider.provider_name(), "minimax-token");
+        provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn should_apply_default_base_url_when_create_omits_override() {
+        let provider = create(CreateParams {
+            api_key: Some("mm-token-key".into()),
+            model: Some("MiniMax-M3".into()),
+            base_url: None,
+            model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .expect("create without base_url must succeed");
+        let meta = provider.provider_metadata();
+        assert_eq!(provider.provider_name(), "minimax-token");
+        assert!(
+            meta.endpoint
+                .as_deref()
+                .is_some_and(|e| e.contains("minimaxi.com") || e.contains("minimax")),
+            "omitted base_url must pin the MiniMax Token Plan Anthropic root, got {:?}",
+            meta.endpoint
+        );
+    }
 }

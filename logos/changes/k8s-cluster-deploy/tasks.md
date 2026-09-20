@@ -12,6 +12,15 @@
 
 ## [code]
 
+- [x] 修复 `deploy/` 构建说明：cluster/hostpath 必须 `--features api,postgres`（#2436）
+- [x] 修复 `03-cluster-with-config.yaml` init：创建 `profiles/*/data/inbox`（#2437）
+- [x] 修复 `config.rs` 中 `impl Config` 被提前闭合导致 musl 构建失败
+- [x] 重编 musl binary（`api,postgres`）并滚动本地 k8s Deployment
+- [x] 复验：`\dt` 11 表；inbox INFO tick；octoscode/WS `turn/start` 成功
+
 ## [deploy] 本地 k8s 验证（verify PASS 且人类确认后）
 
-- [ ] 按部署方案执行 `./deploy/scripts/deploy-k8s.sh cluster`（或 hostpath）并完成 smoke 清单
+- [x] 按部署方案在 docker-desktop `octos` ns 完成 smoke 清单（见 agent-store 验证笔记；正式 `openlogos smoke` 仍需人类确认）
+  - SMOKE-S16-01/02 PASS
+  - SMOKE-S16-03 PASS（postgres feature binary 后）
+  - SMOKE-S16-04 部分：Pod recreate + health/WS 恢复；历史回放未做完整断言

@@ -66,7 +66,7 @@
 **部署命令**：
 ```bash
 # 1. 编译 musl binary
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 
 # 2. 放到 hostPath 目录
 mkdir -p /tmp/octos-k8s
@@ -105,7 +105,7 @@ cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s/
 **部署命令**：
 ```bash
 # 1. 编译 + build image
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 docker build -t octos:k8s-stateless .
 
 # 2. 创建 Secret（敏感）
@@ -123,7 +123,7 @@ kubectl create secret generic llm-credentials \
 
 ```bash
 # 1. 编译 musl binary
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 
 # 2. 准备 hostPath 目录
 mkdir -p /tmp/octos-k8s
@@ -136,7 +136,7 @@ kubectl delete -f deploy/k8s/01-baseline.yaml
 kubectl apply -f deploy/k8s/02-hostpath-dev.yaml
 
 # 5. 改 binary 后重新加载
-cargo build --release --target x86_64-unknown-linux-musl -p octos-cli
+cargo build --release --target x86_64-unknown-linux-musl -p octos-cli --no-default-features --features "api,postgres"
 cp target/x86_64-unknown-linux-musl/release/octos /tmp/octos-k8s/
 kubectl rollout restart deployment/octos -n octos
 ```
