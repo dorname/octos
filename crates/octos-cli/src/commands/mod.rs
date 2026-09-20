@@ -36,6 +36,12 @@ mod oup_text;
 #[cfg_attr(test, allow(unused_imports))]
 mod peer;
 mod profile;
+// serve.rs builds the REST router from crate::api (and the watchdog from
+// crate::monitor) — both are `api`-gated. The pub use and the Command
+// variant below are gated too; the module declaration itself must be, or
+// any api-less consumer (e.g. octos-ffi's default-features=false dep)
+// compiles serve.rs against modules that don't exist.
+#[cfg(feature = "api")]
 mod serve;
 #[cfg(feature = "api")]
 #[cfg(feature = "postgres")]

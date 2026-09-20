@@ -1750,6 +1750,7 @@ mod tests {
             expires_at: None,
             provider: provider.to_string(),
             auth_method: "paste_token".to_string(),
+            account_id: None,
         }
     }
 
