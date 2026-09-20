@@ -1,8 +1,8 @@
-# 业务场景概览（技术实现）
+# Delta: prd/3-technical-plan/2-scenario-implementation — core-00-scenario-overview.md
 
-> 最后更新：2026-09-20
-> 场景编号全局唯一：S01 由 chatgpt-oauth-codex 落地；S02–S15 由 baseline-prd 分配、本变更（baseline-architecture）完成时序图建模。
-> 说明：core 模块 skip_phases = [api, database, scenario]（单二进制 CLI/本地存储形态，无独立 API 设计与编排测试阶段），故下表对应列标记为"跳过"。
+> target: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-00-scenario-overview.md
+
+## MODIFIED — 场景地图
 
 ## 场景地图
 
@@ -25,6 +25,8 @@
 | S15 | 安全策略与沙箱配置管理 | ✅ | ✅ | ✅（主路径） | 跳过 | 跳过 | 文档基线完成 |
 | S16 | K8s 多副本无状态化部署与故障恢复 | ✅ | ✅ | ✅ | 跳过 | 跳过 | 文档基线进行中 |
 
+## MODIFIED — 场景依赖关系
+
 ## 场景依赖关系
 
 ```
@@ -40,6 +42,8 @@ S09 技能 / S10 MCP（横切：扩展 S03/S04/S05 的工具面）
 S11 子代理（依赖 S03 agent loop；为 S07 之外的另一种并行形态）
 S16 k8s 无状态化（横切：S05 集群部署；PG 真相源；影响 S06 cron / 审批跨副本）
 ```
+
+## MODIFIED — 场景索引
 
 ## 场景索引
 

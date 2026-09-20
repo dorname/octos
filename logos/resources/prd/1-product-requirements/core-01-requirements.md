@@ -1,6 +1,6 @@
 # octos 需求文档
 
-> 最后更新：2026-09-18
+> 最后更新：2026-09-20
 > 基线说明：本文档基于仓库现状（29 个 CLI 命令、157 条 REST 路由、17 个消息通道、36+20 个工具、pipeline/memory/sandbox/plugin 子系统）正向定义产品需求基线。场景编号接续已占用的 S01（chatgpt-oauth-codex 变更落地）。
 
 ## 一、产品背景与目标
@@ -73,6 +73,9 @@ octos 是一个 **Rust 原生、API 优先的多租户智能体操作系统（Ag
 ### P10: LLM 调用单点脆弱
 因为单一提供商会遇到限流（429）与宕机（5xx）→ 导致无人值守任务在凌晨直接中断 → 造成自动化场景（cron、gateway）不可用，用户被迫盯梢。
 
+### P11: 多副本部署状态无法共享
+因为会话、审批、cron、检查点等业务状态绑在单机 JSONL/redb 与进程内缓存 → 导致把 `octos serve` 放进多副本 Deployment 后出现会话并发写冲突、审批无法跨 Pod 恢复、后台任务失联 → 造成无法水平扩缩与滚动升级，生产可用性卡在单实例。
+
 ## 三、场景总览
 
 | 编号 | 场景名称 | 触发条件 | 关联痛点 | 优先级 |
@@ -92,6 +95,7 @@ octos 是一个 **Rust 原生、API 优先的多租户智能体操作系统（Ag
 | S13 | ACP 协议接入 IDE | 用户在 Zed 等 IDE 中使用 agent | P02 | P2 |
 | S14 | 多租户运维与管理面 | 管理员托管多个 profile/子账户 | P09 | P2 |
 | S15 | 安全策略与沙箱配置管理 | 用户需要收紧/调整执行安全边界 | P04 | P2 |
+| S16 | K8s 多副本无状态化部署与故障恢复 | 需要在 Kubernetes 上水平扩缩 serve/worker | P09, P11 | P0 |
 
 ## 四、核心场景详述
 
@@ -378,6 +382,30 @@ octos 是一个 **Rust 原生、API 优先的多租户智能体操作系统（Ag
 - **优先级**：P2
 - **主路径**：配置工具策略（allow/deny、通配、group 组、byProvider 覆盖）→ 配置沙箱（mode auto/bwrap/landlock/macos/appcontainer/docker、fail_closed）→ `octos doctor` 验证决策结果 → 显式模式不可用时收到 fail-closed 拒绝与修复指引
 
+### S16: K8s 多副本无状态化部署与故障恢复
+
+- **触发条件**：运维/平台需要在 Kubernetes 上以多副本方式运行 `octos serve`（及逻辑 Worker/Scheduler），并在 Pod 滚动或故障后保持会话、审批、cron 与执行连续性
+- **用户价值**：业务状态以 PostgreSQL 为唯一真相源，Pod 可任意销毁重建；审批与任务可跨副本恢复；支持滚动升级与水平扩缩（← P09, P11）
+- **优先级**：P0
+- **主路径**：选择部署形态（baseline / hostpath / cluster）→ 应用 `deploy/k8s/*.yaml` 并注入 ConfigMap/Secret → 运行 PG 迁移 → 多副本启动 → 客户端经 Service 访问 → 杀 Pod / 滚动后按 Scope 从 PG 回放事件与恢复租约 → 会话与审批不丢
+
+#### 验收条件
+
+##### 正常：cluster 形态多副本可服务
+- **GIVEN** 本地 k8s（如 docker-desktop）可用，镜像与配置已按 `deploy/docs/K8S_INSTALL.md` 准备
+- **WHEN** 执行 `./deploy/scripts/deploy-k8s.sh cluster` 且副本数 ≥ 2
+- **THEN** Service 可访问仪表盘与 UI Protocol；`GET /api/version` 返回 200；PG 中存在迁移后的业务表
+
+##### 正常：Pod 销毁后会话可续
+- **GIVEN** 集群模式运行中，客户端已在某会话产生事件（PG `session_events` 有单调 seq）
+- **WHEN** 删除处理该连接的 Pod，客户端重连并按 seq 回放
+- **THEN** 无缺口或显式 resync；已确认业务状态不丢；新 Pod 可接管 Scope 租约
+
+##### 异常：未配置 PG 却启用集群模式
+- **GIVEN** 配置声明集群/PG 后端但 `DATABASE_URL` 缺失或不可达
+- **WHEN** 启动 serve 集群角色
+- **THEN** 启动失败并给出可操作错误（缺连接串/迁移未应用），不以 local JSONL 静默顶替集群真相源
+
 ## 五、约束与边界
 
 ### 5.1 技术约束
@@ -385,7 +413,7 @@ octos 是一个 **Rust 原生、API 优先的多租户智能体操作系统（Ag
 - **语言与工具链**：Rust edition 2024，rust-version 1.85.0；纯 Rust TLS（rustls），无 OpenSSL 依赖；`deny(unsafe_code)` 工作区级 lint
 - **跨平台**：Linux / macOS / Windows 三平台行为一致（shell、进程管理、二进制发现的平台差异已抽象）；沙箱后端能力依赖宿主机（bwrap/Landlock 仅 Linux，sandbox-exec 仅 macOS，AppContainer 仅 Windows，Docker 跨平台）
 - **外部凭据**：LLM 提供商 key/OAuth、各 IM 通道 bot token 依赖第三方平台配额与可用性
-- **单机模型**：数据目录为 `~/.octos`（config.json / auth.json / sessions / episodes.redb），无中心数据库；多实例/多租户靠 profile 隔离
+- **运行模型**：本地/单机模式数据目录为 `~/.octos`（config.json / auth.json / sessions / episodes.redb），多实例/多租户靠 profile 隔离；**集群模式**以 PostgreSQL 为业务状态唯一真相源（会话/事件/审批/租约/检查点/cron），本机文件降级为 local adapter 或迁移来源（见 ADR cluster-state-and-execution）
 - **feature 构建约束**：`serve`(api)、`browser`、`git` 工具、`code_structure`(ast)、email 通道、`embed-llama` 等为 feature-gated，默认安装包含 embed-llama（需 cmake + C++ 工具链）
 
 ### 5.2 资源与时间约束

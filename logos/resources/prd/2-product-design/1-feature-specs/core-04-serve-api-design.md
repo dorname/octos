@@ -59,6 +59,27 @@
 - **WHEN** 客户端不带 token 请求 `/api/my/*` 路由
 - **THEN** 返回 401；带普通用户 token 请求 `/api/admin/*` 返回 403；响应体不泄露内部细节
 
+### 1附.1 集群模式启动
+
+当配置/环境启用 PostgreSQL 集群后端时，`octos serve` 进入集群角色（见 `serve_cluster` / 部署清单）：
+
+1. 校验 `DATABASE_URL` 与迁移版本
+2. 挂载 UI Protocol / admin 路由（与单机相同对外契约）
+3. 会话事件、审批、租约写入 PG；WS 支持 `replay_from_pg`
+4. Cron 使用 `CronServicePg`（若启用定时任务）
+
+#### 验收条件（交互级增量）
+
+##### 正常：集群 serve 探活
+- **GIVEN** cluster 形态已部署
+- **WHEN** 客户端访问 `GET /api/version` 与仪表盘
+- **THEN** 行为与单机 serve 一致（200 + 页面），后端状态在 PG
+
+##### 异常：缺 DATABASE_URL
+- **GIVEN** 集群标志已开但无可用 PG
+- **WHEN** 启动
+- **THEN** 失败并提示修复路径，不静默回落 JSONL 真相源
+
 ## 二、S13: ACP 协议接入 IDE — 交互规格
 
 ### 2.1 `octos acp`

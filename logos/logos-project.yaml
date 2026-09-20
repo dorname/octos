@@ -18,7 +18,7 @@ tech_stack:
 scenario_counter:
   # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
   # S02-S15 已由 change baseline-prd 在需求文档中分配(2026-09-18)
-  next_id: 16
+  next_id: 17
 modules:
   - id: core
     name: 核心功能
@@ -172,3 +172,9 @@ baseline_index:
     source_hash: b4fbf33f014642fa1e00d8aaf8ec6ef52d070b2611f2fe78dee2c6687feff9cc
     denominator: 148
     generated_at: 2026-09-18T05:42:15.128Z
+  - path: logos/resources/prd/2-product-design/1-feature-specs/core-07-k8s-cluster-design.md
+    desc: S16 K8s 集群无状态化功能规格。涉及 baseline/hostpath/cluster 部署形态、Scope、租约恢复与跨 Pod 审批时必读。
+  - path: logos/resources/prd/3-technical-plan/2-scenario-implementation/core-S16-k8s-cluster.md
+    desc: S16 K8s 多副本无状态化部署时序图与拓扑。涉及滚动升级后会话续接、租约接管、PG 回放时必读。
+  - path: logos/resources/prd/3-technical-plan/3-deployment/core-01-deployment-plan.md
+    desc: core 部署方案（docker / k8s baseline·hostpath·cluster）。涉及环境变量、迁移、回滚与 SMOKE-S16 冒烟输入时必读。
