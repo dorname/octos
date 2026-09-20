@@ -6,14 +6,18 @@
 
 | Metric | Value |
 |--------|-------|
-| Defined cases | 40 |
+| Defined cases | 74 |
 | Manual cases (excluded) | 1 |
-| Executed cases | 40 |
-| Passed | 40 |
+| Executed cases | 74 |
+| Passed | 73 |
 | Failed | 0 |
-| Skipped | 0 |
+| Skipped | 1 |
 | Uncovered | 0 |
 | Coverage | 100% |
-| Pass rate | 100% |
+| Pass rate | 99% |
 | **Gate 3.5** | **PASS** |
+
+## Skipped Cases
+
+- ST-S17-13
 
