@@ -293,6 +293,18 @@ Step 5 分批执行提示词（可直接复用）：
 
 **违反此规则将破坏项目的变更可追溯性。**
 
+## ⛔ GitHub Issue / PR 目标仓库（强制执行）
+
+本仓库 `origin` 为 **fork**（当前：`dorname/octos`）；`upstream` 为上游（当前：`octos-org/octos`）。
+
+- **创建 / 评论 Issue、创建 PR、推送分支**：默认且只能针对 **`origin` / fork**（例如 `-R dorname/octos` 或 `git push origin …`）
+- **严禁**向 **`upstream` / `octos-org/octos`**（或任何非 origin 的上游 remote）创建 Issue、开 PR、或 `git push`
+- 执行前必须用 `git remote -v` 核对目标；`gh issue create` / `gh pr create` **必须**显式带上 fork 的 `-R <owner>/<repo>`，禁止依赖「默认落到上游」的隐式宿主
+- 若用户未明确要求「同步上游 / 向上游提 PR」，AI **不得**建议或执行对上游的 issue/PR/push
+- 历史误开到上游的条目不得作为后续默认目标
+
+**违反此规则会把 fork 侧验证噪声与私有部署细节泄漏到上游社区。**
+
 ## ⚠️ openlogos CLI 规则
 
 运行任何 `openlogos` 命令之前，**必须先 cd 到项目根目录**（即 `logos/logos.config.json` 所在目录）。
