@@ -103,6 +103,17 @@
 | UT-S16-39 | profiles::tests::overlay_save_to_readonly_seed_writes_marked_overlay | save 到只读 CM 种子路径：改写 override.json 并打 managed_by=ui + updated_at，get 合并生效 |
 | UT-S16-40 | profiles::tests::overlay_save_to_writable_path_writes_seed_no_override | save 到可写路径：照旧写 <id>.json，不产生 override |
 
+## 批 8（黑板 #15 — 修复 #13 缺陷：seed_readonly 写探测，挂载语义只读）
+
+### UT-S16-41 ~ UT-S16-44 — crates/octos-cli profiles（写探测）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-41 | profiles::tests::probe_readonly_detects_chmod_444_readonly | 权限位只读（chmod 444）判只读：save 改写 override（保留 UT-S16-39 语义）；root 跳过 |
+| UT-S16-42 | profiles::tests::probe_readonly_detects_mount_level_readonly_via_dir_0555 | **挂载层只读**（0644 可写位但 0555 目录/FS 拒绝写）判只读——#14 暴露的 `permissions().readonly()` 缺口，写探测覆盖；root 跳过 |
+| UT-S16-43 | profiles::tests::probe_readonly_reports_writable_for_normal_path | 可写路径判可写：save 写 seed 不产生 override（保留 UT-S16-40 语义） |
+| UT-S16-44 | profiles::tests::probe_readonly_cleans_up_probe_file | 写探测后 `.probe-readonly-*` 临时文件被清理（可写与只读两路径都不残留） |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

@@ -1855,10 +1855,19 @@ impl ProfileStore {
         // (`<id>.override.json`) wrapped with a `managed_by: "ui"` provenance
         // marker + updated_at, so [`ProfileStore::get`] merges it over the
         // seed. A writable (non-CM) path saves directly as before.
-        let seed_readonly = path.exists()
-            && std::fs::metadata(&path)
-                .map(|m| m.permissions().readonly())
-                .unwrap_or(false);
+        // Issue #15 (修复 #13 缺陷): the previous check used
+        // `permissions().readonly()`, which reads the file permission BITS —
+        // a 0644 file has the owner-write bit and always reports writable,
+        // even when the path is on a READ-ONLY FILESYSTEM (bind-mount ro /
+        // ConfigMap subPath ro). #14 live proof: CM-mounted
+        // cluster-worker.json is 0644 yet `echo test >> it` fails with
+        // EROFS, so save() misjudged the seed as writable and rename() died
+        // with EROFS. Write-probe instead: try creating a temp file in the
+        // seed's parent dir; EROFS/PermissionDenied means truly read-only
+        // (covers BOTH chmod-444 and mount-ro); clean up the probe either
+        // way. Other errors (missing dir etc.) conservatively stay writable
+        // so the normal save path is not blocked.
+        let seed_readonly = path.exists() && probe_readonly_fs(&path);
         let (write_path, content) = if seed_readonly {
             let overlay_path = self.profile_override_path(&normalized.id);
             let wrapper = serde_json::json!({
@@ -2179,6 +2188,60 @@ impl ProfileStore {
 
         self.save(&profile)?;
         Ok(profile)
+    }
+}
+
+/// Test helper: true when the effective uid is 0 (root). Reads
+/// /proc/self/status on Linux (no `unsafe`); non-Linux/unparseable → false
+/// so the root-skip never fires spuriously off-Linux.
+#[cfg(test)]
+fn current_euid_is_root() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned))
+        })
+        .map(|euid| euid == "0")
+        .unwrap_or(false)
+}
+
+/// Issue #15: write-probe a path's parent dir to detect a truly read-only
+/// filesystem (mount-ro / ConfigMap subPath ro) OR permission-bit read-only
+/// (chmod 444). Returns true when creating a temp file in the parent dir
+/// fails with EROFS or PermissionDenied; the probe file is always cleaned up.
+/// Any other error (missing dir, etc.) returns false so the normal save path
+/// is not blocked by an unrelated I/O hiccup.
+fn probe_readonly_fs(path: &std::path::Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let probe = parent.join(format!(
+        ".probe-readonly-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            // Writable — clean up the probe and report writable.
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&probe); // best-effort; usually absent
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        }
     }
 }
 
@@ -7260,6 +7323,14 @@ mod tests {
 
     #[test]
     fn overlay_save_to_readonly_seed_writes_marked_overlay() {
+        // Root bypasses permission bits (chmod 444 is a no-op for uid 0), so
+        // the read-only seed simulation cannot work — skip like the root-noise
+        // convention (#4 outer note). The save-redirect logic itself is
+        // environment-independent; this assert runs on CI/non-root.
+        if current_euid_is_root() {
+            eprintln!("skipping overlay_save_to_readonly_seed under root (uid 0 bypasses 444)");
+            return;
+        }
         // UT-S16-39: save() to a read-only (ConfigMap-mounted) seed path
         // redirects to <id>.override.json with managed_by=ui + updated_at,
         // and a subsequent get() merges it over the seed.
@@ -7309,6 +7380,156 @@ mod tests {
         assert!(
             !store.profile_override_path("admin").exists(),
             "writable save must not produce an override file"
+        );
+    }
+
+
+    // ── Issue #15 (修复 #13 缺陷): seed_readonly 写探测(挂载语义只读) ──
+
+    #[test]
+    fn probe_readonly_detects_chmod_444_readonly() {
+        // Root bypasses permission bits (chmod 444/0555 are no-ops for uid 0),
+        // so the read-only simulation cannot work — skip like the root-noise
+        // convention noted on the blackboard (#4 outer note). The probe logic
+        // itself is environment-independent; these asserts run on CI/non-root.
+        let skip_root = current_euid_is_root();
+        if skip_root {
+            eprintln!("skipping probe_readonly_detects_chmod_444_readonly under root (permission-bit mock is a no-op for uid 0)");
+            return;
+        }
+        // UT-S16-41: write-probe on a chmod-444 (permission-bit read-only)
+        // seed must report read-only — save redirects to override (preserves
+        // the UT-S16-39 semantic).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cw444");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cw444", "moonshot-coding")).unwrap(),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(
+            probe_readonly_fs(&seed_path),
+            "chmod-444 seed must probe as read-only"
+        );
+        let mut ui = seed_profile("cw444", "minimax-token");
+        ui.config.env_vars.insert("K".into(), "v".into());
+        store.save(&ui).unwrap();
+        assert!(
+            store.profile_override_path("cw444").exists(),
+            "save to chmod-444 seed must redirect to override"
+        );
+    }
+
+    #[test]
+    fn probe_readonly_detects_mount_level_readonly_via_dir_0555() {
+        // Root bypasses permission bits (chmod 444/0555 are no-ops for uid 0),
+        // so the read-only simulation cannot work — skip like the root-noise
+        // convention noted on the blackboard (#4 outer note). The probe logic
+        // itself is environment-independent; these asserts run on CI/non-root.
+        let skip_root = current_euid_is_root();
+        if skip_root {
+            eprintln!("skipping probe_readonly_detects_mount_level_readonly_via_dir_0555 under root (permission-bit mock is a no-op for uid 0)");
+            return;
+        }
+        // UT-S16-42: the #14 live gap — a file whose PERMISSION BITS are
+        // writable (0644) but whose FILESYSTEM/dir refuses writes (mount-ro /
+        // ConfigMap subPath ro). Simulated by making the profiles DIR 0555:
+        // the file is 0644 (owner-write bit set, permissions().readonly()
+        // would say writable) yet creating a temp probe in the dir is denied
+        // — exactly the mount-level read-only shape. save must redirect to
+        // override.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cwmnt");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cwmnt", "moonshot-coding")).unwrap(),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // File stays 0644 (writable bits) — this is the mount-ro shape.
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // Dir becomes read-only (no write/search for creating entries).
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        assert!(
+            probe_readonly_fs(&seed_path),
+            "0644 file in a 0555 (mount-ro) dir must probe as read-only — \
+             permissions().readonly() would have missed this (#14 gap)"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Restore dir writability so save's override write can proceed.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn probe_readonly_reports_writable_for_normal_path() {
+        // UT-S16-43: a normal writable path probes as writable — save writes
+        // the seed directly and produces NO override (preserves UT-S16-40).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cwok");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cwok", "anthropic")).unwrap(),
+        );
+        assert!(
+            !probe_readonly_fs(&seed_path),
+            "normal writable path must NOT probe as read-only"
+        );
+        store.save(&seed_profile("cwok", "anthropic")).unwrap();
+        assert!(
+            !store.profile_override_path("cwok").exists(),
+            "writable save must not produce an override file"
+        );
+    }
+
+    #[test]
+    fn probe_readonly_cleans_up_probe_file() {
+        // UT-S16-44: the write-probe must not leave a `.probe-readonly-*`
+        // file behind, on either the writable or read-only path.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cwprobe");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cwprobe", "anthropic")).unwrap(),
+        );
+        // writable path
+        let _ = probe_readonly_fs(&seed_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        // read-only path
+        let _ = probe_readonly_fs(&seed_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".probe-readonly-")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "probe must not leave .probe-readonly-* files: {leftover:?}"
         );
     }
 
