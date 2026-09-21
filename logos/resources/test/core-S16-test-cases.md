@@ -91,6 +91,18 @@
 | UT-S16-34 | store/projection-store-hydrate-failed.test.ts | 静默失败标记：markHydrateFailed/isHydrateFailed/clearHydrateFailed 三面（失败标记而非空引导态） |
 | UT-S16-35 | runtime/hydrate-projection.test.ts · issue #10 epoch | epoch 修复：hydrate user envelope meta 含 persisted_at，渲染兜底不渲染 epoch/序号 |
 
+## 批 7（黑板 #13 — issue #11 治本：CM 种子 + PVC 可写覆盖合并）
+
+### UT-S16-36 ~ UT-S16-40 — crates/octos-cli profiles（方案 c 合并/保存语义）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-36 | profiles::tests::overlay_get_returns_seed_when_no_overlay | 种子+无覆盖：get 返回种子原样 |
+| UT-S16-37 | profiles::tests::overlay_get_merges_ui_marked_overlay_over_seed | 种子+带 managed_by=ui 覆盖：深合并，覆盖层 llm/env_vars 优先（UI 配 key 即用） |
+| UT-S16-38 | profiles::tests::overlay_get_ignores_unmarked_leftover_seed_wins | 种子+无标记覆盖（历史残留）：种子胜（#7 防遮蔽语义保留） |
+| UT-S16-39 | profiles::tests::overlay_save_to_readonly_seed_writes_marked_overlay | save 到只读 CM 种子路径：改写 override.json 并打 managed_by=ui + updated_at，get 合并生效 |
+| UT-S16-40 | profiles::tests::overlay_save_to_writable_path_writes_seed_no_override | save 到可写路径：照旧写 <id>.json，不产生 override |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

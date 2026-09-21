@@ -1757,14 +1757,58 @@ impl ProfileStore {
 
     /// Get a single profile by ID.
     pub fn get(&self, id: &str) -> Result<Option<UserProfile>> {
-        let path = self.profile_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)
-            .wrap_err_with(|| format!("failed to read profile: {id}"))?;
-        let mut profile: UserProfile = serde_json::from_str(&content)
-            .wrap_err_with(|| format!("failed to parse profile: {id}"))?;
+        let seed_path = self.profile_path(id);
+        let seed = if seed_path.exists() {
+            let content = std::fs::read_to_string(&seed_path)
+                .wrap_err_with(|| format!("failed to read profile: {id}"))?;
+            let profile: UserProfile = serde_json::from_str(&content)
+                .wrap_err_with(|| format!("failed to parse profile: {id}"))?;
+            Some(profile)
+        } else {
+            None
+        };
+
+        // Issue #11 (方案 c): the writable PVC overlay. When present AND
+        // carrying an explicit `managed_by: "ui"` provenance marker, it
+        // overrides the (possibly read-only ConfigMap) seed — this is how a
+        // UI save lands a real LLM key for a CM-mounted cluster profile
+        // without touching the seed. An overlay WITHOUT the marker is a
+        // historical PVC leftover and is IGNORED (the #7 anti-shadowing
+        // guarantee: stale PVC must not silently override ConfigMap config).
+        let overlay_path = self.profile_override_path(id);
+        let mut profile: UserProfile = if overlay_path.exists() {
+            let content = std::fs::read_to_string(&overlay_path)
+                .wrap_err_with(|| format!("failed to read profile overlay: {id}"))?;
+            let wrapper: serde_json::Value = serde_json::from_str(&content)
+                .wrap_err_with(|| format!("failed to parse profile overlay: {id}"))?;
+            let managed = wrapper
+                .get("managed_by")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if managed == "ui" {
+                let inner = wrapper.get("profile").cloned().unwrap_or(wrapper.clone());
+                let ov: UserProfile = serde_json::from_value(inner)
+                    .wrap_err_with(|| format!("failed to parse profile overlay profile: {id}"))?;
+                match seed {
+                    Some(mut base) => {
+                        merge_profile_overlay(&mut base, ov);
+                        base
+                    }
+                    None => ov,
+                }
+            } else {
+                // Leftover without provenance → seed wins (or nothing).
+                match seed {
+                    Some(s) => s,
+                    None => return Ok(None),
+                }
+            }
+        } else {
+            match seed {
+                Some(s) => s,
+                None => return Ok(None),
+            }
+        };
         // Fail fast on legacy records that predate the channel-name
         // reservation (codex #1613 r5): a channel-named profile
         // produces ambiguous session keys (`api:telegram:123` parses as
@@ -1804,16 +1848,40 @@ impl ProfileStore {
         let mut serialized =
             serde_json::to_value(&normalized).wrap_err("failed to serialize profile")?;
         preserve_local_owner_metadata(&path, &mut serialized);
-        let content =
-            serde_json::to_string_pretty(&serialized).wrap_err("failed to serialize profile")?;
+
+        // Issue #11 (方案 c): when the seed path is read-only (a ConfigMap
+        // mount, e.g. cluster-worker.json), a UI save would fail with EROFS.
+        // Redirect the write to the writable PVC overlay
+        // (`<id>.override.json`) wrapped with a `managed_by: "ui"` provenance
+        // marker + updated_at, so [`ProfileStore::get`] merges it over the
+        // seed. A writable (non-CM) path saves directly as before.
+        let seed_readonly = path.exists()
+            && std::fs::metadata(&path)
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(false);
+        let (write_path, content) = if seed_readonly {
+            let overlay_path = self.profile_override_path(&normalized.id);
+            let wrapper = serde_json::json!({
+                "managed_by": "ui",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "profile": serialized,
+            });
+            let content = serde_json::to_string_pretty(&wrapper)
+                .wrap_err("failed to serialize profile overlay")?;
+            (overlay_path, content)
+        } else {
+            let content = serde_json::to_string_pretty(&serialized)
+                .wrap_err("failed to serialize profile")?;
+            (path.clone(), content)
+        };
 
         // Atomic write: write to temp file, then rename to avoid partial writes
         // if the process is interrupted or concurrent saves race.
-        let tmp = path.with_extension("json.tmp");
+        let tmp = write_path.with_extension("json.tmp");
         std::fs::write(&tmp, &content)
             .wrap_err_with(|| format!("failed to write temp profile: {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .wrap_err_with(|| format!("failed to rename profile: {}", path.display()))?;
+        std::fs::rename(&tmp, &write_path)
+            .wrap_err_with(|| format!("failed to rename profile: {}", write_path.display()))?;
 
         // Restrict file permissions to owner-only (mode 0600)
         #[cfg(unix)]
@@ -1906,6 +1974,14 @@ impl ProfileStore {
 
     pub(crate) fn profile_path(&self, id: &str) -> PathBuf {
         self.registry_dir.join(format!("{id}.json"))
+    }
+
+    /// Issue #11 (方案 c): the writable PVC overlay path for a profile whose
+    /// seed is a read-only ConfigMap mount. The overlay sits next to the seed
+    /// in the same profiles dir (PVC), so a UI save can land without touching
+    /// the read-only seed. See [`ProfileStore::get`] for the merge semantics.
+    pub(crate) fn profile_override_path(&self, id: &str) -> PathBuf {
+        self.registry_dir.join(format!("{id}.override.json"))
     }
 
     /// Registration-id reservation policy (codex #1613 r6/r8), wired
@@ -2104,6 +2180,25 @@ impl ProfileStore {
         self.save(&profile)?;
         Ok(profile)
     }
+}
+
+/// Issue #11 (方案 c): deep-merge a UI overlay into a seed profile. The
+/// overlay's `config.llm` and `config.env_vars` take precedence (that's how a
+/// UI save lands a real key over a read-only ConfigMap seed); everything else
+/// (identity, workspace, channels, gateway) stays from the seed unless the
+/// overlay explicitly sets it. Scalar Option fields: overlay `Some` wins,
+/// overlay `None` keeps the seed value.
+fn merge_profile_overlay(seed: &mut UserProfile, overlay: UserProfile) {
+    // LLM contract: overlay fully replaces the selection if it has one.
+    if overlay.config.llm.is_some() {
+        seed.config.llm = overlay.config.llm;
+    }
+    // env_vars: merge key-by-key so a UI save of one key doesn't wipe others.
+    for (k, v) in overlay.config.env_vars {
+        seed.config.env_vars.insert(k, v);
+    }
+    // updated_at reflects the overlay write time.
+    seed.updated_at = overlay.updated_at;
 }
 
 fn preserve_local_owner_metadata(path: &Path, serialized: &mut serde_json::Value) {
@@ -7062,4 +7157,159 @@ mod tests {
             effective_profile_asr_language(Some(&store), Some("broken"), None).unwrap_err();
         assert!(malformed.to_string().contains("failed to parse profile"));
     }
+
+    // ── Issue #11 (方案 c): CM 种子 + PVC 可写覆盖合并 ──────────────
+
+    fn seed_profile(id: &str, family: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some(family.into()),
+                        model_id: Some("seed-model".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn write_json(path: &std::path::Path, value: &serde_json::Value) {
+        std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn overlay_get_returns_seed_when_no_overlay() {
+        // UT-S16-36: seed + no overlay → seed returned as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        write_json(
+            &store.profile_path("cw"),
+            &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
+        );
+        let got = store.get("cw").unwrap().unwrap();
+        let fam = got.config.llm.unwrap().primary.unwrap().family_id.unwrap();
+        assert_eq!(fam, "moonshot-coding");
+        assert!(got.config.env_vars.is_empty());
+    }
+
+    #[test]
+    fn overlay_get_merges_ui_marked_overlay_over_seed() {
+        // UT-S16-37: seed + overlay with managed_by=ui → deep merge, overlay
+        // llm/env_vars win (this is how a UI save lands a real key over a
+        // read-only ConfigMap seed).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        write_json(
+            &store.profile_path("cw"),
+            &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
+        );
+        let mut ov = seed_profile("cw", "minimax-token");
+        ov.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-real".into());
+        write_json(
+            &store.profile_override_path("cw"),
+            &serde_json::json!({
+                "managed_by": "ui",
+                "updated_at": "2026-09-21T00:00:00Z",
+                "profile": serde_json::to_value(&ov).unwrap(),
+            }),
+        );
+        let got = store.get("cw").unwrap().unwrap();
+        let fam = got.config.llm.as_ref().unwrap().primary.as_ref().unwrap().family_id.clone().unwrap();
+        assert_eq!(fam, "minimax-token", "overlay llm must win over seed");
+        assert_eq!(
+            got.config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-real"),
+            "overlay env_vars must merge in"
+        );
+    }
+
+    #[test]
+    fn overlay_get_ignores_unmarked_leftover_seed_wins() {
+        // UT-S16-38: seed + overlay WITHOUT managed_by marker (historical PVC
+        // leftover) → seed wins (#7 anti-shadowing guarantee: stale PVC must
+        // not silently override ConfigMap config).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        write_json(
+            &store.profile_path("cw"),
+            &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
+        );
+        let mut leftover = seed_profile("cw", "stale-family");
+        leftover.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-stale".into());
+        // Leftover is a bare UserProfile json (no managed_by wrapper).
+        write_json(
+            &store.profile_override_path("cw"),
+            &serde_json::to_value(&leftover).unwrap(),
+        );
+        let got = store.get("cw").unwrap().unwrap();
+        let fam = got.config.llm.unwrap().primary.unwrap().family_id.unwrap();
+        assert_eq!(fam, "moonshot-coding", "unmarked leftover must NOT shadow seed");
+        assert!(got.config.env_vars.is_empty(), "unmarked leftover env_vars must NOT merge");
+    }
+
+    #[test]
+    fn overlay_save_to_readonly_seed_writes_marked_overlay() {
+        // UT-S16-39: save() to a read-only (ConfigMap-mounted) seed path
+        // redirects to <id>.override.json with managed_by=ui + updated_at,
+        // and a subsequent get() merges it over the seed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cw");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
+        );
+        // Make the seed read-only to simulate the ConfigMap mount.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let mut ui = seed_profile("cw", "minimax-token");
+        ui.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-ui".into());
+        store.save(&ui).unwrap();
+
+        assert!(
+            store.profile_override_path("cw").exists(),
+            "save to read-only seed must redirect to override path"
+        );
+        let raw = std::fs::read_to_string(store.profile_override_path("cw")).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(wrapper.get("managed_by").and_then(|v| v.as_str()), Some("ui"));
+        assert!(wrapper.get("updated_at").is_some(), "overlay must carry updated_at");
+
+        let got = store.get("cw").unwrap().unwrap();
+        let fam = got.config.llm.as_ref().unwrap().primary.as_ref().unwrap().family_id.clone().unwrap();
+        assert_eq!(fam, "minimax-token");
+        assert_eq!(
+            got.config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-ui")
+        );
+    }
+
+    #[test]
+    fn overlay_save_to_writable_path_writes_seed_no_override() {
+        // UT-S16-40: save() to a writable (non-CM) path writes <id>.json
+        // directly and produces NO override file.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        store.save(&seed_profile("admin", "anthropic")).unwrap();
+        assert!(store.profile_path("admin").exists());
+        assert!(
+            !store.profile_override_path("admin").exists(),
+            "writable save must not produce an override file"
+        );
+    }
+
 }

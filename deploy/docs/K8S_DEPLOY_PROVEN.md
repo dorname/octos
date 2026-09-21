@@ -279,6 +279,35 @@ kubectl create secret generic llm-credentials \
 kubectl rollout restart deployment/octos -n octos
 ```
 
+## 集群模式 LLM key 的三条配置通道与优先级（issue #11 治本）
+
+cluster-worker 这类 **ConfigMap 只读挂载**的 profile，UI 无法直接写。治本
+采用「CM 种子 + PVC 可写覆盖合并」（方案 c），key 有三条配置通道，按
+优先级从高到低：
+
+| 通道 | 路径 | 何时生效 | 优先级 |
+|---|---|---|---|
+| **1. UI 覆盖层** | `profiles/<id>.override.json`（PVC 可写，带 `managed_by:"ui"` + `updated_at` 标记） | UI 在 Settings 配 key 并保存后，对话**立即**用覆盖层值 | **最高**（显式用户配置） |
+| **2. kubectl secret** | `secret/llm-credentials`（`ANTHROPIC_API_KEY` 等） | 无 UI 覆盖层时，profile 的 `route.api_key_env` 解析到 pod env | 中（集群级共享） |
+| **3. CM 种子** | `configMap/cluster-worker-profile`（只读挂载 `profiles/<id>.json`） | 无覆盖层且 secret 为空/占位时，profile 的 LLM 路由（family/model/base_url）由种子提供 | **最低**（滚动稳定的默认） |
+
+**合并语义**（`ProfileStore::get`）：
+- 覆盖层**有** `managed_by:"ui"` 标记 → 深合并（覆盖层 `config.llm` 与 `config.env_vars` 优先，其余种子保留）→ **通道 1 胜**；
+- 覆盖层**无**标记（历史 PVC 残留）→ **忽略覆盖层，种子胜**（#7 防遮蔽：陈旧 PVC 不得静默覆盖 ConfigMap 配置）；
+- 无覆盖层 → 种子 + secret 解析（通道 2/3）。
+
+**UI 配 key 的落点**（`ProfileStore::save`）：
+- 目标 profile 的种子路径**只读**（CM 挂载）→ save **改写** `<id>.override.json`（PVC 可写），自动打 `managed_by:"ui"` + `updated_at`；
+- 目标路径可写（非 CM 挂载，如 admin）→ 照旧写 `<id>.json`，不产生 override。
+
+**验证（issue #11 四条标准）**：
+1. UI 配 key 即用 → save 落 override，get 合并，对话用 cluster-worker 读到 key；
+2. rollout 保留 → override.json 在 PVC，重启后仍在；
+3. CM 种子生效 → 无 override 时种子（family/model/base_url）正常提供；
+4. 本节即文档（三通道与优先级）。
+
+---
+
 ## PVC 残留 profile 会覆盖 ConfigMap 的 LLM 配置（优先级语义）
 
 `DEFAULT_PROFILE` 等 ConfigMap 变量**只在 profile 文件不存在时**生效——init
