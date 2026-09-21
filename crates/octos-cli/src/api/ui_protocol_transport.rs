@@ -19009,7 +19009,16 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
 fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
     match identity {
         AuthIdentity::User { id, .. } if !id.is_empty() => Some(id),
-        AuthIdentity::User { .. } | AuthIdentity::Admin => None,
+        AuthIdentity::User { .. } => None,
+        // #40 (③): align the WS connection profile with the REST semantics —
+        // `resolve_my_profile_id` maps `AuthIdentity::Admin` to ADMIN_PROFILE_ID,
+        // so an Admin WS connection's profile scope is `admin`, not None. This
+        // makes existing bare admin `web-*` session keys immediately readable by
+        // the hydrate lookup (which resolves key-profile → connection-identity →
+        // routed), closing the read/write resolution mismatch where session/open
+        // routed admin sessions to the admin manager but hydrate fell back to
+        // `_main` → unknown_session.
+        AuthIdentity::Admin => Some(crate::api::auth_handlers::ADMIN_PROFILE_ID),
     }
 }
 

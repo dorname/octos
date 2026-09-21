@@ -15402,7 +15402,9 @@ fn authenticated_profile_id_uses_user_identity_only() {
     };
 
     assert_eq!(authenticated_profile_id(&user), Some("profile-a"));
-    assert_eq!(authenticated_profile_id(&AuthIdentity::Admin), None);
+    // #40 (③): Admin WS connection profile aligns with REST resolve_my_profile_id
+    // → ADMIN_PROFILE_ID (was None), so bare admin web-* keys hydrate correctly.
+    assert_eq!(authenticated_profile_id(&AuthIdentity::Admin), Some("admin"));
 }
 
 #[test]
