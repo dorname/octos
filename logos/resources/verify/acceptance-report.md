@@ -8,8 +8,8 @@
 |--------|-------|
 | Defined cases | 139 |
 | Manual cases (excluded) | 1 |
-| Executed cases | 140 |
-| Passed | 139 |
+| Executed cases | 144 |
+| Passed | 143 |
 | Failed | 0 |
 | Skipped | 1 |
 | Uncovered | 0 |
