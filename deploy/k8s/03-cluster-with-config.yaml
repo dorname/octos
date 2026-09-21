@@ -292,6 +292,10 @@ spec:
           mountPath: /usr/local/bin/init-config.sh
           readOnly: true
           subPath: init-config.sh
+        - name: cluster-worker-profile
+          mountPath: /tmp/octos-data/profiles/cluster-worker.json
+          readOnly: true
+          subPath: cluster-worker.json
       containers:
       - name: octos
         image: alpine:3.21
@@ -341,6 +345,14 @@ spec:
           mountPath: /tmp/octos-data
         - name: workspace
           mountPath: /workspace
+        - name: cluster-worker-profile
+          mountPath: /tmp/octos-data/profiles/cluster-worker.json
+          readOnly: true
+          subPath: cluster-worker.json
+          # The operator-facing LLM profile lives in a read-only ConfigMap
+          # mount (over the PVC path) so a UI/API config write cannot be
+          # silently shadowed by a stale PVC-resident profile file —
+          # config survives rollout without depending on PVC content.
         - name: octos-binary
           mountPath: /opt/octos
           readOnly: true
@@ -361,6 +373,76 @@ spec:
         configMap:
           name: octos-init-script
           defaultMode: 0o755
+      - name: cluster-worker-profile
+        configMap:
+          name: cluster-worker-profile
+          defaultMode: 0o644
+
+---
+# Operator-facing LLM profile for the cluster-worker gateway, mounted
+# read-only at /tmp/octos-data/profiles/cluster-worker.json (subPath).
+# Design (issue #7): profile content is config, not PVC state — a rollout
+# restart must NOT lose it (emptyDir would drop it; a stale PVC file would
+# shadow ConfigMap LLM vars). The CM mount makes the profile the single
+# source of truth while the PVC keeps serving runtime data (sessions, etc).
+# The secret value in env_vars below is a PLACEHOLDER — the real key must
+# come from the llm-credentials Secret via route.api_key_env resolution;
+# keep this CM free of live secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-worker-profile
+  namespace: octos
+data:
+  cluster-worker.json: |
+    {
+      "id": "cluster-worker",
+      "name": "Cluster Worker",
+      "enabled": true,
+      "data_dir": null,
+      "config": {
+        "llm": {
+          "primary": {
+            "family_id": "minimax-token",
+            "model_id": "MiniMax-M3",
+            "route": {
+              "route_id": "minimax-token-plan",
+              "base_url": "https://api.minimaxi.com/anthropic",
+              "api_key_env": "ANTHROPIC_API_KEY",
+              "api_type": "anthropic"
+            }
+          },
+          "fallbacks": []
+        },
+        "channels": [],
+        "gateway": {},
+        "email": null,
+        "api_type": null,
+        "env_vars": {},
+        "hooks": [],
+        "admin_mode": false,
+        "format_after_edit": false,
+        "sandbox": {
+          "enabled": false,
+          "mode": "auto",
+          "fail_closed": false,
+          "allow_network": false,
+          "workspace_write": true,
+          "repo_git_write": null,
+          "build_cache_slot": null,
+          "docker": {"image": "ubuntu:24.04", "cpu_limit": null, "memory_limit": null, "pids_limit": null, "mount_mode": "rw", "extra_binds": []},
+          "read_allow_paths": [],
+          "write_allow_globs": null,
+          "profile_name": null,
+          "allow_toolchains": true
+        },
+        "adaptive_routing": null,
+        "content_routing": null,
+        "plugins": {"require_signed": false}
+      },
+      "created_at": "2026-09-17T05:31:46Z",
+      "updated_at": "2026-09-17T05:31:46Z"
+    }
 
 ---
 apiVersion: v1

@@ -252,6 +252,30 @@ fn test_octos_deployment_single_replica_for_rwo_pvc() {
 }
 
 #[test]
+fn test_octos_deployment_mounts_cluster_worker_profile_configmap() {
+    // Issue #7: the operator-facing LLM profile must come from a read-only
+    // ConfigMap mount, not PVC-resident state — otherwise a rollout restart
+    // either loses it (emptyDir) or shadows ConfigMap LLM vars (stale PVC).
+    let doc = octos_deployment_doc();
+    assert!(
+        doc.contains("cluster-worker-profile"),
+        "octos Deployment must mount the cluster-worker-profile ConfigMap \
+         (issue #7: profile as config, not PVC state)"
+    );
+    assert!(
+        doc.contains("subPath: cluster-worker.json"),
+        "cluster-worker profile mount must use subPath so the JSON file \
+         lands at /tmp/octos-data/profiles/cluster-worker.json without \
+         shadowing the whole profiles directory"
+    );
+    assert!(
+        doc.contains("name: cluster-worker-profile\n        configMap:"),
+        "cluster-worker-profile volume must be backed by a ConfigMap, not \
+         a PVC or emptyDir"
+    );
+}
+
+#[test]
 fn test_k8s_deploy_proven_doc_records_recreate_and_portforward() {
     let doc = std::fs::read_to_string(repo_root().join("deploy/docs/K8S_DEPLOY_PROVEN.md"))
         .expect("deploy/docs/K8S_DEPLOY_PROVEN.md must exist");
