@@ -15407,6 +15407,66 @@ fn authenticated_profile_id_uses_user_identity_only() {
     assert_eq!(authenticated_profile_id(&AuthIdentity::Admin), Some("admin"));
 }
 
+// ── Issue #40/#41: canonical profile-scoped session keys (kind=api) ─────────
+
+#[test]
+fn mint_canonical_session_key_mints_for_bare_id_with_profile() {
+    // Bare `web-*` id + explicit profile_id → `{profile}:api:{raw}` (kind=api).
+    let minted = mint_canonical_session_key(&SessionKey("web-1789871791268-87x3ps".into()), Some("admin"))
+        .expect("bare id + profile must mint");
+    assert_eq!(minted.0, "admin:api:web-1789871791268-87x3ps");
+    // The minted key parses back via profile_id() first-hit (② self-consistent).
+    assert_eq!(minted.profile_id(), Some("admin"));
+    assert_eq!(minted.channel(), "api");
+}
+
+#[test]
+fn mint_canonical_session_key_preserves_topic_suffix() {
+    let minted = mint_canonical_session_key(&SessionKey("web-1#research".into()), Some("admin"))
+        .expect("bare id + profile must mint");
+    assert_eq!(minted.0, "admin:api:web-1#research");
+    assert_eq!(minted.topic(), Some("research"));
+}
+
+#[test]
+fn mint_canonical_session_key_skips_already_scoped_or_profileless() {
+    // Already profile-scoped → None (leave as-is).
+    assert!(
+        mint_canonical_session_key(&SessionKey("admin:api:web-1".into()), Some("admin")).is_none()
+    );
+    // Bare id but NO profile → None (legacy inference covers it; no mint).
+    assert!(mint_canonical_session_key(&SessionKey("web-1".into()), None).is_none());
+}
+
+#[test]
+fn canonical_key_read_path_resolves_profile_first() {
+    // ②: a canonical key's profile_id() is the first-priority read-path signal,
+    // so hydrate/lookup resolves to the `admin` manager directly — not the
+    // `_main` fallback that produced unknown_session for bare admin keys.
+    let key = SessionKey("admin:api:web-1789871791268-87x3ps".into());
+    // Simulate resolve_sessions_for_lookup's precedence: profile_id() first.
+    let resolved = key.profile_id().or(None).or(Some("_main"));
+    assert_eq!(resolved, Some("admin"), "canonical key must hit admin, not _main");
+    // A bare legacy key (pre-mint) has no profile → falls back to the Admin
+    // connection identity (③), also landing on admin.
+    let bare = SessionKey("web-1789871791268-87x3ps".into());
+    let legacy = bare
+        .profile_id()
+        .or(authenticated_profile_id(&AuthIdentity::Admin))
+        .or(Some("_main"));
+    assert_eq!(legacy, Some("admin"), "③: bare admin key resolves via Admin identity");
+}
+
+#[test]
+fn mint_canonical_session_key_cross_profile_does_not_regress() {
+    // Bare id minted under different profiles stays isolated per profile.
+    let a = mint_canonical_session_key(&SessionKey("web-x".into()), Some("admin")).unwrap();
+    let b = mint_canonical_session_key(&SessionKey("web-x".into()), Some("cluster-worker")).unwrap();
+    assert_eq!(a.profile_id(), Some("admin"));
+    assert_eq!(b.profile_id(), Some("cluster-worker"));
+    assert_ne!(a.0, b.0, "same raw id under different profiles must not collide");
+}
+
 #[test]
 fn skill_action_job_events_are_visible_only_to_their_profile() {
     let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(

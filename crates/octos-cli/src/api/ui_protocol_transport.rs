@@ -19006,8 +19006,29 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     methods
 }
 
-fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
-    match identity {
+/// #40 (①) + #41 裁决 (ii) kind=api: mint a CANONICAL profile-scoped session
+/// key from a BARE client id + an explicit profile id.
+///
+/// Returns `Some(canonical)` (`{profile}:api:{raw}`, topic suffix preserved)
+/// only when the id carries no profile prefix AND a profile id is given;
+/// otherwise `None` (already-canonical or no profile → leave the key as-is so
+/// legacy inference still covers it). `api` is a registered channel, so the
+/// minted key parses back via `SessionKey::profile_id()` first-hit (②) with
+/// zero new global parse-flip surface.
+fn mint_canonical_session_key(session_id: &SessionKey, profile_id: Option<&str>) -> Option<SessionKey> {
+    if session_id.profile_id().is_some() {
+        return None; // already profile-scoped
+    }
+    let pid = profile_id?;
+    let raw = session_id.base_key();
+    let minted = SessionKey::with_profile(pid, "api", raw);
+    match session_id.topic() {
+        Some(t) if !t.is_empty() => Some(SessionKey(format!("{}#{}", minted.0, t))),
+        _ => Some(minted),
+    }
+}
+
+fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {    match identity {
         AuthIdentity::User { id, .. } if !id.is_empty() => Some(id),
         AuthIdentity::User { .. } => None,
         // #40 (③): align the WS connection profile with the REST semantics —
@@ -20181,6 +20202,24 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
+
+    // #40 (①) + #41 裁决 (ii) kind=api: mint a CANONICAL profile-scoped session
+    // key when the client supplies a BARE id (no profile prefix) AND an explicit
+    // `profile_id`. The key is the single source of truth — ledger, JSONL,
+    // registry, and the open ack all use it — so the read path can resolve by
+    // `session_id.profile_id()` first (②). Form: `{profile}:api:{raw}` (kind=api,
+    // the ui-protocol service face; the raw id's `web-` prefix preserves origin).
+    // `api` is already a registered channel, so the canonical key parses back
+    // (`profile_id()` first-hit) with zero new global parse-flip surface (the
+    // rejected alternative (i) registering "web").
+    //
+    // Legacy inference stays as a fallback for existing bare keys (no data
+    // migration): only a bare id + explicit profile_id mints here.
+    if let Some(minted) = mint_canonical_session_key(&params.session_id, params.profile_id.as_deref())
+    {
+        params.session_id = minted;
+    }
+
     let ledger_profile_id = active_profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
