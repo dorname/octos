@@ -81,6 +81,16 @@
 | UT-S16-31 | api::ui_protocol_transport::tests::fallback_enabled_profile_id_returns_none_for_explicit_non_main | 缺陷 B 门形：显式非 _main profile id 不被静默 remap（未解析显式 id 仍 error，快速失败） |
 | UT-S16-32 | api::ui_protocol_transport::tests::fallback_enabled_profile_id_picks_first_enabled_for_main | 缺陷 B：裸 _main 引用在有 enabled profile 的 store 上回退到第一个 enabled（name 排序稳定）；无 store 时仍 None 保持原错误面 |
 
+## 批 6（黑板 #11 — issue #10 会话切换身份-内容绑定，三面统一修复）
+
+### UT-S16-33 ~ UT-S16-35 — octos-web vitest
+
+| ID | 测试 | 描述 |
+|----|------|------|
+| UT-S16-33 | store/projection-store-switch-race.test.ts | 切换竞态守卫：beginSnapshot 同 key 重入拒绝（慢 A 不覆盖新 B 快照），释放后可重入 |
+| UT-S16-34 | store/projection-store-hydrate-failed.test.ts | 静默失败标记：markHydrateFailed/isHydrateFailed/clearHydrateFailed 三面（失败标记而非空引导态） |
+| UT-S16-35 | runtime/hydrate-projection.test.ts · issue #10 epoch | epoch 修复：hydrate user envelope meta 含 persisted_at，渲染兜底不渲染 epoch/序号 |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

@@ -104,3 +104,6 @@
 {"id": "UT-S16-30", "status": "pass", "duration_ms": 520, "timestamp": "2026-09-21T14:20:00+08:00", "scenario": "core-S16"}
 {"id": "UT-S16-31", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T14:20:00+08:00", "scenario": "core-S16"}
 {"id": "UT-S16-32", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T14:20:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-33", "status": "pass", "duration_ms": 2, "timestamp": "2026-09-21T16:05:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-34", "status": "pass", "duration_ms": 2, "timestamp": "2026-09-21T16:05:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-35", "status": "pass", "duration_ms": 5, "timestamp": "2026-09-21T16:05:00+08:00", "scenario": "core-S16"}
