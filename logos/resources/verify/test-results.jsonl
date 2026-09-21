@@ -72,3 +72,29 @@
 {"id":"UT-S17-18","status":"pass","duration_ms":0,"timestamp":"2026-09-20T17:41:08.293711124+00:00","scenario":"S17"}
 {"id":"UT-S17-19","status":"pass","duration_ms":6,"timestamp":"2026-09-20T17:41:08.300793917+00:00","scenario":"S17"}
 {"id":"UT-S17-20","status":"pass","duration_ms":0,"timestamp":"2026-09-20T17:41:08.301265328+00:00","scenario":"S17"}
+{"id": "UT-S16-01", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-02", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-03", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-04", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-05", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-06", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-07", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-08", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-09", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-10", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-11", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-12", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-13", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-14", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-15", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-16", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-17", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-18", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-19", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-20", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-21", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-22", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-20T19:37:35+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-23", "status": "pass", "duration_ms": 4, "timestamp": "2026-09-21T10:25:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-24", "status": "pass", "duration_ms": 4, "timestamp": "2026-09-21T10:25:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-25", "status": "pass", "duration_ms": 4, "timestamp": "2026-09-21T10:25:00+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-26", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T11:00:00+08:00", "scenario": "core-S16"}
