@@ -406,9 +406,18 @@ curl -sf http://127.0.0.1:50080/health
 
 （serve 只会自动放行**容器绑定端口** 8080 的 loopback，不会自动放行 PF 端口。）
 
+**`OCTOS_APPUI_ALLOWED_ORIGINS` 语义**：逗号分隔的浏览器 Origin 白名单。
+**空 / 未设置** = 仅放行**不带 `Origin` 头**的通道（如 curl、服务器间调用、
+CLI）——浏览器发起的 WebSocket **必带 `Origin` 头**，不在白名单即被 403
+拒绝（前端表现为通用 "Unable to establish the UI Protocol connection"）。
+因此任何浏览器可达的入口（PF 端口 9091/50080、独立 web 反代 **5174**）
+都必须**显式**写入该 env；serve 只自动追加容器绑定端口 8080 的 loopback。
+该 env 在 `deploy/k8s/03-cluster-with-config.yaml` 的 Deployment 清单中
+**显式声明**（勿只 `kubectl set env` 打 live——滚动即丢，#14 实案）。
+
 ```bash
 kubectl -n octos set env deploy/octos \
-  OCTOS_APPUI_ALLOWED_ORIGINS='http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080,http://127.0.0.1:50080,http://localhost:50080'
+  OCTOS_APPUI_ALLOWED_ORIGINS='http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080,http://127.0.0.1:50080,http://localhost:50080,http://127.0.0.1:5174,http://localhost:5174'
 kubectl -n octos rollout status deploy/octos --timeout=300s
 ```
 

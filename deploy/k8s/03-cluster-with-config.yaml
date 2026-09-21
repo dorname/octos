@@ -323,9 +323,10 @@ spec:
           value: "info,octos_cli=debug,octos_store=debug"
         # Allow AppUI/WebSocket from common port-forward origins.
         # Serve auto-appends loopback for the *container* bind port (8080)
-        # only — PF ports (9091, 50080) must be listed explicitly.
+        # only — PF ports (9091, 50080) and the standalone web reverse-proxy
+        # origin (5174) must be listed explicitly.
         - name: OCTOS_APPUI_ALLOWED_ORIGINS
-          value: "http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080,http://localhost:50080,http://127.0.0.1:50080"
+          value: "http://localhost:9091,http://127.0.0.1:9091,http://localhost:8080,http://127.0.0.1:8080,http://localhost:50080,http://127.0.0.1:50080,http://127.0.0.1:5174,http://localhost:5174"
         ports:
         - containerPort: 8080
         readinessProbe:
