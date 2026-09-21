@@ -174,3 +174,18 @@
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01 至 UT-S16-12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。
 - 批 2 的 3 项 vitest 中 UT-S16-25 为 #5 专属回归（新写），UT-S16-23/24 为既有 hydrate 基础用例（同批复验时一并计入）。
+
+## 批 14（黑板 #40/#41 — 会话切换历史丢失根治:canonical profile-scoped session keys,kind=api）
+
+### UT-S16-61 / 62 / 63 / 64 / 65 — crates/octos-cli ui_protocol_transport（规范键铸造+读路径）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-61 | api::ui_protocol_transport::tests::mint_canonical_session_key_mints_for_bare_id_with_profile | 裸 web-* id+显式 profile_id → 铸造 `admin:api:web-<原id>`(kind=api),profile_id() 一级命中自洽 |
+| UT-S16-62 | api::ui_protocol_transport::tests::mint_canonical_session_key_preserves_topic_suffix | 铸造保留 topic 后缀(`admin:api:web-1#research`) |
+| UT-S16-63 | api::ui_protocol_transport::tests::mint_canonical_session_key_skips_already_scoped_or_profileless | 已 profile-scoped / 无 profile_id → 不铸造(legacy 推断覆盖) |
+| UT-S16-64 | api::ui_protocol_transport::tests::canonical_key_read_path_resolves_profile_first | ②读路径:规范键 profile_id() 一级命中 admin(非 _main);裸键+Admin 身份(③)legacy 命中 admin |
+| UT-S16-65 | api::ui_protocol_transport::tests::mint_canonical_session_key_cross_profile_does_not_regress | 同裸 id 跨 profile 铸造隔离不碰撞 |
+
+### octos-web 前端(session-context.test.ts,submodule commit 1407897)
+- sessionTimestamp 适配第三种键形 `{profile}:api:web-{ms}-{rand}` 与 uuid-v7 变体(34/34 绿)
