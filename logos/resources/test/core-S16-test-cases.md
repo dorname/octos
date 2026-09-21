@@ -137,14 +137,18 @@
 
 ## 批 11（黑板 #26 — 修复 #25 复验异议：fallback 测试密闭性，生产零改动）
 
-### UT-S16-47..51（改）+ UT-S16-52（增）— crates/octos-cli runtime::profile（密闭性）
+### UT-S16-47 / 48 / 49 / 50 / 51（改）+ UT-S16-52（增）— crates/octos-cli runtime::profile（密闭性）
 
 | ID | 测试函数 | 描述 |
 |----|----------|------|
-| UT-S16-47..51 | （同批 10 五用例） | key env 名由真实 ANTHROPIC_API_KEY 改为专有 OCTOS_TEST_FB_KEY_23（不可能存在于进程 env）——#25 复验异议：进程带真实 key 时"缺失/占位"场景被 std::env::var 污染；改专有名后密闭 |
+| UT-S16-47 | runtime::profile::tests::admin_key_fallback_fills_missing_consuming_key | key env 名由真实 ANTHROPIC_API_KEY 改为专有 OCTOS_TEST_FB_KEY_23（不可能存在于进程 env）——#25 复验异议密闭化 |
+| UT-S16-48 | runtime::profile::tests::admin_key_fallback_fills_placeholder_consuming_key | 同上：改专有 OCTOS_TEST_FB_KEY_23，占位场景不被进程 env 污染 |
+| UT-S16-49 | runtime::profile::tests::admin_key_fallback_preserves_explicit_consuming_key | 同上：改专有 OCTOS_TEST_FB_KEY_23，显式优先判定密闭 |
+| UT-S16-50 | runtime::profile::tests::admin_key_fallback_noop_when_admin_has_no_key | 同上：改专有 OCTOS_TEST_FB_KEY_23，admin 无 key no-op 密闭 |
+| UT-S16-51 | runtime::profile::tests::admin_key_fallback_skips_admin_and_keeps_seed_files_untouched | 同上：改专有 OCTOS_TEST_FB_KEY_23，admin 自身不回退+种子字节不动密闭 |
 | UT-S16-52 | runtime::profile::tests::admin_key_fallback_is_hermetic_to_process_env | 密闭性回归：fallback 只读 config.api_key_env（测试专有名），从不读 provider 默认进程 env——导出真实 ANTHROPIC_API_KEY=sk-real 下回退仍正确触发 |
 
 ## 备注
-- 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
+- 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01 至 UT-S16-12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。
 - 批 2 的 3 项 vitest 中 UT-S16-25 为 #5 专属回归（新写），UT-S16-23/24 为既有 hydrate 基础用例（同批复验时一并计入）。
