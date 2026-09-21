@@ -3986,7 +3986,7 @@ fn redact_ledger_event_secrets(event: &mut UiProtocolLedgerEvent) {
     redact_ui_notification_secrets(notification);
 }
 
-fn encode_session_dir_name(session_id: &SessionKey) -> String {
+pub(crate) fn encode_session_dir_name(session_id: &SessionKey) -> String {
     let mut out = String::with_capacity(session_id.0.len() * 2);
     for byte in session_id.0.as_bytes() {
         out.push_str(&format!("{:02x}", byte));

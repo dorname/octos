@@ -15488,6 +15488,62 @@ fn mint_canonical_session_key_is_idempotent_at_entrypoints() {
     assert_eq!(via_conn.0, once.0, "Admin-identity and explicit-profile mints agree");
 }
 
+// ── Issue #46: mint respects legacy data (键跟数据走) ───────────────────────
+
+#[test]
+fn legacy_data_exists_when_ledger_dir_present() {
+    // UT-S16-67: bare key with a ui-protocol ledger dir → data exists → skip mint.
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = SessionKey("web-1789871791268-87x3ps".into());
+    let ledger_dir = tmp
+        .path()
+        .join("ui-protocol")
+        .join(crate::api::ui_protocol_ledger::encode_session_dir_name(&bare));
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    assert!(legacy_session_data_exists(Some(tmp.path()), None, &bare));
+}
+
+#[test]
+fn legacy_data_exists_when_jsonl_present_without_ledger() {
+    // UT-S16-68: bare key with a sessions JSONL but NO ledger dir → still data.
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = SessionKey("web-legacy-only".into());
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let jsonl = sessions_dir.join(format!(
+        "{}.jsonl",
+        octos_bus::session::encode_path_component(&bare.0)
+    ));
+    std::fs::write(&jsonl, "{}\n").unwrap();
+    // ledger root absent (None) — JSONL alone must mark the key as having data.
+    assert!(legacy_session_data_exists(None, Some(tmp.path()), &bare));
+}
+
+#[test]
+fn legacy_data_absent_for_brand_new_key() {
+    // UT-S16-69: brand-new bare key (no ledger dir, no JSONL) → no data → mint.
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = SessionKey("web-brand-new".into());
+    assert!(!legacy_session_data_exists(Some(tmp.path()), Some(tmp.path()), &bare));
+}
+
+#[test]
+fn legacy_data_lookup_does_not_match_canonical_key() {
+    // UT-S16-70: the probe keys off the BARE key. A canonical key's data must not
+    // mark a different bare key as having data (and vice versa) — no cross-key bleed.
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = SessionKey("web-a".into());
+    let canonical = SessionKey("admin:api:web-a".into());
+    // Data exists for the canonical key only.
+    let ledger_dir = tmp
+        .path()
+        .join("ui-protocol")
+        .join(crate::api::ui_protocol_ledger::encode_session_dir_name(&canonical));
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    assert!(!legacy_session_data_exists(Some(tmp.path()), None, &bare));
+    assert!(legacy_session_data_exists(Some(tmp.path()), None, &canonical));
+}
+
 #[test]
 fn skill_action_job_events_are_visible_only_to_their_profile() {
     let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(

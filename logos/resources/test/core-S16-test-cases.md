@@ -193,3 +193,9 @@
 ### 批 14 续（#43 — cross-profile scope 测试适配 + 五入口规范化）
 - cold_scope 5 case 适配规范键语义(历史 case 证据键=`{profile}:api:{raw}`,no-history 保留裸键 legacy)——裁决 a 两世界钉住
 - UT-S16-66: mint_canonical_session_key_is_idempotent_at_entrypoints(五入口幂等+Admin身份与显式profile铸造一致)
+
+### 批 14 续2(#46 — mint 尊重存量数据,键跟数据走)
+- UT-S16-67: legacy_data_exists_when_ledger_dir_present(裸键有 ledger 目录→不铸造)
+- UT-S16-68: legacy_data_exists_when_jsonl_present_without_ledger(有 JSONL 无 ledger→不铸造)
+- UT-S16-69: legacy_data_absent_for_brand_new_key(全新裸键→铸造)
+- UT-S16-70: legacy_data_lookup_does_not_match_canonical_key(裸/规范键探测隔离不互染)

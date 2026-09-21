@@ -19006,8 +19006,7 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     methods
 }
 
-/// #40 (①) + #41 裁决 (ii) kind=api: mint a CANONICAL profile-scoped session
-/// key from a BARE client id + an explicit profile id.
+/// #40 (①) + #41 裁决 (ii) kind=api: mint a CANONICAL profile-scoped session/// key from a BARE client id + an explicit profile id.
 ///
 /// Returns `Some(canonical)` (`{profile}:api:{raw}`, topic suffix preserved)
 /// only when the id carries no profile prefix AND a profile id is given;
@@ -19015,6 +19014,40 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
 /// legacy inference still covers it). `api` is a registered channel, so the
 /// minted key parses back via `SessionKey::profile_id()` first-hit (②) with
 /// zero new global parse-flip surface.
+/// #46: does the bare session key already have on-disk data under this
+/// profile? "键跟数据走" — if a legacy bare key has a ui-protocol ledger dir
+/// (`<ledger_root>/ui-protocol/<hex(bare)>`) OR a sessions JSONL
+/// (`<profile_data>/sessions/<encoded(bare)>.jsonl`), the open must NOT mint a
+/// canonical key (minting would orphan the existing data → hydrate replays 0).
+/// Pure path probing, injected roots → hermetic tests. No read-side translation
+/// layer (rejected, same as the #41 guard-mapping veto).
+fn legacy_session_data_exists(
+    ledger_data_dir: Option<&Path>,
+    profile_data_dir: Option<&Path>,
+    bare_key: &SessionKey,
+) -> bool {
+    if let Some(root) = ledger_data_dir {
+        let dir = root
+            .join("ui-protocol")
+            .join(super::ui_protocol_ledger::encode_session_dir_name(bare_key));
+        if dir.is_dir() {
+            return true;
+        }
+    }
+    if let Some(pdata) = profile_data_dir {
+        let sessions_dir = pdata.join("sessions");
+        // sessions JSONL filename = percent-encoded key (encode_path_component).
+        let jsonl = sessions_dir.join(format!(
+            "{}.jsonl",
+            octos_bus::session::encode_path_component(&bare_key.0)
+        ));
+        if jsonl.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 fn mint_canonical_session_key(session_id: &SessionKey, profile_id: Option<&str>) -> Option<SessionKey> {
     if session_id.profile_id().is_some() {
         return None; // already profile-scoped
@@ -20217,16 +20250,33 @@ async fn open_session_result(
     // migration): only a bare id + explicit profile_id mints here.
     if let Some(minted) = mint_canonical_session_key(&params.session_id, params.profile_id.as_deref())
     {
-        // Keep the resume cursor consistent: `validate_cursor_stream` requires
-        // `after.stream == session_id.0`, so a minted key must re-point the
-        // cursor's stream to the canonical key or open fails with
-        // cursor_stream_mismatch.
-        if let Some(after) = params.after.as_mut() {
-            if after.stream == params.session_id.0 {
-                after.stream = minted.0.clone();
+        // #46 (键跟数据走): skip minting when the bare key ALREADY has on-disk
+        // data under this profile (legacy ledger dir / sessions JSONL) — minting
+        // would orphan it (hydrate replays 0). Only brand-new sessions mint.
+        let ledger_root = state
+            .ui_protocol
+            .ledger
+            .get()
+            .and_then(|l| l.config_data_dir());
+        let profile_data = resolve_session_profile_runtime(state, active_profile_id.as_deref())
+            .map(|rt| rt.data_dir.clone());
+        let has_legacy = legacy_session_data_exists(
+            ledger_root.as_deref(),
+            profile_data.as_deref(),
+            &params.session_id,
+        );
+        if !has_legacy {
+            // Keep the resume cursor consistent: `validate_cursor_stream` requires
+            // `after.stream == session_id.0`, so a minted key must re-point the
+            // cursor's stream to the canonical key or open fails with
+            // cursor_stream_mismatch.
+            if let Some(after) = params.after.as_mut() {
+                if after.stream == params.session_id.0 {
+                    after.stream = minted.0.clone();
+                }
             }
+            params.session_id = minted;
         }
-        params.session_id = minted;
     }
 
     let ledger_profile_id = active_profile_id
