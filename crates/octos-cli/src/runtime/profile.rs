@@ -212,6 +212,106 @@ pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvid
     }
 }
 
+/// By-family key-env candidate set for a provider, most-specific first
+/// (dedup): the route's configured `api_key_env`, then the family's canonical
+/// `ENTRY.api_key_env`, then `key_env_aliases`. Shared by the self-resolution
+/// (#35) and the cross-profile admin fallback (#23/#31).
+fn by_family_key_candidates(key_var: &str, provider_name: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = vec![key_var.to_string()];
+    if let Some(entry) = octos_llm::registry::lookup(provider_name) {
+        if let Some(canonical) = entry.api_key_env {
+            candidates.push(canonical.to_string());
+        }
+        for alias in entry.key_env_aliases {
+            candidates.push((*alias).to_string());
+        }
+    }
+    candidates.dedup();
+    candidates
+}
+
+/// Issue #35 (治本 a′): SELF by-family key resolution for ANY profile (admin
+/// included).
+///
+/// #34 root cause: the UI save writes admin.json with a self-inconsistent
+/// naming — the route declares `api_key_env=ANTHROPIC_API_KEY` (named after
+/// `api_type=anthropic`) while the key value is stored under
+/// `env_vars.MINIMAX_API_KEY` (the family canonical name). The cross-profile
+/// fallback (#23/#31) excludes admin as a target, so admin's OWN chain never
+/// resolves a key (route name missing in admin.env_vars, process env a
+/// REPLACE_ME placeholder) → 401. cluster-worker was unaffected (#33).
+///
+/// For ANY profile, if the route's declared `api_key_env` is missing/placeholder
+/// in the profile's OWN `env_vars`, but a same-family candidate name (canonical
+/// `ENTRY.api_key_env` + `key_env_aliases`, dedup, route-name first) holds a real
+/// key in the SAME env_vars → inject it under the route's declared name.
+///
+/// Semantics (proposal `ui-key-self-family-resolution`, operator 裁定仅治本 a′):
+/// - Runs BEFORE / independent of the #23 cross-profile fallback; admin is no
+///   longer excluded (self-resolution applies to admin).
+/// - **Explicit-key-wins** unchanged: a real key under the route name (env_vars
+///   or process env) is never overridden.
+/// - Successful injection logs a `warn!` with the matched name + family, never
+///   the key value.
+/// - **In-memory Config only** — never writes seed/override (#13/#15/#20).
+/// - #23/#31 cross-profile fallback is preserved as-is (still fires when the
+///   profile's own env_vars has no key at all).
+///
+/// Real case: admin.json route ANTHROPIC_API_KEY vs stored MINIMAX_API_KEY
+/// (minimax-token family).
+fn apply_self_family_key_resolution(
+    profile: &crate::profiles::UserProfile,
+    provider_name: &str,
+    config: &mut Config,
+) {
+    // The route's declared key env name (configured, else the provider default).
+    let Some(key_var) = config
+        .api_key_env
+        .clone()
+        .or_else(|| Config::provider_default_env_var(provider_name))
+    else {
+        return;
+    };
+
+    // Explicit-key-wins: a real key already resolvable under the route name
+    // (own env_vars or process env) is never overridden.
+    let own = config
+        .env_vars
+        .get(&key_var)
+        .cloned()
+        .or_else(|| std::env::var(&key_var).ok());
+    if let Some(value) = own {
+        if !is_placeholder_key(&value) {
+            return;
+        }
+    }
+
+    // Self by-family lookup in the profile's OWN env_vars: first non-placeholder
+    // candidate under a DIFFERENT name than the route's wins (the route name
+    // itself was already shown missing/placeholder above).
+    let candidates = by_family_key_candidates(&key_var, provider_name);
+    let hit = candidates.iter().filter(|name| *name != &key_var).find_map(|name| {
+        config
+            .env_vars
+            .get(name)
+            .filter(|v| !is_placeholder_key(v))
+            .map(|v| (name.clone(), v.clone()))
+    });
+    let Some((hit_name, key)) = hit else {
+        return;
+    };
+
+    tracing::warn!(
+        profile = %profile.id,
+        provider = %provider_name,
+        key_env = %key_var,
+        matched_env = %hit_name,
+        "profile LLM key under a family-canonical name, not the route-declared \
+         name — self-resolving by provider family (#35 治本 a′)"
+    );
+    config.env_vars.insert(key_var, key);
+}
+
 /// Issue #23 (方案 a): admin-profile LLM key fallback for the CONSUMING profile.
 ///
 /// Structural gap: the UI "API Keys" panel writes to the **admin** profile
@@ -1160,6 +1260,16 @@ impl ProfileRuntime {
                 eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
             })?;
 
+        // #35 (治本 a′): SELF by-family key resolution runs FIRST, for ANY
+        // profile (admin included) — if the route's declared api_key_env is
+        // missing/placeholder in the profile's OWN env_vars but a same-family
+        // candidate holds a real key, inject it under the route name. This
+        // resolves the admin self-inconsistent naming (#34: route
+        // ANTHROPIC_API_KEY vs stored MINIMAX_API_KEY) without depending on the
+        // cross-profile fallback (which excludes admin). See
+        // `apply_self_family_key_resolution` docs.
+        apply_self_family_key_resolution(profile, &provider_name, &mut config);
+
         // #23 (方案 a): when the CONSUMING profile (e.g. the k8s cluster-worker
         // that sessions run as) has its LLM key missing or placeholder
         // (REPLACE_ME / empty), fall back to the SAME provider's key from the
@@ -1173,6 +1283,8 @@ impl ProfileRuntime {
         // files — it only injects the resolved key into the in-memory Config
         // env_vars for this bootstrap, preserving the #13/#15/#20 read-only
         // seed semantics. Observable: a warn is logged on a successful fallback.
+        // Preserved as-is (#35): still fires when the profile's own env_vars has
+        // no key at all after self-resolution.
         apply_admin_llm_key_fallback(profile, data_dir, &provider_name, &mut config);
 
         // Step 3: build the LLM provider chain.
@@ -3601,6 +3713,99 @@ mod tests {
         assert!(
             config.env_vars.get("OCTOS_TEST_FB_KEY_31").is_none(),
             "admin with no candidate key must no-op (the missing-key error surfaces downstream)"
+        );
+    }
+
+    // ── Issue #35 (治本 a′): SELF by-family key resolution (admin included) ──
+    //
+    // #34 root cause: UI save wrote admin.json self-inconsistently — route
+    // declares api_key_env=ANTHROPIC_API_KEY (after api_type) but stores the key
+    // under env_vars.MINIMAX_API_KEY (family canonical). The cross-profile
+    // fallback excludes admin, so admin's own chain never resolved → 401.
+    // Self-resolution reads ONLY the profile's own env_vars (never the process
+    // env for the SOURCE), keyed on test-only names where possible. The
+    // candidate set uses the real registry family (minimax-token → MINIMAX_API_KEY),
+    // so MINIMAX_API_KEY appears as an env_vars map KEY — never read from the
+    // process env by self-resolution (hermetic under any real exported key).
+
+    #[test]
+    fn self_family_resolution_injects_when_route_name_mismatch() {
+        // UT-S16-57: #34 iron-proof in case — admin's OWN env_vars holds the key
+        // under the family canonical MINIMAX_API_KEY, while the route declares
+        // the test-only OCTOS_TEST_SELF_35 (protocol-shaped override). Literal
+        // name misses; self by-family resolution must inject the canonical key
+        // under the route name — for ADMIN itself (no longer excluded).
+        let profile = fallback_profile("admin", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("MINIMAX_API_KEY".to_string(), "sk-self-minimax".to_string());
+        let mut config = fallback_config_for_family("minimax-token", "OCTOS_TEST_SELF_35", own);
+
+        apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            Some("sk-self-minimax"),
+            "self by-family resolution must inject the family-canonical key under \
+             the route-declared name — including for the admin profile (#34)"
+        );
+    }
+
+    #[test]
+    fn self_family_resolution_noop_when_route_name_has_real_key() {
+        // UT-S16-58: route name already holds a REAL key → no-op (explicit-key
+        // -wins; the family canonical is never consulted to override it).
+        let profile = fallback_profile("admin", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("OCTOS_TEST_SELF_35".to_string(), "sk-explicit".to_string());
+        own.insert("MINIMAX_API_KEY".to_string(), "sk-should-not-win".to_string());
+        let mut config = fallback_config_for_family("minimax-token", "OCTOS_TEST_SELF_35", own);
+
+        apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            Some("sk-explicit"),
+            "an explicit key under the route name must win; family canonical must not override"
+        );
+    }
+
+    #[test]
+    fn self_family_resolution_noop_when_no_family_candidate() {
+        // UT-S16-59: own env_vars has NO family candidate key at all → no-op,
+        // nothing injected; the missing-key error surfaces downstream unchanged
+        // (never silent).
+        let profile = fallback_profile("admin", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("UNRELATED".to_string(), "sk-other".to_string());
+        let mut config = fallback_config_for_family("minimax-token", "OCTOS_TEST_SELF_35", own);
+
+        apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
+
+        assert!(
+            config.env_vars.get("OCTOS_TEST_SELF_35").is_none(),
+            "no family candidate key → no-op (missing-key error surfaces downstream)"
+        );
+    }
+
+    #[test]
+    fn self_family_resolution_skips_placeholder_candidates() {
+        // UT-S16-60: route name AND one family candidate are REPLACE_ME
+        // placeholders, another candidate holds the real key → skip placeholders,
+        // inject the real one (placeholders never injected). minimax-token's
+        // candidate set is [route-name, MINIMAX_API_KEY]; we make the route name
+        // placeholder and MINIMAX_API_KEY real.
+        let profile = fallback_profile("admin", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("OCTOS_TEST_SELF_35".to_string(), "REPLACE_ME".to_string());
+        own.insert("MINIMAX_API_KEY".to_string(), "sk-real-minimax".to_string());
+        let mut config = fallback_config_for_family("minimax-token", "OCTOS_TEST_SELF_35", own);
+
+        apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            Some("sk-real-minimax"),
+            "placeholder route name must be skipped; the real family-canonical key injected"
         );
     }
 }

@@ -159,6 +159,17 @@
 | UT-S16-55 | runtime::profile::tests::admin_key_fallback_skips_placeholder_candidates | 路由名候选=REPLACE_ME 占位、族规范名真实 → 跳过占位命中族规范名（占位不注入） |
 | UT-S16-56 | runtime::profile::tests::admin_key_fallback_noop_when_no_candidate_has_key | admin 无任何候选 key → no-op 不静默，缺失错误下游照常报 |
 
+## 批 13（黑板 #35 — 治本 a′：服务端自体 by-family key 解析，admin 含）
+
+### UT-S16-57 / 58 / 59 / 60 — crates/octos-cli runtime::profile（自体 by-family 解析）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-57 | runtime::profile::tests::self_family_resolution_injects_when_route_name_mismatch | **#34 铁证入案**：admin 自身 env_vars 存族规范名 MINIMAX_API_KEY、路由声明 OCTOS_TEST_SELF_35（协议覆盖名）→ 字面名 miss，自体 by-family 注入族规范 key 到路由名下（admin 不再被排除） |
+| UT-S16-58 | runtime::profile::tests::self_family_resolution_noop_when_route_name_has_real_key | 路由名已有真实 key → no-op（显式优先，族规范名不覆盖） |
+| UT-S16-59 | runtime::profile::tests::self_family_resolution_noop_when_no_family_candidate | 自身无任何族候选 key → no-op 不注入，缺失错误下游照常报 |
+| UT-S16-60 | runtime::profile::tests::self_family_resolution_skips_placeholder_candidates | 路由名=REPLACE_ME 占位、族规范名真实 → 跳过占位注入真实 key |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01 至 UT-S16-12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。
