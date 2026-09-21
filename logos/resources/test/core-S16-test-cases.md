@@ -114,6 +114,15 @@
 | UT-S16-43 | profiles::tests::probe_readonly_reports_writable_for_normal_path | 可写路径判可写：save 写 seed 不产生 override（保留 UT-S16-40 语义） |
 | UT-S16-44 | profiles::tests::probe_readonly_cleans_up_probe_file | 写探测后 `.probe-readonly-*` 临时文件被清理（可写与只读两路径都不残留） |
 
+## 批 9（黑板 #20 — 修复 #15 写探测盲区：目录可写 + subPath 单文件只读）
+
+### UT-S16-45 ~ UT-S16-46 — crates/octos-cli profiles（目标文件写探测）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-45 | profiles::tests::probe_readonly_detects_subpath_file_ro_dir_writable | **subPath 盲区**（目录 0755 可写 + 目标文件 0444 只读）判只读：save 改写 override 而非 rename ro 种子——#19 铁证入案，#15 目录探测误判此形；root 跳过 |
+| UT-S16-46 | profiles::tests::probe_readonly_target_probe_does_not_modify_seed | 目标文件 write(true) 探测不 create/truncate/写字节：探测前后 seed 内容字节不变 |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

@@ -2214,6 +2214,36 @@ fn current_euid_is_root() -> bool {
 /// Any other error (missing dir, etc.) returns false so the normal save path
 /// is not blocked by an unrelated I/O hiccup.
 fn probe_readonly_fs(path: &std::path::Path) -> bool {
+    // #20 (fix the #15 blind spot): probe the TARGET FILE ITSELF first, not
+    // just the parent dir. k8s ConfigMap subPath mounts are "dir writable +
+    // single file read-only" (#19 live proof: the profiles dir accepts touch,
+    // yet cluster-worker.json is a separate `ro` mount entry and `echo >>`
+    // fails with EROFS). Probing only the parent dir misjudges this shape as
+    // writable → save rename()s the seed → EROFS. Opening the seed path
+    // itself with write(true) (no create, no truncate) fails with EROFS on a
+    // subPath ro mount, PermissionDenied on chmod-444 — one probe covers all
+    // three read-only shapes (chmod-444 / mount-ro dir / subPath ro file).
+    if path.exists() {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            // Writable — the handle drops here with no bytes written (we never
+            // truncate), so the seed content is untouched.
+            Ok(_) => return false,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+                ) {
+                    return true;
+                }
+                // Other errors (e.g. NotFound raced away) fall through to the
+                // dir probe below as a conservative fallback.
+            }
+        }
+    }
+    // Fallback: the target file does not exist (new seed) or could not be
+    // opened directly — probe the parent DIR by creating a temp file. This
+    // covers "save a brand-new profile into a read-only dir" (mount-ro dir),
+    // where there is no seed file to open yet.
     let Some(parent) = path.parent() else {
         return false;
     };
@@ -7531,6 +7561,69 @@ mod tests {
             leftover.is_empty(),
             "probe must not leave .probe-readonly-* files: {leftover:?}"
         );
+    }
+
+    #[test]
+    fn probe_readonly_detects_subpath_file_ro_dir_writable() {
+        // Root bypasses permission bits (chmod 0444 is a no-op for uid 0), so
+        // the read-only simulation cannot work — skip like the root-noise
+        // convention (#4 outer note / #15). Probe logic is environment-
+        // independent; these asserts run on CI/non-root.
+        if current_euid_is_root() {
+            eprintln!("skipping probe_readonly_detects_subpath_file_ro_dir_writable under root (permission-bit mock is a no-op for uid 0)");
+            return;
+        }
+        // UT-S16-45: the #19 blind spot — a WRITABLE directory (0755) but a
+        // READ-ONLY target FILE, the k8s ConfigMap subPath shape. The #15
+        // dir-only probe misjudged this as writable (dir accepts a temp file)
+        // → save rename()d the seed → EROFS. The target-file probe must now
+        // report read-only and save must redirect to override.
+        //
+        // Simulated with dir=0755 (writable) + file=0444 (read-only). On a
+        // real subPath mount the file is ro at the FS layer; chmod-0444 is the
+        // closest portable stand-in that also denies a write open with
+        // PermissionDenied (the probe treats both as read-only).
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cwsub");
+        write_json(
+            &seed_path,
+            &serde_json::to_value(seed_profile("cwsub", "moonshot-coding")).unwrap(),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // File read-only, DIR STAYS WRITABLE — the subPath shape (#19).
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            probe_readonly_fs(&seed_path),
+            "dir-writable + file-read-only (subPath shape) must probe as read-only — \
+             the #15 dir-only probe missed this (#19 gap)"
+        );
+        let mut ui = seed_profile("cwsub", "minimax-token");
+        ui.config.env_vars.insert("K".into(), "v".into());
+        store.save(&ui).unwrap();
+        assert!(
+            store.profile_override_path("cwsub").exists(),
+            "save to a subPath-style ro seed must redirect to override (not rename the ro seed)"
+        );
+    }
+
+    #[test]
+    fn probe_readonly_target_probe_does_not_modify_seed() {
+        // UT-S16-46: the target-file write-open probe must NOT alter the seed
+        // content — open is write(true) with no truncate and no bytes written.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let seed_path = store.profile_path("cwintact");
+        let original = serde_json::to_value(seed_profile("cwintact", "anthropic")).unwrap();
+        write_json(&seed_path, &original);
+        let before = std::fs::read_to_string(&seed_path).unwrap();
+        let _ = probe_readonly_fs(&seed_path); // writable path → target probe opens write(true)
+        let after = std::fs::read_to_string(&seed_path).unwrap();
+        assert_eq!(before, after, "write-open probe must not modify seed content");
     }
 
 }
