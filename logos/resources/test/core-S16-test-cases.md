@@ -123,6 +123,18 @@
 | UT-S16-45 | profiles::tests::probe_readonly_detects_subpath_file_ro_dir_writable | **subPath 盲区**（目录 0755 可写 + 目标文件 0444 只读）判只读：save 改写 override 而非 rename ro 种子——#19 铁证入案，#15 目录探测误判此形；root 跳过 |
 | UT-S16-46 | profiles::tests::probe_readonly_target_probe_does_not_modify_seed | 目标文件 write(true) 探测不 create/truncate/写字节：探测前后 seed 内容字节不变 |
 
+## 批 10（黑板 #23 — issue #11 第三层缺口：admin profile LLM key 回退，方案 a）
+
+### UT-S16-47 ~ UT-S16-51 — crates/octos-cli runtime::profile（admin key 回退）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-47 | runtime::profile::tests::admin_key_fallback_fills_missing_consuming_key | 消费 profile key env 缺失 → 回退 admin 同 provider key 注入 env_vars |
+| UT-S16-48 | runtime::profile::tests::admin_key_fallback_fills_placeholder_consuming_key | key env=REPLACE_ME 占位（CM 种子值）→ 视为缺失回退 admin key |
+| UT-S16-49 | runtime::profile::tests::admin_key_fallback_preserves_explicit_consuming_key | 消费 profile 显式真实 key → 不被回退覆盖（显式优先） |
+| UT-S16-50 | runtime::profile::tests::admin_key_fallback_noop_when_admin_has_no_key | admin 也无 key → 回退 no-op，缺失错误下游照常报（不静默） |
+| UT-S16-51 | runtime::profile::tests::admin_key_fallback_skips_admin_and_keeps_seed_files_untouched | admin 自身不回退；回退只注入内存 Config，种子/override/admin.json 字节不动（只读语义保留） |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

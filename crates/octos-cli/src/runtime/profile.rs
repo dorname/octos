@@ -212,6 +212,108 @@ pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvid
     }
 }
 
+/// Issue #23 (方案 a): admin-profile LLM key fallback for the CONSUMING profile.
+///
+/// Structural gap: the UI "API Keys" panel writes to the **admin** profile
+/// (`PUT /api/my/profile` → `resolve_my_profile_id` Admin → `ADMIN_PROFILE_ID`),
+/// but sessions run as `DEFAULT_PROFILE` (e.g. `cluster-worker` in k8s). A
+/// consuming profile whose LLM key env var is missing or a placeholder
+/// (`REPLACE_ME` / empty) therefore never sees the UI-supplied key — "UI 配 key
+/// 即用" (issue #11) is unreachable. This fallback reads the SAME provider's key
+/// from the `admin` profile and injects it into the consuming profile's
+/// in-memory `Config.env_vars` for this bootstrap.
+///
+/// Semantics (proposal `ui-key-fallback-admin-profile`):
+/// - **Explicit-key-wins**: a consuming profile with a real (non-placeholder)
+///   key in its env_vars, keychain, or process env is never overridden.
+/// - **Observable**: a `warn!` is logged on a successful fallback.
+/// - **admin without key → error surfaces downstream unchanged** (no silent
+///   no-op masking a genuinely unconfigured deployment).
+/// - **Seed/overlay untouched**: the key is injected into the in-memory Config
+///   only — never written to the (possibly read-only subPath-mounted) seed or
+///   the override file, preserving the #13/#15/#20 read-only seed semantics.
+///
+/// No-op for the admin profile itself, and when the admin profile or its key
+/// cannot be read (the downstream resolver then reports the original
+/// missing-key error, unchanged).
+fn apply_admin_llm_key_fallback(
+    profile: &crate::profiles::UserProfile,
+    data_dir: &Path,
+    provider_name: &str,
+    config: &mut Config,
+) {
+    use crate::api::auth_handlers::ADMIN_PROFILE_ID;
+
+    // The admin profile is the fallback SOURCE, never a fallback target.
+    if profile.id == ADMIN_PROFILE_ID {
+        return;
+    }
+
+    // The effective key env-var name for this provider: the configured
+    // `api_key_env` if set, else the provider's registry default.
+    let Some(key_var) = config
+        .api_key_env
+        .clone()
+        .or_else(|| Config::provider_default_env_var(provider_name))
+    else {
+        return;
+    };
+
+    // Explicit-key-wins: a real (non-placeholder) key already resolvable from
+    // the consuming profile's own env_vars or the process env never falls back.
+    let own = config
+        .env_vars
+        .get(&key_var)
+        .cloned()
+        .or_else(|| std::env::var(&key_var).ok());
+    if let Some(value) = own {
+        if !is_placeholder_key(&value) {
+            return;
+        }
+    }
+
+    // Read the admin profile from the SAME profiles root. `data_dir` is the
+    // per-profile `<root>/profiles/<id>/data` runtime tree, and
+    // `ProfileStore::open_unified(root)` registers profiles under
+    // `<root>/profiles/`. So the store root is data_dir's GREAT-GRAND-parent:
+    // data_dir → <id> → profiles → root.
+    let Some(store_root) = data_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    else {
+        return;
+    };
+    let Ok(store) = crate::profiles::ProfileStore::open_unified(store_root) else {
+        return;
+    };
+    let Ok(Some(admin)) = store.get(ADMIN_PROFILE_ID) else {
+        return;
+    };
+    let Some(admin_key) = admin.config.env_vars.get(&key_var).cloned() else {
+        return;
+    };
+    if is_placeholder_key(&admin_key) {
+        return;
+    }
+
+    tracing::warn!(
+        consuming_profile = %profile.id,
+        provider = %provider_name,
+        key_env = %key_var,
+        "consuming profile LLM key missing/placeholder — falling back to the \
+         admin profile's key for this provider (#23 方案 a)"
+    );
+    config.env_vars.insert(key_var, admin_key);
+}
+
+/// A credential value that carries no real key: empty/whitespace, or the
+/// ConfigMap seed placeholder `REPLACE_ME` (issue #11 k8s seed ships this).
+fn is_placeholder_key(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty() || v.eq_ignore_ascii_case("REPLACE_ME")
+}
+
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
 ///
@@ -999,7 +1101,7 @@ impl ProfileRuntime {
         data_dir: &Path,
         octos_home: Option<&Path>,
         role: BootstrapRole,
-        config: Config,
+        mut config: Config,
         host_voice: Option<&crate::config::VoiceConfig>,
         no_retry: bool,
         provider_override: Option<Arc<dyn LlmProvider>>,
@@ -1028,6 +1130,21 @@ impl ProfileRuntime {
             .ok_or_else(|| {
                 eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
             })?;
+
+        // #23 (方案 a): when the CONSUMING profile (e.g. the k8s cluster-worker
+        // that sessions run as) has its LLM key missing or placeholder
+        // (REPLACE_ME / empty), fall back to the SAME provider's key from the
+        // `admin` profile — the actual landing point of the UI "API Keys" panel
+        // (`PUT /api/my/profile` → `resolve_my_profile_id` Admin → admin). This
+        // closes the structural gap where the UI-supplied key never reaches the
+        // consuming profile, making "UI 配 key 即用" (issue #11) reachable.
+        //
+        // Explicit-key-wins: a consuming profile with a real (non-placeholder)
+        // key is never overridden. Fallback never touches the seed/overlay
+        // files — it only injects the resolved key into the in-memory Config
+        // env_vars for this bootstrap, preserving the #13/#15/#20 read-only
+        // seed semantics. Observable: a warn is logged on a successful fallback.
+        apply_admin_llm_key_fallback(profile, data_dir, &provider_name, &mut config);
 
         // Step 3: build the LLM provider chain.
         let base_provider = match provider_override {
@@ -3125,5 +3242,178 @@ mod tests {
             "unset lane api_key_env must fail the lane build (fail-open to the \
              session provider), not fall back to the auth store's credential",
         );
+    }
+
+    // ── Issue #23 (方案 a): admin-profile LLM key fallback ──────────────────
+    //
+    // Helpers build a profiles root with an `admin` profile carrying a real
+    // key, plus a consuming profile (e.g. cluster-worker) whose key env var is
+    // missing / placeholder / explicit. `apply_admin_llm_key_fallback` is the
+    // pure decision point — these tests never drive `create_provider` (which
+    // would need a live key), only the env_vars injection semantics.
+
+    /// Build a `UserProfile` shell with the given id + env_vars.
+    fn fallback_profile(id: &str, env_vars: HashMap<String, String>) -> UserProfile {
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                env_vars,
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Write `admin.json` (with `admin_env`) into a fresh profiles root and
+    /// return `(tempdir, profiles_root, data_dir)` where data_dir is the
+    /// consuming profile's `<root>/<id>/data`.
+    fn fallback_setup(
+        consuming_id: &str,
+        admin_env: HashMap<String, String>,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("profiles");
+        let admin = fallback_profile("admin", admin_env);
+        let store = crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap();
+        store.save(&admin).unwrap();
+        let data_dir = root.join(consuming_id).join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        (tmp, root, data_dir)
+    }
+
+    /// A `Config` for `provider` whose `api_key_env`/`env_vars` are set as given.
+    fn fallback_config(key_var: &str, env_vars: HashMap<String, String>) -> Config {
+        Config {
+            provider: Some("anthropic".to_string()),
+            api_key_env: Some(key_var.to_string()),
+            env_vars,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn admin_key_fallback_fills_missing_consuming_key() {
+        // UT-S16-47: consuming profile (cluster-worker) key env MISSING →
+        // fall back to admin's key, injected into env_vars.
+        let mut admin_env = HashMap::new();
+        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-admin-real"),
+            "missing consuming key must fall back to the admin profile key"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_fills_placeholder_consuming_key() {
+        // UT-S16-48: consuming profile key env = REPLACE_ME placeholder (the
+        // k8s ConfigMap seed value) → fall back to admin's real key.
+        let mut admin_env = HashMap::new();
+        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("ANTHROPIC_API_KEY".to_string(), "REPLACE_ME".to_string());
+        let mut config = fallback_config("ANTHROPIC_API_KEY", own);
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-admin-real"),
+            "REPLACE_ME placeholder must be treated as missing and fall back"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_preserves_explicit_consuming_key() {
+        // UT-S16-49: consuming profile has a REAL explicit key → never
+        // overridden by the admin fallback (explicit-key-wins).
+        let mut admin_env = HashMap::new();
+        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut own = HashMap::new();
+        own.insert("ANTHROPIC_API_KEY".to_string(), "sk-worker-explicit".to_string());
+        let mut config = fallback_config("ANTHROPIC_API_KEY", own);
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-worker-explicit"),
+            "an explicit consuming key must win over the admin fallback"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_noop_when_admin_has_no_key() {
+        // UT-S16-50: admin profile has no usable key either → fallback is a
+        // no-op (the consuming key stays missing; the downstream resolver then
+        // reports the original missing-key error — never a silent success).
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", HashMap::new());
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+
+        assert!(
+            config.env_vars.get("ANTHROPIC_API_KEY").is_none(),
+            "admin without a key must not inject anything (error surfaces downstream)"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_skips_admin_and_keeps_seed_files_untouched() {
+        // UT-S16-51: (i) the admin profile itself is never a fallback target;
+        // (ii) fallback never writes to disk — the consuming seed/override and
+        // admin.json bytes are unchanged (read-only seed semantics preserved).
+        let mut admin_env = HashMap::new();
+        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        let (tmp, root, data_dir) = fallback_setup("cluster-worker", admin_env);
+
+        // (i) admin profile is a fallback SOURCE, never a target.
+        let admin_profile = fallback_profile("admin", HashMap::new());
+        let mut admin_config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        apply_admin_llm_key_fallback(&admin_profile, &data_dir, "anthropic", &mut admin_config);
+        assert!(
+            admin_config.env_vars.get("ANTHROPIC_API_KEY").is_none(),
+            "the admin profile must never fall back to itself"
+        );
+
+        // (ii) a real fallback injects ONLY into the in-memory Config.
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+        assert_eq!(
+            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-admin-real")
+        );
+        // Seed/override/admin.json bytes unchanged on disk.
+        let admin_path = root.join("admin.json");
+        let admin_bytes = std::fs::read_to_string(&admin_path).unwrap();
+        assert!(
+            admin_bytes.contains("sk-admin-real"),
+            "admin.json must still hold its own key (not rewritten)"
+        );
+        assert!(
+            !root.join("cluster-worker.json").exists()
+                && !root.join("cluster-worker.override.json").exists(),
+            "fallback must not write any consuming-profile seed/override file"
+        );
+        drop(tmp);
     }
 }
