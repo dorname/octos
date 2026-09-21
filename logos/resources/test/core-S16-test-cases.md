@@ -199,3 +199,7 @@
 - UT-S16-68: legacy_data_exists_when_jsonl_present_without_ledger(有 JSONL 无 ledger→不铸造)
 - UT-S16-69: legacy_data_absent_for_brand_new_key(全新裸键→铸造)
 - UT-S16-70: legacy_data_lookup_does_not_match_canonical_key(裸/规范键探测隔离不互染)
+
+### 批 14 续3(#51 — hydrate/messages 入口规范化尊重存量)
+- UT-S16-71: entry_normalization_keeps_bare_key_with_legacy_jsonl(裸键有 JSONL→读入口不铸,保持裸键)
+- UT-S16-72: entry_normalization_mints_for_brand_new_key(全新裸键→读入口铸规范键,幂等)

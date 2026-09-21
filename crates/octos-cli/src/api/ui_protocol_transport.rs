@@ -19048,6 +19048,32 @@ fn legacy_session_data_exists(
     false
 }
 
+/// #46+#51: normalize a session key at a read entry, respecting legacy data.
+/// Returns the canonical minted key ONLY when the bare key has no legacy data
+/// under the resolved profile; a bare key with existing ledger/JSONL stays bare
+/// so the read hits the same bucket the data lives in (键跟数据走).
+fn normalize_session_key_at_entry(
+    state: &AppState,
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+) -> SessionKey {
+    let Some(minted) = mint_canonical_session_key(session_id, connection_profile_id) else {
+        return session_id.clone(); // already canonical or no profile
+    };
+    let ledger_root = state
+        .ui_protocol
+        .ledger
+        .get()
+        .and_then(|l| l.config_data_dir());
+    let profile_data = resolve_session_profile_runtime(state, connection_profile_id)
+        .map(|rt| rt.data_dir.clone());
+    if legacy_session_data_exists(ledger_root.as_deref(), profile_data.as_deref(), session_id) {
+        session_id.clone() // legacy data lives under the bare key — keep it
+    } else {
+        minted
+    }
+}
+
 fn mint_canonical_session_key(session_id: &SessionKey, profile_id: Option<&str>) -> Option<SessionKey> {
     if session_id.profile_id().is_some() {
         return None; // already profile-scoped
@@ -25927,13 +25953,12 @@ async fn handle_session_hydrate(
         send_scope_error(ws, id, error);
         return;
     }
-    // #43 (b): normalize a bare session id to the canonical `{profile}:api:{raw}`
-    // at the hydrate entry, so a client replaying a just-opened session by its
-    // original bare id resolves to the same canonical ledger/JSONL bucket.
+    // #43 (b) + #51: normalize a bare session id to the canonical key at the
+    // hydrate entry — but skip minting when the bare key has legacy data, so the
+    // hydrate replays the existing bucket instead of an orphaned canonical one.
     let mut params = params;
-    if let Some(minted) = mint_canonical_session_key(&params.session_id, connection_profile_id) {
-        params.session_id = minted;
-    }
+    params.session_id =
+        normalize_session_key_at_entry(state, &params.session_id, connection_profile_id);
     if params.include.len() > SESSION_HYDRATE_INCLUDE_MAX {
         let _ = send_rpc_error(
             ws,
@@ -28489,14 +28514,16 @@ async fn handle_session_messages_page(
         topic: params.topic.clone(),
     });
     let identity_ext = identity.cloned().map(Extension);
-    // #43 (b): normalize a bare session id to the canonical `{profile}:api:{raw}`
-    // before the REST-backed read, so a bare-id messages page hits the canonical
-    // bucket the (minted) session actually lives under. The connection profile
-    // comes from the authenticated identity (Admin → admin per ③).
+    // #43 (b) + #51: normalize a bare session id to the canonical key before the
+    // REST-backed read, skipping the mint when the bare key has legacy data. The
+    // connection profile comes from the authenticated identity (Admin → admin, ③).
     let conn_profile = identity.and_then(authenticated_profile_id);
-    let normalized = mint_canonical_session_key(&SessionKey(params.session_id.clone()), conn_profile)
-        .map(|k| k.0)
-        .unwrap_or_else(|| params.session_id.clone());
+    let normalized = normalize_session_key_at_entry(
+        state,
+        &SessionKey(params.session_id.clone()),
+        conn_profile,
+    )
+    .0;
     let session_id_str = normalized.clone();
     let response = super::handlers::session_messages(
         State(state.clone()),

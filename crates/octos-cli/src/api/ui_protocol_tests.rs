@@ -15544,6 +15544,58 @@ fn legacy_data_lookup_does_not_match_canonical_key() {
     assert!(legacy_session_data_exists(Some(tmp.path()), None, &canonical));
 }
 
+#[tokio::test]
+async fn entry_normalization_keeps_bare_key_with_legacy_jsonl() {
+    // UT-S16-71: at the read entry (hydrate/messages share
+    // `normalize_session_key_at_entry`), a bare key WITH legacy JSONL data must
+    // NOT be minted — it stays bare so the read hits the existing bucket (#51).
+    let tmp = tempfile::tempdir().unwrap();
+    // state_with_profile registers the admin ProfileRuntime with data_dir =
+    // <tmp>/data — the profile data root the JSONL probe reads.
+    let (state, _runtime) = state_with_profile(&tmp.path().join("data"), "admin").await;
+    let bare = SessionKey("web-legacy-hydrate".into());
+    // state_with_profile roots the profile data dir at <arg>/profiles/<id>/data.
+    let sessions_dir = tmp
+        .path()
+        .join("data")
+        .join("profiles")
+        .join("admin")
+        .join("data")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::write(
+        sessions_dir.join(format!(
+            "{}.jsonl",
+            octos_bus::session::encode_path_component(&bare.0)
+        )),
+        "{}\n",
+    )
+    .unwrap();
+    let normalized = normalize_session_key_at_entry(&state, &bare, Some("admin"));
+    assert_eq!(
+        normalized.0, bare.0,
+        "bare key with legacy JSONL must stay bare at the read entry (#51)"
+    );
+}
+
+#[tokio::test]
+async fn entry_normalization_mints_for_brand_new_key() {
+    // UT-S16-72: a brand-new bare key (no ledger, no JSONL) mints to canonical
+    // at the read entry — same as open. Idempotent on the canonical key.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _runtime) = state_with_profile(&tmp.path().join("data"), "admin").await;
+    let bare = SessionKey("web-brand-new-hydrate".into());
+    let normalized = normalize_session_key_at_entry(&state, &bare, Some("admin"));
+    assert_eq!(
+        normalized.0, "admin:api:web-brand-new-hydrate",
+        "brand-new bare key mints at the read entry"
+    );
+    assert_eq!(
+        normalize_session_key_at_entry(&state, &normalized, Some("admin")).0,
+        normalized.0
+    );
+}
+
 #[test]
 fn skill_action_job_events_are_visible_only_to_their_profile() {
     let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
