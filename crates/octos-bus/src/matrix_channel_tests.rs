@@ -912,15 +912,27 @@ async fn test_handle_room_query_requires_token() {
         tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() })
     };
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Windows CI flake (nightly run 35514856517, issue #9-A): a fixed
+    // 100ms sleep assumed the appservice listener was up. On Windows the
+    // bind+accept warmup routinely exceeds that, so the client hit a
+    // not-yet-listening port and `unwrap()` panicked with
+    // ConnectionRefused instead of observing 401. Poll until the port
+    // accepts (platform-independent) before asserting the status code.
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!(
-            "http://127.0.0.1:{appservice_port}/_matrix/app/v1/rooms/%23alias%3Alocalhost"
-        ))
-        .send()
-        .await
-        .unwrap();
+    let url = format!(
+        "http://127.0.0.1:{appservice_port}/_matrix/app/v1/rooms/%23alias%3Alocalhost"
+    );
+    let mut resp = None;
+    for _ in 0..40 {
+        match client.get(&url).send().await {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let resp = resp.expect("appservice listener never came up within 1s");
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 

@@ -9517,6 +9517,28 @@ fn auth_unavailable_error(method: &str) -> RpcError {
         }))
 }
 
+/// Issue #9-B (nightly E2E `web-client.spec.ts`): `session/open` without an
+/// explicit `profile_id` defaults to `_main`. When `_main` is not a real
+/// profile (typical on a fresh serve that only has operator-created ones),
+/// the open failed with `profile_unresolved`, the WS chat turn never ran,
+/// `doneEvent` stayed undefined (test :179) and the persisted transcript was
+/// empty (test :191). Fall back to the first *enabled* profile in the store
+/// so an unscoped open still lands on a usable runtime. Explicit `profile_id`
+/// values are untouched (an unresolved explicit id still errors, which is the
+/// intended fast-fail for a mis-configured caller).
+fn fallback_enabled_profile_id(state: &AppState, requested: &str) -> Option<String> {
+    if requested != MAIN_PROFILE_ID {
+        return None;
+    }
+    let store = state.profile_store.as_ref()?;
+    let mut profiles = store.list().ok()?;
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
+        .into_iter()
+        .find(|p| p.enabled)
+        .map(|p| p.id)
+}
+
 fn profile_is_known(state: &AppState, profile_id: &str) -> bool {
     state
         .profile_store
@@ -9527,12 +9549,16 @@ fn profile_is_known(state: &AppState, profile_id: &str) -> bool {
         || (profile_id == MAIN_PROFILE_ID && state.profile_store.is_none())
 }
 
-fn ensure_known_profile(state: &AppState, profile_id: &str) -> Result<(), RpcError> {
+fn ensure_known_profile(state: &AppState, profile_id: &str) -> Result<String, RpcError> {
     if profile_is_known(state, profile_id) {
-        Ok(())
-    } else {
-        Err(profile_unresolved_error(profile_id))
+        return Ok(profile_id.to_string());
     }
+    // Issue #9-B: same unscoped-`_main` fallback as session/open — an
+    // enabled-profile store must not hard-fail a bare `_main` reference.
+    if let Some(fallback) = fallback_enabled_profile_id(state, profile_id) {
+        return Ok(fallback);
+    }
+    Err(profile_unresolved_error(profile_id))
 }
 
 fn local_profile_permission_error(
@@ -11215,6 +11241,10 @@ async fn raw_session_status_result(
         return Err(RpcError::invalid_params("session_id is required"));
     };
     let profile_id = raw_profile_id(&params, connection_profile_id);
+    // Issue #9-B: an unscoped `_main` open on a store that has enabled
+    // profiles must not hard-fail — land on the first enabled profile.
+    let profile_id = fallback_enabled_profile_id(state, &profile_id)
+        .unwrap_or(profile_id);
     let profile = state
         .profile_store
         .as_ref()

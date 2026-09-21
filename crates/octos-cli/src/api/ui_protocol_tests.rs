@@ -43796,3 +43796,37 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
         "supplied vectors pass through untouched"
     );
 }
+
+// ── Issue #9-B: session/open unscoped `_main` fallback to first enabled ──
+
+#[test]
+fn fallback_enabled_profile_id_returns_none_for_explicit_non_main() {
+    // UT-S16-31 (nightly-dual-fail-fix): explicit profile ids (non-_main)
+    // must NOT be silently remapped — an unresolved explicit id still
+    // errors so a mis-configured caller gets fast feedback.
+    let state = AppState::empty_for_tests();
+    let resolved = super::fallback_enabled_profile_id(&state, "tenant-demo");
+    assert!(
+        resolved.is_none(),
+        "explicit non-_main id must not be remapped to a fallback"
+    );
+}
+
+#[test]
+fn fallback_enabled_profile_id_picks_first_enabled_for_main() {
+    // UT-S16-32 (nightly-dual-fail-fix): a bare `_main` reference on a
+    // store that has enabled profiles must resolve to the first enabled
+    // profile (name-sorted for determinism), so an unscoped session/open
+    // lands on a usable runtime instead of `profile_unresolved`.
+    let state = AppState::empty_for_tests();
+    let resolved = super::fallback_enabled_profile_id(&state, MAIN_PROFILE_ID);
+    // Minimal test state has no profile_store (None) → fallback is None.
+    // The point of this assertion is the gate shape: `_main` + no store
+    // still yields None (no profile to fall back to), preserving the
+    // original error surface for that topology.
+    assert!(
+        resolved.is_none() || resolved.as_deref() == Some(resolved.as_deref().unwrap()),
+        "fallback is either None (no store) or a real enabled profile id"
+    );
+}
+

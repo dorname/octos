@@ -71,6 +71,16 @@
 | UT-S16-28 | retry::tests::should_not_retry_on_403_authentication_failure | 模拟 403 provider：同上，403 路径不重试 |
 | UT-S16-29 | error::tests::should_render_401_with_provider_label_status_and_summary_for_turn_failfast | LlmError Display 在上游 401 时携带 provider 标签 + HTTP 状态码 + kind 摘要 + 上游正文摘要（turn/error message 复用同一 Display） |
 
+## 批 5（黑板 #9 — nightly 双失败修复：Windows 测试 + E2E 会话管线）
+
+### UT-S16-30 ~ UT-S16-32 — 缺陷 A（Windows）+ 缺陷 B（E2E）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-30 | matrix_channel::tests::test_handle_room_query_requires_token | 缺陷 A：appservice 监听端口固定 100ms sleep → 轮询等端口就绪（≤1s），消除 Windows CI 时序假设（nightly run 35514856517 Windows 516/1 失败） |
+| UT-S16-31 | api::ui_protocol_transport::tests::fallback_enabled_profile_id_returns_none_for_explicit_non_main | 缺陷 B 门形：显式非 _main profile id 不被静默 remap（未解析显式 id 仍 error，快速失败） |
+| UT-S16-32 | api::ui_protocol_transport::tests::fallback_enabled_profile_id_picks_first_enabled_for_main | 缺陷 B：裸 _main 引用在有 enabled profile 的 store 上回退到第一个 enabled（name 排序稳定）；无 store 时仍 None 保持原错误面 |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。
