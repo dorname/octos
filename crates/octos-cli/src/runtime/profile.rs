@@ -3303,15 +3303,15 @@ mod tests {
         // UT-S16-47: consuming profile (cluster-worker) key env MISSING →
         // fall back to admin's key, injected into env_vars.
         let mut admin_env = HashMap::new();
-        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
-        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
 
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
             Some("sk-admin-real"),
             "missing consuming key must fall back to the admin profile key"
         );
@@ -3322,17 +3322,17 @@ mod tests {
         // UT-S16-48: consuming profile key env = REPLACE_ME placeholder (the
         // k8s ConfigMap seed value) → fall back to admin's real key.
         let mut admin_env = HashMap::new();
-        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut own = HashMap::new();
-        own.insert("ANTHROPIC_API_KEY".to_string(), "REPLACE_ME".to_string());
-        let mut config = fallback_config("ANTHROPIC_API_KEY", own);
+        own.insert("OCTOS_TEST_FB_KEY_23".to_string(), "REPLACE_ME".to_string());
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", own);
 
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
             Some("sk-admin-real"),
             "REPLACE_ME placeholder must be treated as missing and fall back"
         );
@@ -3343,17 +3343,17 @@ mod tests {
         // UT-S16-49: consuming profile has a REAL explicit key → never
         // overridden by the admin fallback (explicit-key-wins).
         let mut admin_env = HashMap::new();
-        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut own = HashMap::new();
-        own.insert("ANTHROPIC_API_KEY".to_string(), "sk-worker-explicit".to_string());
-        let mut config = fallback_config("ANTHROPIC_API_KEY", own);
+        own.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-worker-explicit".to_string());
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", own);
 
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
             Some("sk-worker-explicit"),
             "an explicit consuming key must win over the admin fallback"
         );
@@ -3366,12 +3366,12 @@ mod tests {
         // reports the original missing-key error — never a silent success).
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", HashMap::new());
         let profile = fallback_profile("cluster-worker", HashMap::new());
-        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
 
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert!(
-            config.env_vars.get("ANTHROPIC_API_KEY").is_none(),
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").is_none(),
             "admin without a key must not inject anything (error surfaces downstream)"
         );
     }
@@ -3382,24 +3382,24 @@ mod tests {
         // (ii) fallback never writes to disk — the consuming seed/override and
         // admin.json bytes are unchanged (read-only seed semantics preserved).
         let mut admin_env = HashMap::new();
-        admin_env.insert("ANTHROPIC_API_KEY".to_string(), "sk-admin-real".to_string());
+        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
         let (tmp, root, data_dir) = fallback_setup("cluster-worker", admin_env);
 
         // (i) admin profile is a fallback SOURCE, never a target.
         let admin_profile = fallback_profile("admin", HashMap::new());
-        let mut admin_config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        let mut admin_config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
         apply_admin_llm_key_fallback(&admin_profile, &data_dir, "anthropic", &mut admin_config);
         assert!(
-            admin_config.env_vars.get("ANTHROPIC_API_KEY").is_none(),
+            admin_config.env_vars.get("OCTOS_TEST_FB_KEY_23").is_none(),
             "the admin profile must never fall back to itself"
         );
 
         // (ii) a real fallback injects ONLY into the in-memory Config.
         let profile = fallback_profile("cluster-worker", HashMap::new());
-        let mut config = fallback_config("ANTHROPIC_API_KEY", HashMap::new());
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
         assert_eq!(
-            config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
             Some("sk-admin-real")
         );
         // Seed/override/admin.json bytes unchanged on disk.
@@ -3415,5 +3415,38 @@ mod tests {
             "fallback must not write any consuming-profile seed/override file"
         );
         drop(tmp);
+    }
+
+    #[test]
+    fn admin_key_fallback_is_hermetic_to_process_env() {
+        // UT-S16-52: hermeticity regression (#25 复验异议). The fallback reads
+        // `std::env::var(key_var)` to detect an explicit key — so tests MUST use
+        // a var name that can never appear in the process env. Even with a real
+        // provider-default key (ANTHROPIC_API_KEY) exported in the shell, the
+        // fallback keyed on the test-only name must behave purely from the
+        // injected env_vars: a MISSING consuming key still falls back (the real
+        // process ANTHROPIC_API_KEY must NOT be mistaken for an explicit key).
+        //
+        // We cannot unset the developer's real ANTHROPIC_API_KEY (process-global
+        // and parallel-unsafe); instead we prove the fallback never consults it —
+        // it only ever reads `config.api_key_env`, which here is the test-only
+        // OCTOS_TEST_FB_KEY_23.
+        let mut admin_env = HashMap::new();
+        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        // No OCTOS_TEST_FB_KEY_23 in env_vars, and (regardless of any real
+        // ANTHROPIC_API_KEY in the process env) the fallback must still fire.
+        let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            Some("sk-admin-real"),
+            "fallback must consult only config.api_key_env (test-only name), never \
+             the provider-default process env var — hermetic under a real \
+             ANTHROPIC_API_KEY (#25 复验)"
+        );
     }
 }
