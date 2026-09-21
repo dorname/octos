@@ -61,6 +61,16 @@
 |----|----------|------|
 | UT-S16-26 | test_octos_deployment_mounts_cluster_worker_profile_configmap | **批 3 #7 断言**：Deployment 以 readOnly+subPath 挂载 cluster-worker-profile CM（profile 作为配置而非 PVC 状态，防滚动丢失） |
 
+## 批 4（黑板 #8 — serve LLM 鉴权类失败快速失败，新规范全流程实战）
+
+### UT-S16-27 ~ UT-S16-29 — crates/octos-llm
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-27 | retry::tests::should_not_retry_on_401_authentication_failure | 模拟 401 provider：RetryProvider 单尝试即 Err，is_retryable=false，且错误仍 typed 为 Authentication（快速失败落态前提） |
+| UT-S16-28 | retry::tests::should_not_retry_on_403_authentication_failure | 模拟 403 provider：同上，403 路径不重试 |
+| UT-S16-29 | error::tests::should_render_401_with_provider_label_status_and_summary_for_turn_failfast | LlmError Display 在上游 401 时携带 provider 标签 + HTTP 状态码 + kind 摘要 + 上游正文摘要（turn/error message 复用同一 Display） |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01..12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

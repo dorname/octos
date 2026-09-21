@@ -830,6 +830,107 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "FailFast must not retry");
     }
 
+    /// Provider that always returns an authentication (401/403) error and
+    /// counts `chat` calls — used to assert the auth path never retries.
+    struct AuthFailProvider {
+        status: u16,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AuthFailProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::from_status(self.status, "Unauthorized").into())
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::from_status(self.status, "Unauthorized").into())
+        }
+
+        fn model_id(&self) -> &str {
+            "authfail"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test-auth"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_on_401_authentication_failure() {
+        // UT-S16-27 (serve-auth-failfast): a 401 from the upstream provider
+        // must surface immediately — auth failures are NOT retryable
+        // (backoff ladder is 429/5xx/network/timeout/stream only), so the
+        // turn layer gets a fast terminal instead of a hung watchdog.
+        use std::sync::atomic::Ordering;
+        let provider = AuthFailProvider {
+            status: 401,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let err = retry
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .expect_err("401 must surface as an error");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "401 must not be retried");
+        // And the surfaced error still classifies as Authentication so the
+        // turn layer can render a fast-fail terminal with the upstream
+        // summary rather than a generic hang.
+        let is_auth = err
+            .chain()
+            .any(|cause| {
+                cause
+                    .downcast_ref::<LlmError>()
+                    .map(|e| e.kind == LlmErrorKind::Authentication)
+                    .unwrap_or(false)
+            });
+        assert!(is_auth, "surfaced error must stay typed as Authentication");
+    }
+
+    #[tokio::test]
+    async fn should_not_retry_on_403_authentication_failure() {
+        // UT-S16-28 (serve-auth-failfast): same fast-fail contract for 403.
+        use std::sync::atomic::Ordering;
+        let provider = AuthFailProvider {
+            status: 403,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let calls = provider.calls.clone();
+        let retry = RetryProvider::new(Arc::new(provider)).with_config(RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            backoff_multiplier: 2.0,
+        });
+
+        let err = retry
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .expect_err("403 must surface as an error");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "403 must not be retried");
+    }
+
     #[tokio::test]
     async fn should_retry_when_normal_policy() {
         use crate::{LlmCallPolicy, with_llm_call_policy};

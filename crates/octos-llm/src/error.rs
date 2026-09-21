@@ -488,6 +488,36 @@ mod tests {
     }
 
     #[test]
+    fn should_render_401_with_provider_label_status_and_summary_for_turn_failfast() {
+        // UT-S16-29 (serve-auth-failfast): the turn/error envelope surfaces
+        // the provider error's Display as its message on an upstream 401.
+        // Assert that Display carries the three pieces the frontend needs
+        // to show a fast, actionable failure instead of a 30s watchdog:
+        // (a) provider/lane label, (b) HTTP status, (c) upstream summary
+        // (truncated body). LlmError::from_status_with_label is the exact
+        // constructor the anthropic/openai providers use on non-2xx.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"API key is invalid."},"request_id":null}"#;
+        let err = LlmError::from_status_with_label(401, body, "kimi-code");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("kimi-code"),
+            "Display must carry provider label: {rendered}"
+        );
+        assert!(
+            rendered.contains("401"),
+            "Display must carry HTTP status: {rendered}"
+        );
+        assert!(
+            rendered.contains("authentication failed"),
+            "Display must carry kind summary: {rendered}"
+        );
+        assert!(
+            rendered.contains("API key is invalid"),
+            "Display must carry upstream body summary: {rendered}"
+        );
+    }
+
+    #[test]
     fn should_recognise_generic_quota_keyword() {
         let body = r#"{"error":{"type":"insufficient_quota","message":"out of credits"}}"#;
         let err = LlmError::from_status(403, body);
