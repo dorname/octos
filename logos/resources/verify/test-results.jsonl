@@ -137,3 +137,4 @@
 {"id": "UT-S16-63", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T17:23:41+08:00", "scenario": "core-S16"}
 {"id": "UT-S16-64", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T17:23:41+08:00", "scenario": "core-S16"}
 {"id": "UT-S16-65", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T17:23:41+08:00", "scenario": "core-S16"}
+{"id": "UT-S16-66", "status": "pass", "duration_ms": 0, "timestamp": "2026-09-21T18:00:06+08:00", "scenario": "core-S16"}

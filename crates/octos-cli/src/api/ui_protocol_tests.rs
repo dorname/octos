@@ -15468,6 +15468,27 @@ fn mint_canonical_session_key_cross_profile_does_not_regress() {
 }
 
 #[test]
+fn mint_canonical_session_key_is_idempotent_at_entrypoints() {
+    // #43 (b): the five read/write entrypoints (session/open, turn/start via
+    // open ack, hydrate, messages, list) all funnel through this one helper.
+    // It must be idempotent — re-normalizing an already-canonical key is a no-op
+    // — so a client holding the ack'd canonical key never double-prefixes.
+    let bare = SessionKey("web-1789871791268-87x3ps".into());
+    let once = mint_canonical_session_key(&bare, Some("admin")).unwrap();
+    assert_eq!(once.0, "admin:api:web-1789871791268-87x3ps");
+    // hydrate / messages / list re-normalize the canonical key → unchanged.
+    assert!(mint_canonical_session_key(&once, Some("admin")).is_none());
+    // Admin connection profile (③) mints the same canonical key as an explicit
+    // profile_id=admin, so bare-id reads after open land on the same bucket.
+    let via_conn = mint_canonical_session_key(
+        &bare,
+        authenticated_profile_id(&AuthIdentity::Admin),
+    )
+    .unwrap();
+    assert_eq!(via_conn.0, once.0, "Admin-identity and explicit-profile mints agree");
+}
+
+#[test]
 fn skill_action_job_events_are_visible_only_to_their_profile() {
     let event = UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(
         SkillActionJobUpdatedEvent {
@@ -30107,7 +30128,19 @@ async fn cold_scope_admission_case(case: &str) {
         crate::runtime::SessionRuntimeCache::new(8, Duration::from_secs(60))
             .with_sessions_in_cwd(true),
     );
-    let session = SessionKey(format!("cold-scope-master-{case}"));
+    // #43 (a): the cold-scope evidence/ledger must live under the SAME key the
+    // (minted) open will use, or the guard's scope lookup misses. In the
+    // canonical-key world, a session opened with an explicit profile_id mints
+    // `{profile}:api:{raw}` (#40 ①); the "unique"/"ambiguous"/etc. historical
+    // cases model an ALREADY-OPENED session, so their evidence key is the
+    // canonical key. The bare `cold-scope-master-{case}` shape remains covered
+    // by the legacy "no-history" path (no prior open → no mint → bare key) and
+    // by the legacy fallback chain (#40 ②) — both worlds pinned.
+    let session = if case == "no-history" {
+        SessionKey(format!("cold-scope-master-{case}"))
+    } else {
+        SessionKey(format!("cold-scope-{case}:api:cold-scope-master-{case}"))
+    };
     let mut config = LedgerConfig::durable(temp.path().to_owned());
     config.retained_per_session = 2;
     let mut expected_stream = session.0.clone();

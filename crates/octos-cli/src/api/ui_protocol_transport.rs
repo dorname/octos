@@ -20217,6 +20217,15 @@ async fn open_session_result(
     // migration): only a bare id + explicit profile_id mints here.
     if let Some(minted) = mint_canonical_session_key(&params.session_id, params.profile_id.as_deref())
     {
+        // Keep the resume cursor consistent: `validate_cursor_stream` requires
+        // `after.stream == session_id.0`, so a minted key must re-point the
+        // cursor's stream to the canonical key or open fails with
+        // cursor_stream_mismatch.
+        if let Some(after) = params.after.as_mut() {
+            if after.stream == params.session_id.0 {
+                after.stream = minted.0.clone();
+            }
+        }
         params.session_id = minted;
     }
 
@@ -25868,6 +25877,13 @@ async fn handle_session_hydrate(
         send_scope_error(ws, id, error);
         return;
     }
+    // #43 (b): normalize a bare session id to the canonical `{profile}:api:{raw}`
+    // at the hydrate entry, so a client replaying a just-opened session by its
+    // original bare id resolves to the same canonical ledger/JSONL bucket.
+    let mut params = params;
+    if let Some(minted) = mint_canonical_session_key(&params.session_id, connection_profile_id) {
+        params.session_id = minted;
+    }
     if params.include.len() > SESSION_HYDRATE_INCLUDE_MAX {
         let _ = send_rpc_error(
             ws,
@@ -28423,12 +28439,20 @@ async fn handle_session_messages_page(
         topic: params.topic.clone(),
     });
     let identity_ext = identity.cloned().map(Extension);
-    let session_id_str = params.session_id.clone();
+    // #43 (b): normalize a bare session id to the canonical `{profile}:api:{raw}`
+    // before the REST-backed read, so a bare-id messages page hits the canonical
+    // bucket the (minted) session actually lives under. The connection profile
+    // comes from the authenticated identity (Admin → admin per ③).
+    let conn_profile = identity.and_then(authenticated_profile_id);
+    let normalized = mint_canonical_session_key(&SessionKey(params.session_id.clone()), conn_profile)
+        .map(|k| k.0)
+        .unwrap_or_else(|| params.session_id.clone());
+    let session_id_str = normalized.clone();
     let response = super::handlers::session_messages(
         State(state.clone()),
         headers.clone(),
         identity_ext,
-        axum_path(params.session_id),
+        axum_path(normalized),
         pagination,
     )
     .await;

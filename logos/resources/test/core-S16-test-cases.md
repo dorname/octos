@@ -189,3 +189,7 @@
 
 ### octos-web 前端(session-context.test.ts,submodule commit 1407897)
 - sessionTimestamp 适配第三种键形 `{profile}:api:web-{ms}-{rand}` 与 uuid-v7 变体(34/34 绿)
+
+### 批 14 续（#43 — cross-profile scope 测试适配 + 五入口规范化）
+- cold_scope 5 case 适配规范键语义(历史 case 证据键=`{profile}:api:{raw}`,no-history 保留裸键 legacy)——裁决 a 两世界钉住
+- UT-S16-66: mint_canonical_session_key_is_idempotent_at_entrypoints(五入口幂等+Admin身份与显式profile铸造一致)
