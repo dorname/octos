@@ -148,6 +148,17 @@
 | UT-S16-51 | runtime::profile::tests::admin_key_fallback_skips_admin_and_keeps_seed_files_untouched | 同上：改专有 OCTOS_TEST_FB_KEY_23，admin 自身不回退+种子字节不动密闭 |
 | UT-S16-52 | runtime::profile::tests::admin_key_fallback_is_hermetic_to_process_env | 密闭性回归：fallback 只读 config.api_key_env（测试专有名），从不读 provider 默认进程 env——导出真实 ANTHROPIC_API_KEY=sk-real 下回退仍正确触发 |
 
+## 批 12（黑板 #31 — 修复 #23 回退取名维度：同 provider 族候选名集合）
+
+### UT-S16-53 / 54 / 55 / 56 — crates/octos-cli runtime::profile（by-family 回退）
+
+| ID | 测试函数 | 描述 |
+|----|----------|------|
+| UT-S16-53 | runtime::profile::tests::admin_key_fallback_resolves_by_family_canonical_name | **#30 铁证入案**：路由 api_key_env=OCTOS_TEST_FB_KEY_31（协议覆盖名），admin 存族规范名 MINIMAX_API_KEY → 字面名 miss，by-family 候选集命中族规范名并注入路由名下 |
+| UT-S16-54 | runtime::profile::tests::admin_key_fallback_prefers_route_name_when_admin_has_both | admin 同有路由名+族规范名 → 路由名（最具体）优先 |
+| UT-S16-55 | runtime::profile::tests::admin_key_fallback_skips_placeholder_candidates | 路由名候选=REPLACE_ME 占位、族规范名真实 → 跳过占位命中族规范名（占位不注入） |
+| UT-S16-56 | runtime::profile::tests::admin_key_fallback_noop_when_no_candidate_has_key | admin 无任何候选 key → no-op 不静默，缺失错误下游照常报 |
+
 ## 备注
 - 批 1 的 12 项 + 批 3 的 1 项同处 `deploy_directory_layout.rs`（文件共 13 个测试函数），用例 ID 按批分别登记（UT-S16-01 至 UT-S16-12 属批 1，UT-S16-26 属批 3），文件物理共存不冲突。
 - pg_persistence_matrix.rs 的 10 项全部为批 1 产物（其中 UT-S16-15/16/17 兼覆盖批 3 #7 防回退语义）。

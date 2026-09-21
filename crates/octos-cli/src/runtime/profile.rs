@@ -290,19 +290,48 @@ fn apply_admin_llm_key_fallback(
     let Ok(Some(admin)) = store.get(ADMIN_PROFILE_ID) else {
         return;
     };
-    let Some(admin_key) = admin.config.env_vars.get(&key_var).cloned() else {
+    // #31: look the admin key up by PROVIDER FAMILY candidate set, not by a
+    // single literal env name. #30 live proof: the UI lands the key under the
+    // family's canonical name (minimax-token → MINIMAX_API_KEY), while the seed
+    // route overrode api_key_env to the protocol shape (ANTHROPIC_API_KEY) —
+    // keying strictly on `config.api_key_env` read admin.env_vars[...] = None
+    // and the fallback no-op'd. Candidates (dedup, order = most specific first):
+    //   1. the consuming route's configured `api_key_env`;
+    //   2. the provider family's canonical default (`ENTRY.api_key_env`);
+    //   3. the family's `key_env_aliases`.
+    // The first non-placeholder hit in admin.env_vars wins, injected under the
+    // consuming config's `key_var` name so the resolver still reads the
+    // declared var. Admin with no candidate key → no-op (never silent).
+    let mut candidates: Vec<String> = vec![key_var.clone()];
+    if let Some(entry) = octos_llm::registry::lookup(provider_name) {
+        if let Some(canonical) = entry.api_key_env {
+            candidates.push(canonical.to_string());
+        }
+        for alias in entry.key_env_aliases {
+            candidates.push((*alias).to_string());
+        }
+    }
+    candidates.dedup();
+
+    let admin_key = candidates.iter().find_map(|name| {
+        admin
+            .config
+            .env_vars
+            .get(name)
+            .filter(|v| !is_placeholder_key(v))
+            .map(|v| (name.clone(), v.clone()))
+    });
+    let Some((hit_name, admin_key)) = admin_key else {
         return;
     };
-    if is_placeholder_key(&admin_key) {
-        return;
-    }
 
     tracing::warn!(
         consuming_profile = %profile.id,
         provider = %provider_name,
         key_env = %key_var,
+        matched_env = %hit_name,
         "consuming profile LLM key missing/placeholder — falling back to the \
-         admin profile's key for this provider (#23 方案 a)"
+         admin profile's key for this provider (#23 方案 a, #31 by-family)"
     );
     config.env_vars.insert(key_var, admin_key);
 }
@@ -3298,6 +3327,22 @@ mod tests {
         }
     }
 
+    /// #31 variant: a consuming config whose provider is `family` (e.g.
+    /// minimax-token) with route-overridden `key_var` — so the fallback's
+    /// by-family candidate set must include the family's canonical env name.
+    fn fallback_config_for_family(
+        family: &str,
+        key_var: &str,
+        env_vars: HashMap<String, String>,
+    ) -> Config {
+        Config {
+            provider: Some(family.to_string()),
+            api_key_env: Some(key_var.to_string()),
+            env_vars,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn admin_key_fallback_fills_missing_consuming_key() {
         // UT-S16-47: consuming profile (cluster-worker) key env MISSING →
@@ -3447,6 +3492,115 @@ mod tests {
             "fallback must consult only config.api_key_env (test-only name), never \
              the provider-default process env var — hermetic under a real \
              ANTHROPIC_API_KEY (#25 复验)"
+        );
+    }
+
+    // ── Issue #31 (选项1): by-provider-family fallback candidate set ────────
+    //
+    // #30 live proof: the UI lands the key under the family's canonical name
+    // (minimax-token → MINIMAX_API_KEY), while the seed route overrode
+    // api_key_env to the protocol shape (ANTHROPIC_API_KEY). Keying strictly on
+    // the literal env name read admin.env_vars[...] = None → no-op. These tests
+    // use the test-only names OCTOS_TEST_FB_KEY_31 (route override) and
+    // OCTOS_TEST_FB_FAMILY_31 (canonical family stand-in) so they stay hermetic
+    // under any real exported key. The by-family candidate set is exercised via
+    // a real registry family (minimax-token) whose canonical env is
+    // MINIMAX_API_KEY — we put the admin key under MINIMAX_API_KEY and the
+    // consuming route override under OCTOS_TEST_FB_KEY_31, proving the fallback
+    // finds the family-canonical key even when the literal route name misses.
+    //
+    // NOTE: the candidate set comes from the REAL registry (minimax-token →
+    // MINIMAX_API_KEY), so these tests assert against MINIMAX_API_KEY. To keep
+    // them hermetic against a developer who really exports MINIMAX_API_KEY, the
+    // consuming profile's own explicit key check uses the route override name
+    // (OCTOS_TEST_FB_KEY_31), and the admin injection target is also that name
+    // — MINIMAX_API_KEY only ever appears as an admin env_vars map KEY, never
+    // read from the process env by the fallback (the fallback reads admin
+    // env_vars, not std::env, for the source).
+
+    #[test]
+    fn admin_key_fallback_resolves_by_family_canonical_name() {
+        // UT-S16-53: #30 iron-proof in case — consuming route api_key_env =
+        // OCTOS_TEST_FB_KEY_31 (protocol override), admin stores the key under
+        // the family canonical MINIMAX_API_KEY. Literal-name lookup misses;
+        // by-family candidate set must hit MINIMAX_API_KEY and inject under the
+        // route override name.
+        let mut admin_env = HashMap::new();
+        admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-admin-minimax".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config =
+            fallback_config_for_family("minimax-token", "OCTOS_TEST_FB_KEY_31", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            Some("sk-admin-minimax"),
+            "by-family fallback must find the admin key under the family canonical \
+             MINIMAX_API_KEY when the literal route override name misses (#30)"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_prefers_route_name_when_admin_has_both() {
+        // UT-S16-54: when admin stores BOTH the route override name and the
+        // family canonical name, the route override (most specific) wins.
+        let mut admin_env = HashMap::new();
+        admin_env.insert("OCTOS_TEST_FB_KEY_31".to_string(), "sk-route-name".to_string());
+        admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-family-name".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config =
+            fallback_config_for_family("minimax-token", "OCTOS_TEST_FB_KEY_31", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            Some("sk-route-name"),
+            "the route-configured name is the most specific candidate and must win"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_skips_placeholder_candidates() {
+        // UT-S16-55: route-name candidate is a REPLACE_ME placeholder but the
+        // family canonical holds a real key → skip the placeholder, hit the
+        // canonical (placeholder is never injected).
+        let mut admin_env = HashMap::new();
+        admin_env.insert("OCTOS_TEST_FB_KEY_31".to_string(), "REPLACE_ME".to_string());
+        admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-admin-minimax".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config =
+            fallback_config_for_family("minimax-token", "OCTOS_TEST_FB_KEY_31", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
+
+        assert_eq!(
+            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            Some("sk-admin-minimax"),
+            "a placeholder candidate must be skipped in favour of the real family key"
+        );
+    }
+
+    #[test]
+    fn admin_key_fallback_noop_when_no_candidate_has_key() {
+        // UT-S16-56: admin has NO candidate key at all (neither route override
+        // nor family canonical) → no-op, nothing injected (never silent).
+        let mut admin_env = HashMap::new();
+        admin_env.insert("UNRELATED_KEY".to_string(), "sk-other".to_string());
+        let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
+        let profile = fallback_profile("cluster-worker", HashMap::new());
+        let mut config =
+            fallback_config_for_family("minimax-token", "OCTOS_TEST_FB_KEY_31", HashMap::new());
+
+        apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
+
+        assert!(
+            config.env_vars.get("OCTOS_TEST_FB_KEY_31").is_none(),
+            "admin with no candidate key must no-op (the missing-key error surfaces downstream)"
         );
     }
 }
