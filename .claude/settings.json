@@ -11,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/openlogos/bin/openlogos-phase"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/openlogos/bin/openlogos-phase"
           }
         ]
       }
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/openlogos/bin/guard-check"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/openlogos/bin/guard-check"
           }
         ]
       }
