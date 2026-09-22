@@ -26,7 +26,7 @@ data:
       root /usr/share/nginx/html;
       index index.html;
 
-      # SPA fallback: any non-/api path serves index.html (client routing).
+      # SPA fallback: any non-whitelisted path serves index.html (client routing).
       location / {
         try_files $uri $uri/ /index.html;
       }
@@ -43,6 +43,40 @@ data:
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         # Long-lived WS / SSE-ish reads.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+      }
+
+      # Backend paths outside /api (whitelist contract — deployment plan §11):
+      # `/health` is the one non-/api path the frontend calls directly; the
+      # SPA fallback used to swallow it into index.html (#15). Exact match
+      # outranks the `location /` prefix.
+      location = /health {
+        proxy_pass http://octos.octos.svc.cluster.local:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+      }
+
+      # `/v1/` covers the session-ingress WS family
+      # (/v1/session_ingress/ws/{session_id}, router.rs:952) — the only /v1
+      # routes the backend serves.
+      location /v1/ {
+        proxy_pass http://octos.octos.svc.cluster.local:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WS upgrade (session ingress).
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_buffering off;
