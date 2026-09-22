@@ -12,39 +12,21 @@ import {
   RPC_ERROR_CODES,
   expectRpcError,
   freshTurnId,
+  isTurnTerminalEnvelopeFor,
   liveServerEnv,
   uniqueSessionId,
 } from "../lib/m9-ws-client";
 
+// Stage-5 v2 wire: the terminal arrives ONLY as a projection/envelope with
+// payload.type === "turn_terminal" — the legacy turn/completed / turn/error
+// frames are suppressed for every connection.
 async function waitForTurnTerminal(
   client: M9WsClient,
   turnId: string,
   timeoutMs = 45_000,
 ) {
-  const existing = client
-    .notificationsLog()
-    .find(
-      (n) =>
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId,
-    );
-  if (existing) return existing;
-
-  return new Promise<ReturnType<M9WsClient["notificationsLog"]>[number]>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`timed out waiting for terminal event for ${turnId}`)),
-      timeoutMs,
-    );
-    client.onNotification((n) => {
-      if (
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId
-      ) {
-        clearTimeout(timer);
-        resolve(n);
-      }
-    });
-  });
+  const params = await client.waitForTurnTerminalEnvelope(turnId, timeoutMs);
+  return { method: "projection/envelope", params };
 }
 
 test.describe("M9 protocol — fault injection", () => {
@@ -71,8 +53,9 @@ test.describe("M9 protocol — fault injection", () => {
         input: [{ kind: "text", text: "Reply with the single word OK." }],
       });
       // Wait for the turn to actually complete on the server (so the full
-      // event sequence is retained in the ledger before we drop).
-      await c1.waitForNotification("turn/completed", 45_000);
+      // event sequence is retained in the ledger before we drop). Stage-5:
+      // the terminal is a turn_terminal projection/envelope.
+      await c1.waitForTurnTerminalEnvelope(turnId, 45_000);
     } finally {
       await c1.close();
     }
@@ -96,11 +79,15 @@ test.describe("M9 protocol — fault injection", () => {
       await c2.waitForNotification("session/open", 30_000);
 
       // The replay must include the original turn lifecycle events for the
-      // same turn_id. We assert at least one of {turn/started, turn/completed}
-      // surfaces — the exact set depends on which events the runtime
-      // ledgers (this is wire-level coverage of the replay path itself).
+      // same turn_id. We assert at least one of {turn/started, terminal
+      // envelope} surfaces — the exact set depends on which events the
+      // runtime ledgers (this is wire-level coverage of the replay path
+      // itself). Stage-5: terminals replay as turn_terminal envelopes whose
+      // params carry the turn_id.
       const log = c2.notificationsLog();
-      const replayed = log.filter((n) => n.params?.turn_id === turnId);
+      const replayed = log.filter(
+        (n) => n.params?.turn_id === turnId || n.params?.thread_id === turnId,
+      );
       expect(replayed.length).toBeGreaterThan(0);
 
       // Among notifications carrying an explicit cursor, all seqs must be
@@ -136,12 +123,13 @@ test.describe("M9 protocol — fault injection", () => {
       const opened = await c1.openSession({ session_id: sid });
       openedSeq = opened.opened.cursor!.seq;
       // Run a no-op turn so the ledger acquires more than one entry.
+      const turnIdForStale = freshTurnId();
       await c1.startTurn({
         session_id: sid,
-        turn_id: freshTurnId(),
+        turn_id: turnIdForStale,
         input: [{ kind: "text", text: "Reply with the single word OK." }],
       });
-      await c1.waitForNotification("turn/completed", 45_000);
+      await c1.waitForTurnTerminalEnvelope(turnIdForStale, 45_000);
     } finally {
       await c1.close();
     }
@@ -224,7 +212,7 @@ test.describe("M9 protocol — fault injection", () => {
       expect(idempotent || typedError).toBe(true);
 
       // Drain the in-flight turn so we don't leak server state.
-      await client.waitForNotification("turn/completed", 45_000).catch(() => {
+      await client.waitForTurnTerminalEnvelope(turnId, 45_000).catch(() => {
         // It's fine if nothing arrives — we already asserted the wire shape.
       });
     } finally {
@@ -355,14 +343,11 @@ test.describe("M9 protocol — fault injection", () => {
       expect(second.interrupted).toBe(true);
 
       const terminal = await waitForTurnTerminal(client, turnId, 45_000);
-      expect(terminal.method).toBe("turn/error");
-      expect(terminal.params.code).toBe("interrupted");
+      expect(terminal.params.payload.data.outcome).toBe("interrupted");
 
-      const terminals = client.notificationsLog().filter(
-        (n) =>
-          (n.method === "turn/completed" || n.method === "turn/error") &&
-          n.params?.turn_id === turnId,
-      );
+      const terminals = client
+        .notificationsLog()
+        .filter((n) => isTurnTerminalEnvelopeFor(n, turnId));
       expect(terminals).toHaveLength(1);
     } finally {
       await client.close();

@@ -157,7 +157,8 @@ test.describe("M9 protocol — task/output/read", () => {
       if (first.truncated) {
         expect(second.text).not.toBe(first.text);
       }
-      await client.waitForNotification("turn/completed", 45_000);
+      // Stage-5 v2 wire: terminal arrives as a turn_terminal envelope.
+      await client.waitForTurnTerminalEnvelope(turnId, 45_000);
     } finally {
       await client.close();
     }

@@ -48,29 +48,40 @@ test.describe("M9 protocol — turn/start", () => {
       });
       expect(accept.accepted).toBe(true);
 
-      // Wait for the terminal event before asserting the rest.
-      const completed = await client.waitForNotification("turn/completed", 45_000);
-      expect(completed.params.turn_id).toBe(turnId);
-      expect(completed.params.session_id).toBe(sid);
-      expect(completed.params.cursor).toBeTruthy();
-      expect(completed.params.cursor.stream).toBe(sid);
-      expect(completed.params.cursor.seq).toBeGreaterThan(baselineSeq);
+      // Wait for the terminal event before asserting the rest. Stage-5 v2
+      // wire: the terminal arrives ONLY as a canonical projection/envelope
+      // with payload.type === "turn_terminal" — the legacy turn/completed
+      // frame is suppressed for every connection.
+      const completed = await client.waitForTurnTerminalEnvelope(turnId, 45_000);
+      expect(completed.turn_id).toBe(turnId);
+      expect(completed.session_id).toBe(sid);
+      expect(completed.payload.data.outcome).toBe("completed");
+      expect(completed.cursor).toBeTruthy();
+      expect(completed.cursor.stream).toBe(sid);
+      expect(completed.cursor.seq).toBeGreaterThan(baselineSeq);
 
       // Inspect the full notification log for the turn.
       const log = client.notificationsLog();
       const forTurn = log.filter(
-        (n) => n.params?.turn_id === turnId,
+        (n) => n.params?.turn_id === turnId || n.params?.thread_id === turnId,
       );
-      // turn/started must appear before turn/completed.
+      // turn/started must appear before the terminal envelope.
       const startedIdx = forTurn.findIndex((n) => n.method === "turn/started");
-      const completedIdx = forTurn.findIndex((n) => n.method === "turn/completed");
+      const completedIdx = forTurn.findIndex(
+        (n) => n.method === "projection/envelope" && n.params?.payload?.type === "turn_terminal",
+      );
       expect(startedIdx).toBeGreaterThanOrEqual(0);
       expect(completedIdx).toBeGreaterThan(startedIdx);
 
-      // At least one message/delta with non-empty text.
-      const deltas = forTurn.filter((n) => n.method === "message/delta");
+      // At least one assistant_delta envelope with non-empty text (the
+      // Stage-5 replacement for message/delta).
+      const deltas = forTurn.filter(
+        (n) => n.method === "projection/envelope" && n.params?.payload?.type === "assistant_delta",
+      );
       expect(deltas.length).toBeGreaterThanOrEqual(1);
-      const combined = deltas.map((d) => String(d.params.text ?? "")).join("");
+      const combined = deltas
+        .map((d) => String(d.params.payload.data.text ?? ""))
+        .join("");
       expect(combined.length).toBeGreaterThan(0);
 
       // Cursor monotonicity across the durable notifications. Notifications

@@ -45,7 +45,8 @@ test.describe("M9 protocol — progress/updated", () => {
         turn_id: turnId,
         input: [{ kind: "text", text: "Reply with the single word OK." }],
       });
-      await client.waitForNotification("turn/completed", 45_000);
+      // Stage-5 v2 wire: terminal arrives as a turn_terminal envelope.
+      await client.waitForTurnTerminalEnvelope(turnId, 45_000);
 
       const log = client.notificationsLog();
       const progress = log.filter(

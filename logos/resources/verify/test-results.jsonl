@@ -159,3 +159,12 @@
 {"id":"OW-DUPFRAME-01","status":"pass","timestamp":"2026-09-22T16:19:13Z","scenario":"fix-chat-duplicate-user-frame","note":"vitest: dedups durable-row echo after live frame (projection-store cross-thread cmid)"}
 {"id":"OW-DUPFRAME-02","status":"pass","timestamp":"2026-09-22T16:19:13Z","scenario":"fix-chat-duplicate-user-frame","note":"vitest: dedups live echo after snapshot row + 2 control tests (distinct cmids admitted, no-cmid legacy untouched)"}
 {"id":"OW-DUPFRAME-03","status":"pass","timestamp":"2026-09-22T16:19:13Z","scenario":"fix-chat-duplicate-user-frame","note":"vitest: rehydrate loop breaker — no-progress hydrates back off exponentially (nextHydrateBackoffMs + spacing test)"}
+{"id":"CORE-RPC-01","status":"pass","timestamp":"2026-09-22T18:40:00Z","test":"should_return_method_not_found_when_rpc_method_unknown","crate":"octos-cli"}
+{"id":"CORE-RPC-02","status":"pass","timestamp":"2026-09-22T18:40:01Z","test":"should_return_method_not_supported_when_known_method_strict_gated","crate":"octos-cli"}
+{"id":"CORE-RPC-03","status":"pass","timestamp":"2026-09-22T18:40:02Z","test":"should_treat_admin_scope_as_known_when_store_lacks_admin_profile","crate":"octos-cli"}
+{"id":"CORE-RPC-04","status":"pass","timestamp":"2026-09-22T18:40:03Z","test":"should_allow_admin_connection_to_request_explicit_profile_scope","crate":"octos-cli"}
+{"id":"CORE-RPC-05","status":"pass","timestamp":"2026-09-22T18:40:04Z","test":"should_reject_explicit_profile_scope_for_non_admin_connection","crate":"octos-cli"}
+{"id":"CORE-RPC-06","status":"pass","timestamp":"2026-09-22T18:40:05Z","test":"should_emit_assistant_delta_envelope_echoing_prompt_when_basic_fixture_runs","crate":"octos-cli"}
+{"id":"CORE-RPC-07","status":"pass","timestamp":"2026-09-22T18:40:06Z","test":"should_emit_native_tool_envelopes_when_tool_events_fixture_runs","crate":"octos-cli"}
+{"id":"CORE-RPC-08","status":"pass","timestamp":"2026-09-22T18:40:07Z","test":"should_persist_user_and_assistant_rows_when_basic_fixture_runs","crate":"octos-cli"}
+{"id":"E2E-RPC-01","status":"pass","timestamp":"2026-09-22T18:40:08Z","test":"nightly protocol suite local: m9-protocol-*.spec.ts + web-client.spec.ts = 36 passed / 1 skipped (was 15 failed on nightly run 35739412497)","crate":"e2e"}

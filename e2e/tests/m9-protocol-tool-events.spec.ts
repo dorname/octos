@@ -49,15 +49,24 @@ test.describe("M9 protocol — tool/* events", () => {
       });
       expect(accept.accepted).toBe(true);
 
-      const completed = await client.waitForNotification("turn/completed", 50_000);
-      expect(completed.params.turn_id).toBe(turnId);
+      // Stage-5 v2 wire: terminal + tool lifecycle arrive as canonical
+      // projection/envelope payloads (legacy tool/* and turn/completed
+      // frames are suppressed for every connection).
+      const completed = await client.waitForTurnTerminalEnvelope(turnId, 50_000);
+      expect(completed.turn_id).toBe(turnId);
 
       const log = client.notificationsLog();
       const toolStarted = log.filter(
-        (n) => n.method === "tool/started" && n.params?.turn_id === turnId,
+        (n) =>
+          n.method === "projection/envelope" &&
+          n.params?.turn_id === turnId &&
+          n.params?.payload?.type === "tool_start",
       );
       const toolCompleted = log.filter(
-        (n) => n.method === "tool/completed" && n.params?.turn_id === turnId,
+        (n) =>
+          n.method === "projection/envelope" &&
+          n.params?.turn_id === turnId &&
+          n.params?.payload?.type === "tool_end",
       );
 
       // If no tool fired, the live agent decided to answer from priors —
@@ -76,12 +85,12 @@ test.describe("M9 protocol — tool/* events", () => {
       // distinct tool calls.
       const startedIds = new Set(
         toolStarted
-          .map((n) => n.params?.tool_call_id)
+          .map((n) => n.params?.payload?.data?.tool_call_id)
           .filter((x): x is string => typeof x === "string"),
       );
       const completedIds = new Set(
         toolCompleted
-          .map((n) => n.params?.tool_call_id)
+          .map((n) => n.params?.payload?.data?.tool_call_id)
           .filter((x): x is string => typeof x === "string"),
       );
       for (const id of startedIds) {
@@ -92,10 +101,16 @@ test.describe("M9 protocol — tool/* events", () => {
       // notification log (durable ordering).
       for (const id of startedIds) {
         const startIdx = log.findIndex(
-          (n) => n.method === "tool/started" && n.params?.tool_call_id === id,
+          (n) =>
+            n.method === "projection/envelope" &&
+            n.params?.payload?.type === "tool_start" &&
+            n.params?.payload?.data?.tool_call_id === id,
         );
         const endIdx = log.findIndex(
-          (n) => n.method === "tool/completed" && n.params?.tool_call_id === id,
+          (n) =>
+            n.method === "projection/envelope" &&
+            n.params?.payload?.type === "tool_end" &&
+            n.params?.payload?.data?.tool_call_id === id,
         );
         expect(startIdx).toBeGreaterThanOrEqual(0);
         expect(endIdx).toBeGreaterThan(startIdx);

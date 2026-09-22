@@ -11249,6 +11249,124 @@ fn parses_turn_start_rpc_request() {
     ));
 }
 
+/// #12 / 1附.5: a method absent from the server supported-methods table is
+/// UNKNOWN — the wire contract is JSON-RPC `-32601 method not found` with
+/// the method name echoed, never `-32004 method not supported` (which is
+/// reserved for known-but-capability-gated methods).
+#[test]
+fn should_return_method_not_found_when_rpc_method_unknown() {
+    let raw = json!({
+        "jsonrpc": "2.0",
+        "id": "rpc-unknown",
+        "method": "session/zzz-not-real",
+        "params": {},
+    })
+    .to_string();
+
+    let decoded = parse_rpc_request(&raw).expect("parse");
+    let error = route_rpc_command(decoded, ConnectionUiFeatures::default())
+        .expect_err("unknown method must not route");
+
+    assert_eq!(error.code, rpc_error_codes::METHOD_NOT_FOUND);
+    assert!(
+        error.message.contains("session/zzz-not-real"),
+        "error message must echo the method name: {}",
+        error.message
+    );
+}
+
+/// #12 / 1附.5: a method present in the supported-methods table but gated
+/// behind a strict opt-in capability the connection never negotiated keeps
+/// returning `-32004 method not supported` (regression guard — the unknown
+/// method fix must not collapse the two semantics).
+#[test]
+fn should_return_method_not_supported_when_known_method_strict_gated() {
+    let raw = json!({
+        "jsonrpc": "2.0",
+        "id": "rpc-gated",
+        "method": methods::SESSION_LIST,
+        "params": {},
+    })
+    .to_string();
+
+    let decoded = parse_rpc_request(&raw).expect("parse");
+    let error = route_rpc_command(decoded, ConnectionUiFeatures::default())
+        .expect_err("strict-gated method must not route without negotiation");
+
+    assert_eq!(error.code, rpc_error_codes::METHOD_NOT_SUPPORTED);
+    assert!(
+        error.message.contains(methods::SESSION_LIST),
+        "error message must echo the method name: {}",
+        error.message
+    );
+}
+
+/// #12: the admin connection scope (`admin`) is a VIRTUAL profile — the
+/// auth layer synthesizes it for `AuthIdentity::Admin`, it never exists in
+/// the profile store. On a store-backed serve with no `admin` profile row
+/// (the nightly CI shape: fresh HOME + admin token), `session/open` must not
+/// die with `profile_unresolved` — the admin manager legitimately owns
+/// those sessions (#40 ③ pinned the scope for hydrate alignment).
+#[test]
+fn should_treat_admin_scope_as_known_when_store_lacks_admin_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    // The store genuinely has no `admin` row.
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get(crate::api::auth_handlers::ADMIN_PROFILE_ID)
+            .ok()
+            .flatten()
+            .is_none(),
+        "fixture must start without an admin profile row"
+    );
+
+    assert!(
+        profile_is_known(&state, crate::api::auth_handlers::ADMIN_PROFILE_ID),
+        "admin connection scope must be known without a store row"
+    );
+    ensure_known_profile(&state, crate::api::auth_handlers::ADMIN_PROFILE_ID)
+        .expect("admin scope must pass ensure_known_profile");
+}
+
+/// #12: an admin-token connection is a SUPERUSER over profiles (REST parity:
+/// `is_authorized_for_profile` allows admin everywhere). Requesting an
+/// explicit profile scope must not trip the authenticated-scope mismatch
+/// (which closes the WS with 1008) — the requested profile becomes active.
+#[test]
+fn should_allow_admin_connection_to_request_explicit_profile_scope() {
+    let session_id = SessionKey::new("api", "chat-1");
+
+    let active = validate_session_scope(
+        &session_id,
+        Some("_main"),
+        Some(crate::api::auth_handlers::ADMIN_PROFILE_ID),
+    )
+    .expect("admin connection may request an explicit profile scope");
+
+    assert_eq!(
+        active.as_deref(),
+        Some("_main"),
+        "the requested profile wins for an admin connection"
+    );
+}
+
+/// #12: the admin relaxation must not leak to ordinary user-scoped
+/// connections — a non-admin connection pinned to profile-a still rejects
+/// an explicit profile-b scope with the auth-scope violation (1008 path).
+#[test]
+fn should_reject_explicit_profile_scope_for_non_admin_connection() {
+    let session_id = SessionKey::new("api", "chat-1");
+
+    let error = validate_session_scope(&session_id, Some("profile-b"), Some("profile-a"))
+        .expect_err("non-admin cross-profile scope must be rejected");
+
+    assert!(is_auth_scope_violation(&error));
+}
+
 /// UPCR-2026-015 (M9-β-1): the WS turn/start handler accepts the
 /// three new optional fields (`media`, `topic`, `rewrite_for`)
 /// from a strict-additive wire shape. The legacy text-only form
@@ -22945,7 +23063,7 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
     assert!(
         !frames
             .iter()
-            .any(|frame| frame.contains("\"method\":\"message/delta\"") && frame.contains("OK\\n")),
+            .any(|frame| frame.contains("assistant_delta") && frame.contains("OK\\n")),
         "slow fixture must not emit OK delta after a pending interrupt: {frames:?}",
     );
 
@@ -22963,6 +23081,214 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
             if event.turn_id == turn_id && event.code == "interrupted"
     )));
+    // The pending interrupt must pre-empt even the FIRST delta: no
+    // assistant_delta envelope may be ledgered either (Stage-5 wire form).
+    assert!(
+        !replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(note))
+                if matches!(&note.envelope.payload, PayloadV2::AssistantDelta { text, .. } if text.contains("OK"))
+        )),
+        "slow fixture must not ledger an assistant delta after a pending interrupt"
+    );
+}
+
+/// #12: the fixture turn must persist the user prompt and assistant reply
+/// into the standalone session manager like a real turn — otherwise
+/// `session/messages_page` finds no history for the session and the REST
+/// fallback 503s (web-client "session persists across requests").
+#[tokio::test]
+async fn should_persist_user_and_assistant_rows_when_basic_fixture_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state_with_sessions(dir.path());
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:persist-fixture".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "fixture persist probe".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        Arc::clone(&state),
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::Basic,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    let sessions = state.sessions.as_ref().expect("sessions manager");
+    let mut mgr = sessions.lock().await;
+    let session = mgr.get_or_create(&session_id).await;
+    let history = session.get_history(10);
+    assert!(
+        history
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.content.contains("fixture persist probe")),
+        "fixture must persist the user prompt: {history:?}"
+    );
+    assert!(
+        history.iter().any(
+            |m| m.role == MessageRole::Assistant && m.content.contains("fixture persist probe")
+        ),
+        "fixture must persist the assistant echo: {history:?}"
+    );
+}
+
+/// #12 / Stage-5 cutover: legacy `message/delta` frames are suppressed for
+/// EVERY connection (`live_event_passes_capability_filter`), so the Basic
+/// fixture must deliver content as a canonical v2 `assistant_delta`
+/// envelope. It echoes the prompt so transport-fidelity e2e assertions
+/// (CJK, byte boundaries) have deterministic non-trivial content.
+#[tokio::test]
+async fn should_emit_assistant_delta_envelope_echoing_prompt_when_basic_fixture_runs() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "你好世界 fixture probe".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::Basic,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    let replay = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after basic fixture");
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(note))
+                if matches!(&note.envelope.payload, PayloadV2::AssistantDelta { text, .. } if text.contains("你好世界 fixture probe"))
+        )),
+        "basic fixture must echo the prompt as a canonical assistant_delta envelope"
+    );
+}
+
+/// #12 / Stage-5 cutover: the ToolEvents fixture's legacy
+/// `tool/started`/`tool/completed` frames are suppressed for every
+/// connection and have no projection arm — the fixture must emit native
+/// `tool_start`/`tool_progress`/`tool_end` envelopes or the tool-events
+/// e2e can never observe the correlation it asserts.
+#[tokio::test]
+async fn should_emit_native_tool_envelopes_when_tool_events_fixture_runs() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "Use the list_dir tool to list '.'".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::ToolEvents,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    let replay = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after tool fixture");
+    let has_tool_envelope =
+        |replay: &[crate::api::ui_protocol_ledger::LedgeredUiProtocolEvent], want_start: bool| {
+            replay.iter().any(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(note)) => {
+                    match &note.envelope.payload {
+                        PayloadV2::ToolStart {
+                            tool_call_id, name, ..
+                        } => {
+                            want_start && tool_call_id.starts_with("m9-tool-") && name == "list_dir"
+                        }
+                        PayloadV2::ToolEnd { tool_call_id, .. } => {
+                            !want_start && tool_call_id.starts_with("m9-tool-")
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            })
+        };
+    assert!(
+        has_tool_envelope(&replay, true),
+        "tool fixture must emit a native tool_start envelope"
+    );
+    assert!(
+        has_tool_envelope(&replay, false),
+        "tool fixture must emit a native tool_end envelope"
+    );
 }
 
 /// #1463 — an interrupted M9 fixture turn must drain pending user questions

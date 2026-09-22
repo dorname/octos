@@ -18,41 +18,23 @@ import {
   M9WsClient,
   expectRpcError,
   freshTurnId,
+  isTurnTerminalEnvelopeFor,
   liveServerEnv,
   uniqueSessionId,
 } from "../lib/m9-ws-client";
 
 const UNKNOWN_TURN_CODE = -32101;
 
+// Stage-5 v2 wire: the terminal arrives ONLY as a projection/envelope with
+// payload.type === "turn_terminal" — the legacy turn/completed / turn/error
+// frames are suppressed for every connection.
 async function waitForTurnTerminal(
   client: M9WsClient,
   turnId: string,
   timeoutMs = 45_000,
 ) {
-  const existing = client
-    .notificationsLog()
-    .find(
-      (n) =>
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId,
-    );
-  if (existing) return existing;
-
-  return new Promise<ReturnType<M9WsClient["notificationsLog"]>[number]>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`timed out waiting for terminal event for ${turnId}`)),
-      timeoutMs,
-    );
-    client.onNotification((n) => {
-      if (
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId
-      ) {
-        clearTimeout(timer);
-        resolve(n);
-      }
-    });
-  });
+  const params = await client.waitForTurnTerminalEnvelope(turnId, timeoutMs);
+  return { method: "projection/envelope", params };
 }
 
 test.describe("M9 protocol — turn/interrupt (happy paths)", () => {
@@ -143,14 +125,11 @@ test.describe("M9 protocol — turn/interrupt (happy paths)", () => {
       expect(second.interrupted).toBe(true);
 
       const terminal = await waitForTurnTerminal(client, turnId, 45_000);
-      expect(terminal.method).toBe("turn/error");
-      expect(terminal.params.code).toBe("interrupted");
+      expect(terminal.params.payload.data.outcome).toBe("interrupted");
 
-      const terminalEvents = client.notificationsLog().filter(
-        (n) =>
-          (n.method === "turn/completed" || n.method === "turn/error") &&
-          n.params?.turn_id === turnId,
-      );
+      const terminalEvents = client
+        .notificationsLog()
+        .filter((n) => isTurnTerminalEnvelopeFor(n, turnId));
       expect(terminalEvents).toHaveLength(1);
     } finally {
       await client.close();

@@ -49,9 +49,9 @@ use octos_core::ui_protocol::{
     TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
-    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -9554,6 +9554,15 @@ fn fallback_enabled_profile_id(state: &AppState, requested: &str) -> Option<Stri
 }
 
 fn profile_is_known(state: &AppState, profile_id: &str) -> bool {
+    // #12: the admin connection scope is a VIRTUAL profile — the auth layer
+    // synthesizes it for `AuthIdentity::Admin` (#40 ③ pinned it so hydrate
+    // and open resolve consistently), but no `admin` row ever exists in the
+    // profile store. Without this clause every admin-token `session/open` on
+    // a store-backed serve (the nightly CI shape: fresh HOME + admin token)
+    // died with `profile_unresolved` before the turn could start.
+    if profile_id == crate::api::auth_handlers::ADMIN_PROFILE_ID {
+        return true;
+    }
     state
         .profile_store
         .as_ref()
@@ -18679,7 +18688,13 @@ fn route_rpc_command(
 ) -> Result<UiCommand, RpcError> {
     let method_str = request.method.as_str();
     if !ui_protocol_server_supported_methods().contains(&method_str) {
-        return Err(RpcError::method_not_supported(method_str));
+        // #12 / 1附.5: a method absent from the supported-methods table is
+        // UNKNOWN — answer with the JSON-RPC standard `method_not_found`
+        // (-32601), echoing the method name. `method_not_supported` (-32004)
+        // is reserved for KNOWN methods rejected by capability gates below;
+        // collapsing the two makes clients misread "protocol mismatch" as
+        // "capability not negotiated" and take the wrong fallback path.
+        return Err(RpcError::method_not_found(method_str));
     }
     // UPCR-2026-009 / -010 / -011 + M12 Phase D-1: when the method is
     // gated behind a feature flag and the connection did not negotiate
@@ -19108,6 +19123,32 @@ fn validate_session_scope(
 ) -> Result<Option<String>, RpcError> {
     if requested_profile_id.is_some_and(str::is_empty) {
         return Err(RpcError::invalid_params("profile_id cannot be empty"));
+    }
+
+    // #12: an admin-token connection is a SUPERUSER over profiles (REST
+    // parity: `is_authorized_for_profile` allows the admin identity every
+    // profile). The connection pin to `admin` (#40 ③) must not weaponize
+    // the scope-mismatch 1008 close against an explicit profile request —
+    // the requested (or session-prefixed) profile becomes active instead,
+    // defaulting to the virtual `admin` scope for bare opens.
+    if connection_profile_id == Some(crate::api::auth_handlers::ADMIN_PROFILE_ID) {
+        if let (Some(requested_profile_id), Some(session_profile_id)) =
+            (requested_profile_id, session_id.profile_id())
+        {
+            if requested_profile_id != session_profile_id {
+                return Err(profile_mismatch_error(
+                    "profile_id does not match session_id profile",
+                    session_profile_id,
+                    Some(requested_profile_id),
+                ));
+            }
+        }
+        return Ok(Some(
+            requested_profile_id
+                .or_else(|| session_id.profile_id())
+                .unwrap_or(crate::api::auth_handlers::ADMIN_PROFILE_ID)
+                .to_owned(),
+        ));
     }
 
     if let Some(connection_profile_id) = connection_profile_id {
@@ -30993,16 +31034,39 @@ async fn run_m9_fixture_turn(
 
     let outcome = match fixture {
         M9ProtocolFixture::Basic => {
-            let _ = send_notification_ephemeral(
-                &ws,
-                &ledger,
-                UiNotification::MessageDelta(MessageDeltaEvent {
-                    session_id: session_id.clone(),
-                    topic: None,
-                    turn_id: turn_id.clone(),
-                    text: "OK".to_owned(),
-                }),
+            // #12 / Stage-5 cutover: legacy `message/delta` frames are
+            // suppressed for EVERY connection
+            // (`live_event_passes_capability_filter`), so fixture content
+            // must flow as a canonical v2 `assistant_delta` envelope. The
+            // fixture echoes the prompt: deterministic, and it exercises
+            // transport-fidelity (CJK / byte boundaries) with non-trivial
+            // content the e2e specs can assert on.
+            let echo = prompt_text(&params.input).unwrap_or_default();
+            let _ = ledger.emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::AssistantDelta {
+                    text: echo.clone(),
+                    assistant_segment_id: format!("{}:assistant:fixture", turn_id.0),
+                },
+                None,
             );
+            // #12: persist the user prompt + assistant echo into the
+            // standalone session manager like a real turn (thread-stamped,
+            // through the canonical commit path so the commit observer emits
+            // the same persisted envelopes a live turn would). Without this,
+            // `session/messages_page` finds no history for fixture sessions
+            // and the REST fallback 503s.
+            if let Some(sessions) = state.sessions.clone() {
+                let thread = turn_id.0.to_string();
+                let user_message = pre_stamp_turn_thread_id(Message::user(echo.clone()), &thread);
+                let assistant_message = pre_stamp_turn_thread_id(Message::assistant(echo), &thread);
+                let mut mgr = sessions.lock().await;
+                let _ = mgr.add_message_with_seq(&session_id, user_message).await;
+                let _ = mgr
+                    .add_message_with_seq(&session_id, assistant_message)
+                    .await;
+            }
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,
                 std::time::Duration::from_millis(20),
@@ -31043,15 +31107,15 @@ async fn run_m9_fixture_turn(
                     interrupted = true;
                     break;
                 }
-                let _ = send_notification_ephemeral(
-                    &ws,
-                    &ledger,
-                    UiNotification::MessageDelta(MessageDeltaEvent {
-                        session_id: session_id.clone(),
-                        topic: None,
-                        turn_id: turn_id.clone(),
+                // #12 / Stage-5 cutover: same envelope-only wire as Basic.
+                let _ = ledger.emit_envelope_v2(
+                    &session_id,
+                    turn_id.0.to_string(),
+                    PayloadV2::AssistantDelta {
                         text: "OK\n".to_owned(),
-                    }),
+                        assistant_segment_id: format!("{}:assistant:fixture", turn_id.0),
+                    },
+                    None,
                 );
                 if m9_fixture_delay_or_interrupt(
                     &mut interrupt_rx,
@@ -31071,44 +31135,42 @@ async fn run_m9_fixture_turn(
         }
         M9ProtocolFixture::ToolEvents => {
             let tool_call_id = format!("m9-tool-{}", turn_id.0);
-            let topic = session_id.topic().map(ToOwned::to_owned);
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolStarted(ToolStartedEvent {
-                    session_id: session_id.clone(),
-                    topic: topic.clone(),
-                    turn_id: turn_id.clone(),
+            // #12 / Stage-5 cutover: legacy `tool/*` frames are suppressed
+            // for every connection and have no projection arm — emit native
+            // `tool_start`/`tool_progress`/`tool_end` envelopes or the wire
+            // carries nothing for this turn.
+            use octos_core::ui_protocol::EnvelopeToolEndStatus;
+            let _ = ledger.emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::ToolStart {
                     tool_call_id: tool_call_id.clone(),
-                    tool_name: "list_dir".to_owned(),
-                    arguments: Some(json!({ "path": "." })),
-                }),
+                    name: "list_dir".to_owned(),
+                    arguments_preview: Some("{ \"path\": \".\" }".to_owned()),
+                },
+                None,
             );
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolProgress(ToolProgressEvent {
-                    session_id: session_id.clone(),
-                    topic: topic.clone(),
-                    turn_id: turn_id.clone(),
+            let _ = ledger.emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::ToolProgress {
                     tool_call_id: tool_call_id.clone(),
-                    message: Some("listing workspace".to_owned()),
-                    progress_pct: Some(50.0),
-                }),
+                    message: "listing workspace".to_owned(),
+                },
+                None,
             );
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolCompleted(ToolCompletedEvent {
-                    session_id: session_id.clone(),
-                    topic,
-                    turn_id: turn_id.clone(),
+            let _ = ledger.emit_envelope_v2(
+                &session_id,
+                turn_id.0.to_string(),
+                PayloadV2::ToolEnd {
                     tool_call_id,
-                    tool_name: "list_dir".to_owned(),
-                    success: Some(true),
+                    status: EnvelopeToolEndStatus::Complete,
+                    error: None,
+                    reason: None,
                     output_preview: Some("deterministic fixture listing".to_owned()),
                     duration_ms: Some(1),
-                }),
+                },
+                None,
             );
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,

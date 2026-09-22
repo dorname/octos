@@ -14,9 +14,14 @@
 {"id":"SMOKE-DUPFRAME-01","status":"pass","timestamp":"2026-09-23T01:20:00Z","scenario":"S05","note":"k8s playwright: send message, 90s window user frame==1 (3 occurrences incl. title+sidebar), assistant replied"}
 {"id":"SMOKE-DUPFRAME-02","status":"pass","timestamp":"2026-09-23T01:20:30Z","scenario":"S05","note":"k8s playwright: after page reload + session reopen user frame still ==1"}
 {"id":"SMOKE-DUPFRAME-03","status":"pass","timestamp":"2026-09-23T01:21:00Z","scenario":"S05","note":"WS capture: live user_message envelope cmid==turn_id; hydrate snapshot row carries same cmid; session/hydrate RPC count 19 over ~2min (pre-fix 6626/60s)"}
-{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T16:37:38Z","scenario":"S17"}
-{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T16:37:41Z","scenario":"S17"}
-{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T16:37:42Z","scenario":"S17"}
-{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T16:37:43Z","scenario":"S17"}
-{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T16:37:49Z","scenario":"S17"}
-{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T16:37:52Z","scenario":"S17"}
+{"id":"SMOKE-RPC-01","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"本地 fixture serve WS 请求 session/zzz-not-real 返回 -32601 且回显方法名"}
+{"id":"SMOKE-RPC-02","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"未协商 auxiliary 能力时 session/list 返回 -32004"}
+{"id":"SMOKE-RPC-03","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"admin 裸 session/open 成功(profile store 为空,不报 profile_unresolved)"}
+{"id":"SMOKE-RPC-04","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"fixture turn 全事件以 envelope 到达:turn/started→assistant_delta(回显 CJK prompt)→turn_terminal(completed),无 legacy 帧"}
+{"id":"SMOKE-RPC-05","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"musl 重建注入 k8s(ns octos),rollout 成功,/health 200,WS 复验:-32601 + admin 裸 open 通过"}
+{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T19:01:07Z","scenario":"S17"}
+{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T19:01:09Z","scenario":"S17"}
+{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T19:01:10Z","scenario":"S17"}
+{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T19:01:11Z","scenario":"S17"}
+{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T19:01:17Z","scenario":"S17"}
+{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T19:01:20Z","scenario":"S17"}
