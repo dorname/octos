@@ -315,8 +315,19 @@ fn admin_bundle_missing_response() -> Response {
 /// like `apibackup` fall through to the admin redirect rather than being
 /// hijacked by the 404 branch.
 fn is_api_or_infra_path(path: &str) -> bool {
-    for prefix in ["api", "webhook", "internal"] {
+    // Prefix families (segment-boundary matched): anything under these roots
+    // is API-shaped — an unmatched route must 404 as JSON, never 307 into
+    // the SPA (#17: `/v1/*` used to redirect to `/app/`).
+    for prefix in ["api", "webhook", "internal", "v1"] {
         if path == prefix || path.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+    // Exact infrastructure documents: registered routes normally claim
+    // these (`/health`), but when no route matches they are still
+    // API-shaped and must not fall through to the SPA redirect.
+    for exact in ["health", "openapi.json", "docs"] {
+        if path == exact || path.starts_with(&format!("{exact}/")) {
             return true;
         }
     }
@@ -464,6 +475,59 @@ mod tests {
         let assets = StubAssets::empty();
         let resp = serve_with(&assets, &state, "/webhook/unknown/profile").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #17: unmatched infrastructure paths OUTSIDE `/api` —
+    /// `/v1/*`, `/openapi.json`, `/docs`, `/health` — must also return
+    /// `404 application/json` instead of `307 -> /app/`. API clients
+    /// (Playwright `apiRequestContext`, reqwest) trip their redirect cap
+    /// or parse the SPA HTML as a JSON/event-stream body.
+    #[tokio::test]
+    async fn should_return_404_for_unmatched_infra_paths() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::empty();
+        for path in [
+            "/v1/chat/completions",
+            "/v1",
+            "/openapi.json",
+            "/docs",
+            "/docs/anything",
+            "/health",
+        ] {
+            let resp = serve_with(&assets, &state, path).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must 404, not redirect into the SPA"
+            );
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(ct, "application/json", "{path} must be JSON");
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "not_found", "{path}");
+            assert_eq!(body["path"], path, "{path}");
+        }
+    }
+
+    /// Segment-match guard for the new infra prefixes: sibling paths like
+    /// `/v1beta`, `/healthcare`, `/openapi.json.bak`, `/docsify` are NOT
+    /// infrastructure surfaces and keep the original SPA behavior.
+    #[tokio::test]
+    async fn should_not_match_infra_prefix_siblings() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
+        for path in ["/v1beta", "/healthcare", "/openapi.json.bak", "/docsify"] {
+            let resp = serve_with(&assets, &state, path).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "sibling {path} must not be captured by the infra 404 guard"
+            );
+        }
     }
 
     /// Segment-match guard: `/apibackup` is a sibling name, NOT an API
