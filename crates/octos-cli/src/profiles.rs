@@ -7308,7 +7308,9 @@ mod tests {
             &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
         );
         let mut ov = seed_profile("cw", "minimax-token");
-        ov.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-real".into());
+        ov.config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".into(), "sk-real".into());
         write_json(
             &store.profile_override_path("cw"),
             &serde_json::json!({
@@ -7318,10 +7320,23 @@ mod tests {
             }),
         );
         let got = store.get("cw").unwrap().unwrap();
-        let fam = got.config.llm.as_ref().unwrap().primary.as_ref().unwrap().family_id.clone().unwrap();
+        let fam = got
+            .config
+            .llm
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .family_id
+            .clone()
+            .unwrap();
         assert_eq!(fam, "minimax-token", "overlay llm must win over seed");
         assert_eq!(
-            got.config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            got.config
+                .env_vars
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
             Some("sk-real"),
             "overlay env_vars must merge in"
         );
@@ -7339,7 +7354,10 @@ mod tests {
             &serde_json::to_value(seed_profile("cw", "moonshot-coding")).unwrap(),
         );
         let mut leftover = seed_profile("cw", "stale-family");
-        leftover.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-stale".into());
+        leftover
+            .config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".into(), "sk-stale".into());
         // Leftover is a bare UserProfile json (no managed_by wrapper).
         write_json(
             &store.profile_override_path("cw"),
@@ -7347,8 +7365,14 @@ mod tests {
         );
         let got = store.get("cw").unwrap().unwrap();
         let fam = got.config.llm.unwrap().primary.unwrap().family_id.unwrap();
-        assert_eq!(fam, "moonshot-coding", "unmarked leftover must NOT shadow seed");
-        assert!(got.config.env_vars.is_empty(), "unmarked leftover env_vars must NOT merge");
+        assert_eq!(
+            fam, "moonshot-coding",
+            "unmarked leftover must NOT shadow seed"
+        );
+        assert!(
+            got.config.env_vars.is_empty(),
+            "unmarked leftover env_vars must NOT merge"
+        );
     }
 
     #[test]
@@ -7378,7 +7402,9 @@ mod tests {
             std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o444)).unwrap();
         }
         let mut ui = seed_profile("cw", "minimax-token");
-        ui.config.env_vars.insert("ANTHROPIC_API_KEY".into(), "sk-ui".into());
+        ui.config
+            .env_vars
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ui".into());
         store.save(&ui).unwrap();
 
         assert!(
@@ -7387,14 +7413,33 @@ mod tests {
         );
         let raw = std::fs::read_to_string(store.profile_override_path("cw")).unwrap();
         let wrapper: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(wrapper.get("managed_by").and_then(|v| v.as_str()), Some("ui"));
-        assert!(wrapper.get("updated_at").is_some(), "overlay must carry updated_at");
+        assert_eq!(
+            wrapper.get("managed_by").and_then(|v| v.as_str()),
+            Some("ui")
+        );
+        assert!(
+            wrapper.get("updated_at").is_some(),
+            "overlay must carry updated_at"
+        );
 
         let got = store.get("cw").unwrap().unwrap();
-        let fam = got.config.llm.as_ref().unwrap().primary.as_ref().unwrap().family_id.clone().unwrap();
+        let fam = got
+            .config
+            .llm
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .family_id
+            .clone()
+            .unwrap();
         assert_eq!(fam, "minimax-token");
         assert_eq!(
-            got.config.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            got.config
+                .env_vars
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
             Some("sk-ui")
         );
     }
@@ -7413,7 +7458,6 @@ mod tests {
         );
     }
 
-
     // ── Issue #15 (修复 #13 缺陷): seed_readonly 写探测(挂载语义只读) ──
 
     #[test]
@@ -7424,7 +7468,9 @@ mod tests {
         // itself is environment-independent; these asserts run on CI/non-root.
         let skip_root = current_euid_is_root();
         if skip_root {
-            eprintln!("skipping probe_readonly_detects_chmod_444_readonly under root (permission-bit mock is a no-op for uid 0)");
+            eprintln!(
+                "skipping probe_readonly_detects_chmod_444_readonly under root (permission-bit mock is a no-op for uid 0)"
+            );
             return;
         }
         // UT-S16-41: write-probe on a chmod-444 (permission-bit read-only)
@@ -7463,7 +7509,9 @@ mod tests {
         // itself is environment-independent; these asserts run on CI/non-root.
         let skip_root = current_euid_is_root();
         if skip_root {
-            eprintln!("skipping probe_readonly_detects_mount_level_readonly_via_dir_0555 under root (permission-bit mock is a no-op for uid 0)");
+            eprintln!(
+                "skipping probe_readonly_detects_mount_level_readonly_via_dir_0555 under root (permission-bit mock is a no-op for uid 0)"
+            );
             return;
         }
         // UT-S16-42: the #14 live gap — a file whose PERMISSION BITS are
@@ -7570,7 +7618,9 @@ mod tests {
         // convention (#4 outer note / #15). Probe logic is environment-
         // independent; these asserts run on CI/non-root.
         if current_euid_is_root() {
-            eprintln!("skipping probe_readonly_detects_subpath_file_ro_dir_writable under root (permission-bit mock is a no-op for uid 0)");
+            eprintln!(
+                "skipping probe_readonly_detects_subpath_file_ro_dir_writable under root (permission-bit mock is a no-op for uid 0)"
+            );
             return;
         }
         // UT-S16-45: the #19 blind spot — a WRITABLE directory (0755) but a
@@ -7623,7 +7673,9 @@ mod tests {
         let before = std::fs::read_to_string(&seed_path).unwrap();
         let _ = probe_readonly_fs(&seed_path); // writable path → target probe opens write(true)
         let after = std::fs::read_to_string(&seed_path).unwrap();
-        assert_eq!(before, after, "write-open probe must not modify seed content");
+        assert_eq!(
+            before, after,
+            "write-open probe must not modify seed content"
+        );
     }
-
 }

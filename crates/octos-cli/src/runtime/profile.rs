@@ -290,13 +290,16 @@ fn apply_self_family_key_resolution(
     // candidate under a DIFFERENT name than the route's wins (the route name
     // itself was already shown missing/placeholder above).
     let candidates = by_family_key_candidates(&key_var, provider_name);
-    let hit = candidates.iter().filter(|name| *name != &key_var).find_map(|name| {
-        config
-            .env_vars
-            .get(name)
-            .filter(|v| !is_placeholder_key(v))
-            .map(|v| (name.clone(), v.clone()))
-    });
+    let hit = candidates
+        .iter()
+        .filter(|name| *name != &key_var)
+        .find_map(|name| {
+            config
+                .env_vars
+                .get(name)
+                .filter(|v| !is_placeholder_key(v))
+                .map(|v| (name.clone(), v.clone()))
+        });
     let Some((hit_name, key)) = hit else {
         return;
     };
@@ -1129,6 +1132,119 @@ impl ProfileRuntime {
             runtime_lifecycle: self.runtime_lifecycle.clone(),
             pipeline_factory,
             hook_executor,
+            lane_routing: self.lane_routing.clone(),
+            voice: self.voice.clone(),
+        }))
+    }
+
+    /// Rebuild ONLY the LLM provider chain from a freshly committed profile
+    /// file, reusing every long-lived store (episode/memory/recall/
+    /// tool-config), the embedder, and the plugin layer from `self`. This is
+    /// the startup-pinned counterpart of a full re-bootstrap: the boot
+    /// snapshot in `state.profiles` holds the profile's redb single-writer
+    /// lock for the process lifetime, so a hot reload must never re-open
+    /// those stores.
+    ///
+    /// Config derivation mirrors [`Self::bootstrap_resolved`] steps 1-3
+    /// (host memory merge, provider resolution, self/admin key fallbacks) so
+    /// the rebuilt chain serves exactly what a cold restart would serve.
+    pub async fn rebuild_llm_layer(
+        self: &Arc<Self>,
+        profile: &UserProfile,
+        host_memory: Option<&crate::config::MemoryConfig>,
+    ) -> Result<Arc<Self>> {
+        let mut config = config_from_profile(profile, None, None);
+        crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
+
+        let model = config.model.clone();
+        let base_url = config.base_url.clone();
+        let provider_name = config
+            .provider
+            .clone()
+            .or_else(|| {
+                model
+                    .as_deref()
+                    .and_then(crate::config::detect_provider)
+                    .map(String::from)
+            })
+            .ok_or_else(|| {
+                eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
+            })?;
+        apply_self_family_key_resolution(profile, &provider_name, &mut config);
+        apply_admin_llm_key_fallback(profile, &self.data_dir, &provider_name, &mut config);
+
+        let base_provider = chat::create_provider(&provider_name, &config, model, base_url)
+            .wrap_err_with(|| {
+                format!("failed to create LLM provider for profile '{}'", profile.id)
+            })?;
+        let primary_model_id = base_provider.model_id().to_string();
+        let bundle = build_adaptive_provider_chain(
+            base_provider,
+            &config,
+            &self.data_dir,
+            false,
+            ExporterMode::Spawn,
+        );
+        let goal_verifier_llm = build_goal_verifier_provider(&config);
+        let credentials = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
+        // The profile-sourced env entries follow the committed file (LLM
+        // upserts may relocate keychain-backed secrets out of env_vars);
+        // the runtime-injected entries are process-immutable and carry over.
+        let mut plugin_env_template = profile_plugin_env(profile);
+        for (key, value) in &self.plugin_env_template {
+            if matches!(
+                key.as_str(),
+                "OCTOS_DATA_DIR" | "OCTOS_HOME" | "OCTOS_PROFILE_ID" | "OCTOS_VOICE_DIR"
+            ) || key.as_str().ends_with("_API_URL")
+            {
+                plugin_env_template.push((key.clone(), value.clone()));
+            }
+        }
+
+        Ok(Arc::new(Self {
+            profile_id: self.profile_id.clone(),
+            data_dir: self.data_dir.clone(),
+            session_store_root: self.session_store_root.clone(),
+            config,
+            llm: bundle.llm.clone(),
+            goal_verifier_llm,
+            adaptive_router: bundle.adaptive_router.clone(),
+            runtime_qos_catalog: bundle.runtime_qos_catalog.clone(),
+            primary_model_id,
+            provider_name,
+            credentials,
+            skills_dir: self.skills_dir.clone(),
+            plugin_env_template,
+            tool_policy: self.tool_policy.clone(),
+            default_sandbox: self.default_sandbox.clone(),
+            max_iterations: self.max_iterations,
+            session_defaults: self.session_defaults.clone(),
+            agent_profile: self.agent_profile.clone(),
+            format_after_edit: self.format_after_edit,
+            snapshots: self.snapshots.clone(),
+            tool_specs: self.tool_specs.clone(),
+            plugin_tool_names: self.plugin_tool_names.clone(),
+            skill_actions: self.skill_actions.clone(),
+            plugin_reload: self.plugin_reload.clone(),
+            plugin_dirs: self.plugin_dirs.clone(),
+            plugin_prompt_fragments: self.plugin_prompt_fragments.clone(),
+            plugin_hooks: self.plugin_hooks.clone(),
+            review_config: self.review_config.clone(),
+            human_approval_rules: self.human_approval_rules.clone(),
+            system_prompt: self.system_prompt.clone(),
+            prompt_parts: self.prompt_parts.clone(),
+            memory: self.memory.clone(),
+            memory_store: self.memory_store.clone(),
+            recall: self.recall.clone(),
+            embedder: self.embedder.clone(),
+            memory_inject_tokens: self.memory_inject_tokens,
+            memory_refresh_enabled: self.memory_refresh_enabled,
+            memory_refresh: self.memory_refresh.clone(),
+            tool_config: self.tool_config.clone(),
+            cron_service: self.cron_service.clone(),
+            runtime_lifecycle: self.runtime_lifecycle.clone(),
+            pipeline_factory: self.pipeline_factory.clone(),
+            hook_executor: self.hook_executor.clone(),
             lane_routing: self.lane_routing.clone(),
             voice: self.voice.clone(),
         }))
@@ -3460,7 +3576,10 @@ mod tests {
         // UT-S16-47: consuming profile (cluster-worker) key env MISSING →
         // fall back to admin's key, injected into env_vars.
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-admin-real".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
@@ -3468,7 +3587,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_23")
+                .map(String::as_str),
             Some("sk-admin-real"),
             "missing consuming key must fall back to the admin profile key"
         );
@@ -3479,7 +3601,10 @@ mod tests {
         // UT-S16-48: consuming profile key env = REPLACE_ME placeholder (the
         // k8s ConfigMap seed value) → fall back to admin's real key.
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-admin-real".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut own = HashMap::new();
@@ -3489,7 +3614,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_23")
+                .map(String::as_str),
             Some("sk-admin-real"),
             "REPLACE_ME placeholder must be treated as missing and fall back"
         );
@@ -3500,17 +3628,26 @@ mod tests {
         // UT-S16-49: consuming profile has a REAL explicit key → never
         // overridden by the admin fallback (explicit-key-wins).
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-admin-real".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut own = HashMap::new();
-        own.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-worker-explicit".to_string());
+        own.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-worker-explicit".to_string(),
+        );
         let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", own);
 
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_23")
+                .map(String::as_str),
             Some("sk-worker-explicit"),
             "an explicit consuming key must win over the admin fallback"
         );
@@ -3539,7 +3676,10 @@ mod tests {
         // (ii) fallback never writes to disk — the consuming seed/override and
         // admin.json bytes are unchanged (read-only seed semantics preserved).
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-admin-real".to_string(),
+        );
         let (tmp, root, data_dir) = fallback_setup("cluster-worker", admin_env);
 
         // (i) admin profile is a fallback SOURCE, never a target.
@@ -3556,7 +3696,10 @@ mod tests {
         let mut config = fallback_config("OCTOS_TEST_FB_KEY_23", HashMap::new());
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_23")
+                .map(String::as_str),
             Some("sk-admin-real")
         );
         // Seed/override/admin.json bytes unchanged on disk.
@@ -3589,7 +3732,10 @@ mod tests {
         // it only ever reads `config.api_key_env`, which here is the test-only
         // OCTOS_TEST_FB_KEY_23.
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_23".to_string(), "sk-admin-real".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_23".to_string(),
+            "sk-admin-real".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         // No OCTOS_TEST_FB_KEY_23 in env_vars, and (regardless of any real
@@ -3599,7 +3745,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "anthropic", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_23").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_23")
+                .map(String::as_str),
             Some("sk-admin-real"),
             "fallback must consult only config.api_key_env (test-only name), never \
              the provider-default process env var — hermetic under a real \
@@ -3638,7 +3787,10 @@ mod tests {
         // by-family candidate set must hit MINIMAX_API_KEY and inject under the
         // route override name.
         let mut admin_env = HashMap::new();
-        admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-admin-minimax".to_string());
+        admin_env.insert(
+            "MINIMAX_API_KEY".to_string(),
+            "sk-admin-minimax".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut config =
@@ -3647,7 +3799,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_31")
+                .map(String::as_str),
             Some("sk-admin-minimax"),
             "by-family fallback must find the admin key under the family canonical \
              MINIMAX_API_KEY when the literal route override name misses (#30)"
@@ -3659,7 +3814,10 @@ mod tests {
         // UT-S16-54: when admin stores BOTH the route override name and the
         // family canonical name, the route override (most specific) wins.
         let mut admin_env = HashMap::new();
-        admin_env.insert("OCTOS_TEST_FB_KEY_31".to_string(), "sk-route-name".to_string());
+        admin_env.insert(
+            "OCTOS_TEST_FB_KEY_31".to_string(),
+            "sk-route-name".to_string(),
+        );
         admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-family-name".to_string());
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
@@ -3669,7 +3827,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_31")
+                .map(String::as_str),
             Some("sk-route-name"),
             "the route-configured name is the most specific candidate and must win"
         );
@@ -3682,7 +3843,10 @@ mod tests {
         // canonical (placeholder is never injected).
         let mut admin_env = HashMap::new();
         admin_env.insert("OCTOS_TEST_FB_KEY_31".to_string(), "REPLACE_ME".to_string());
-        admin_env.insert("MINIMAX_API_KEY".to_string(), "sk-admin-minimax".to_string());
+        admin_env.insert(
+            "MINIMAX_API_KEY".to_string(),
+            "sk-admin-minimax".to_string(),
+        );
         let (_t, _root, data_dir) = fallback_setup("cluster-worker", admin_env);
         let profile = fallback_profile("cluster-worker", HashMap::new());
         let mut config =
@@ -3691,7 +3855,10 @@ mod tests {
         apply_admin_llm_key_fallback(&profile, &data_dir, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_FB_KEY_31").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_FB_KEY_31")
+                .map(String::as_str),
             Some("sk-admin-minimax"),
             "a placeholder candidate must be skipped in favour of the real family key"
         );
@@ -3743,7 +3910,10 @@ mod tests {
         apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_SELF_35")
+                .map(String::as_str),
             Some("sk-self-minimax"),
             "self by-family resolution must inject the family-canonical key under \
              the route-declared name — including for the admin profile (#34)"
@@ -3757,13 +3927,19 @@ mod tests {
         let profile = fallback_profile("admin", HashMap::new());
         let mut own = HashMap::new();
         own.insert("OCTOS_TEST_SELF_35".to_string(), "sk-explicit".to_string());
-        own.insert("MINIMAX_API_KEY".to_string(), "sk-should-not-win".to_string());
+        own.insert(
+            "MINIMAX_API_KEY".to_string(),
+            "sk-should-not-win".to_string(),
+        );
         let mut config = fallback_config_for_family("minimax-token", "OCTOS_TEST_SELF_35", own);
 
         apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_SELF_35")
+                .map(String::as_str),
             Some("sk-explicit"),
             "an explicit key under the route name must win; family canonical must not override"
         );
@@ -3803,7 +3979,10 @@ mod tests {
         apply_self_family_key_resolution(&profile, "minimax-token", &mut config);
 
         assert_eq!(
-            config.env_vars.get("OCTOS_TEST_SELF_35").map(String::as_str),
+            config
+                .env_vars
+                .get("OCTOS_TEST_SELF_35")
+                .map(String::as_str),
             Some("sk-real-minimax"),
             "placeholder route name must be skipped; the real family-canonical key injected"
         );

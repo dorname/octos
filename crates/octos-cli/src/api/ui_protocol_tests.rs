@@ -2383,11 +2383,16 @@ async fn should_delete_last_model_evict_dynamic_runtime_and_report_deferred() {
     );
 }
 
-/// #2164 acceptance — startup-pinned profile: upsert and delete persist but
-/// return `restart_required: true` with disposition `restart_required`, and
-/// the boot-snapshot runtime is left untouched (no fake reload).
+/// Hot-reload acceptance — startup-pinned profile: upsert and delete persist
+/// AND reload the runtime immediately (disposition `reloaded`,
+/// `restart_required: false`). The rebuilt runtime lands in the dynamic cache
+/// (dynamic-first resolution serves it on the next turn) while the immutable
+/// boot snapshot in `state.profiles` stays untouched as the cold-start
+/// fallback. The rebuild must succeed even though the boot snapshot still
+/// holds the profile's redb single-writer lock — it reuses the snapshot's
+/// long-lived stores instead of re-opening them.
 #[tokio::test]
-async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
+async fn should_hot_reload_startup_pinned_profile_runtime_on_llm_mutations() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
     raw_profile_llm_upsert(
@@ -2425,6 +2430,12 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
+        // The seed upserts above bumped the generation; a real serve startup
+        // boots with the committed file and a FRESH generation counter.
+        profile_runtime_generations()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
     }
     let state = Arc::new(state);
 
@@ -2443,19 +2454,35 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
     .await
     .expect("pinned upsert");
     assert_eq!(result["applied"], json!(true), "{result}");
-    assert_eq!(
-        result["runtime_disposition"], "restart_required",
-        "{result}"
-    );
-    assert_eq!(result["restart_required"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
     assert_eq!(result["effective_from"], "next_turn", "{result}");
+
+    let reloaded = dynamic_cached_profile_runtime(&state, "dev")
+        .expect("pinned reload must land in the dynamic cache");
     assert!(
-        dynamic_cached_profile_runtime(&state, "dev").is_none(),
-        "a pinned profile must not fake a reload into the dynamic cache"
+        !Arc::ptr_eq(&reloaded, &pinned),
+        "the hot reload must produce a fresh runtime, not the boot snapshot"
+    );
+    assert_eq!(
+        reloaded.config.base_url.as_deref(),
+        Some("http://127.0.0.1:9/v1"),
+        "the reloaded chain must serve the COMMITTED endpoint"
     );
     assert!(
         Arc::ptr_eq(&pinned, state.profiles.get("dev").unwrap()),
-        "the boot-snapshot runtime stays as-is until restart"
+        "the immutable boot snapshot stays as the cold-start fallback"
+    );
+    let resolved = resolve_session_profile_runtime(&state, Some("dev")).expect("resolved");
+    assert!(
+        Arc::ptr_eq(&resolved, &reloaded),
+        "dynamic-first resolution must serve the reloaded runtime on the next turn"
+    );
+    // The boot snapshot's redb lock stays held by `state.profiles`; the
+    // rebuild reused its stores rather than re-opening them.
+    assert!(
+        Arc::ptr_eq(&reloaded.memory, &pinned.memory),
+        "hot reload must reuse the boot snapshot's episode store"
     );
 
     let result = raw_profile_llm_delete(
@@ -2466,11 +2493,113 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
     .await
     .expect("pinned delete");
     assert_eq!(result["applied"], json!(true), "{result}");
-    assert_eq!(
-        result["runtime_disposition"], "restart_required",
-        "{result}"
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+}
+
+/// Hot-reload acceptance — a startup-pinned profile that never had an LLM
+/// mutation keeps serving the boot snapshot directly: no dynamic-cache entry,
+/// no second bootstrap (which would fail on the snapshot's redb lock).
+#[tokio::test]
+async fn should_serve_boot_snapshot_for_startup_profile_without_llm_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+
+    let mut state = Arc::try_unwrap(state).ok().expect("sole state owner");
+    state.profiles.insert("dev".to_string(), pinned.clone());
+    if let Some(key) = dynamic_profile_runtime_key(&state, "dev") {
+        dynamic_profile_runtimes()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        // The seed upserts above bumped the generation; a real serve startup
+        // boots with the committed file and a FRESH generation counter.
+        profile_runtime_generations()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+    let state = Arc::new(state);
+
+    let resolved = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("ensure")
+        .expect("runtime");
+    assert!(
+        Arc::ptr_eq(&resolved, &pinned),
+        "a mutation-free pinned profile must serve the boot snapshot as-is"
     );
-    assert_eq!(result["restart_required"], json!(true), "{result}");
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "no dynamic-cache entry may be created without an LLM mutation"
+    );
+}
+
+/// Hot-reload acceptance — deleting the LAST model on a startup-pinned
+/// profile evicts the runtime truth entirely: the next turn must NOT silently
+/// fall back to the stale boot snapshot (which still models the deleted
+/// chain); it reports typed runtime-unavailable truth instead.
+#[tokio::test]
+async fn should_not_fall_back_to_boot_snapshot_after_pinned_last_model_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed sole primary");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+
+    let mut state = Arc::try_unwrap(state).ok().expect("sole state owner");
+    state.profiles.insert("dev".to_string(), pinned.clone());
+    if let Some(key) = dynamic_profile_runtime_key(&state, "dev") {
+        dynamic_profile_runtimes()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        // The seed upserts above bumped the generation; a real serve startup
+        // boots with the committed file and a FRESH generation counter.
+        profile_runtime_generations()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+    let state = Arc::new(state);
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-last", "dev", "openai", "gpt-4o-mini"),
+        None,
+    )
+    .await
+    .expect("delete last model");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "deferred", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+
+    let next_turn = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("ensure");
+    assert!(
+        next_turn.is_none(),
+        "after the last model is deleted the stale boot snapshot must not serve"
+    );
 }
 
 /// #2164 acceptance — a concurrent old bootstrap cannot repopulate the cache
@@ -15404,7 +15533,10 @@ fn authenticated_profile_id_uses_user_identity_only() {
     assert_eq!(authenticated_profile_id(&user), Some("profile-a"));
     // #40 (③): Admin WS connection profile aligns with REST resolve_my_profile_id
     // → ADMIN_PROFILE_ID (was None), so bare admin web-* keys hydrate correctly.
-    assert_eq!(authenticated_profile_id(&AuthIdentity::Admin), Some("admin"));
+    assert_eq!(
+        authenticated_profile_id(&AuthIdentity::Admin),
+        Some("admin")
+    );
 }
 
 // ── Issue #40/#41: canonical profile-scoped session keys (kind=api) ─────────
@@ -15412,8 +15544,11 @@ fn authenticated_profile_id_uses_user_identity_only() {
 #[test]
 fn mint_canonical_session_key_mints_for_bare_id_with_profile() {
     // Bare `web-*` id + explicit profile_id → `{profile}:api:{raw}` (kind=api).
-    let minted = mint_canonical_session_key(&SessionKey("web-1789871791268-87x3ps".into()), Some("admin"))
-        .expect("bare id + profile must mint");
+    let minted = mint_canonical_session_key(
+        &SessionKey("web-1789871791268-87x3ps".into()),
+        Some("admin"),
+    )
+    .expect("bare id + profile must mint");
     assert_eq!(minted.0, "admin:api:web-1789871791268-87x3ps");
     // The minted key parses back via profile_id() first-hit (② self-consistent).
     assert_eq!(minted.profile_id(), Some("admin"));
@@ -15446,7 +15581,11 @@ fn canonical_key_read_path_resolves_profile_first() {
     let key = SessionKey("admin:api:web-1789871791268-87x3ps".into());
     // Simulate resolve_sessions_for_lookup's precedence: profile_id() first.
     let resolved = key.profile_id().or(None).or(Some("_main"));
-    assert_eq!(resolved, Some("admin"), "canonical key must hit admin, not _main");
+    assert_eq!(
+        resolved,
+        Some("admin"),
+        "canonical key must hit admin, not _main"
+    );
     // A bare legacy key (pre-mint) has no profile → falls back to the Admin
     // connection identity (③), also landing on admin.
     let bare = SessionKey("web-1789871791268-87x3ps".into());
@@ -15454,17 +15593,25 @@ fn canonical_key_read_path_resolves_profile_first() {
         .profile_id()
         .or(authenticated_profile_id(&AuthIdentity::Admin))
         .or(Some("_main"));
-    assert_eq!(legacy, Some("admin"), "③: bare admin key resolves via Admin identity");
+    assert_eq!(
+        legacy,
+        Some("admin"),
+        "③: bare admin key resolves via Admin identity"
+    );
 }
 
 #[test]
 fn mint_canonical_session_key_cross_profile_does_not_regress() {
     // Bare id minted under different profiles stays isolated per profile.
     let a = mint_canonical_session_key(&SessionKey("web-x".into()), Some("admin")).unwrap();
-    let b = mint_canonical_session_key(&SessionKey("web-x".into()), Some("cluster-worker")).unwrap();
+    let b =
+        mint_canonical_session_key(&SessionKey("web-x".into()), Some("cluster-worker")).unwrap();
     assert_eq!(a.profile_id(), Some("admin"));
     assert_eq!(b.profile_id(), Some("cluster-worker"));
-    assert_ne!(a.0, b.0, "same raw id under different profiles must not collide");
+    assert_ne!(
+        a.0, b.0,
+        "same raw id under different profiles must not collide"
+    );
 }
 
 #[test]
@@ -15480,12 +15627,12 @@ fn mint_canonical_session_key_is_idempotent_at_entrypoints() {
     assert!(mint_canonical_session_key(&once, Some("admin")).is_none());
     // Admin connection profile (③) mints the same canonical key as an explicit
     // profile_id=admin, so bare-id reads after open land on the same bucket.
-    let via_conn = mint_canonical_session_key(
-        &bare,
-        authenticated_profile_id(&AuthIdentity::Admin),
-    )
-    .unwrap();
-    assert_eq!(via_conn.0, once.0, "Admin-identity and explicit-profile mints agree");
+    let via_conn =
+        mint_canonical_session_key(&bare, authenticated_profile_id(&AuthIdentity::Admin)).unwrap();
+    assert_eq!(
+        via_conn.0, once.0,
+        "Admin-identity and explicit-profile mints agree"
+    );
 }
 
 // ── Issue #46: mint respects legacy data (键跟数据走) ───────────────────────
@@ -15495,10 +15642,9 @@ fn legacy_data_exists_when_ledger_dir_present() {
     // UT-S16-67: bare key with a ui-protocol ledger dir → data exists → skip mint.
     let tmp = tempfile::tempdir().unwrap();
     let bare = SessionKey("web-1789871791268-87x3ps".into());
-    let ledger_dir = tmp
-        .path()
-        .join("ui-protocol")
-        .join(crate::api::ui_protocol_ledger::encode_session_dir_name(&bare));
+    let ledger_dir = tmp.path().join("ui-protocol").join(
+        crate::api::ui_protocol_ledger::encode_session_dir_name(&bare),
+    );
     std::fs::create_dir_all(&ledger_dir).unwrap();
     assert!(legacy_session_data_exists(Some(tmp.path()), None, &bare));
 }
@@ -15524,7 +15670,11 @@ fn legacy_data_absent_for_brand_new_key() {
     // UT-S16-69: brand-new bare key (no ledger dir, no JSONL) → no data → mint.
     let tmp = tempfile::tempdir().unwrap();
     let bare = SessionKey("web-brand-new".into());
-    assert!(!legacy_session_data_exists(Some(tmp.path()), Some(tmp.path()), &bare));
+    assert!(!legacy_session_data_exists(
+        Some(tmp.path()),
+        Some(tmp.path()),
+        &bare
+    ));
 }
 
 #[test]
@@ -15535,13 +15685,16 @@ fn legacy_data_lookup_does_not_match_canonical_key() {
     let bare = SessionKey("web-a".into());
     let canonical = SessionKey("admin:api:web-a".into());
     // Data exists for the canonical key only.
-    let ledger_dir = tmp
-        .path()
-        .join("ui-protocol")
-        .join(crate::api::ui_protocol_ledger::encode_session_dir_name(&canonical));
+    let ledger_dir = tmp.path().join("ui-protocol").join(
+        crate::api::ui_protocol_ledger::encode_session_dir_name(&canonical),
+    );
     std::fs::create_dir_all(&ledger_dir).unwrap();
     assert!(!legacy_session_data_exists(Some(tmp.path()), None, &bare));
-    assert!(legacy_session_data_exists(Some(tmp.path()), None, &canonical));
+    assert!(legacy_session_data_exists(
+        Some(tmp.path()),
+        None,
+        &canonical
+    ));
 }
 
 #[tokio::test]
@@ -44032,4 +44185,3 @@ fn fallback_enabled_profile_id_picks_first_enabled_for_main() {
         "fallback is either None (no store) or a real enabled profile id"
     );
 }
-

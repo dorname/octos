@@ -9533,10 +9533,7 @@ fn fallback_enabled_profile_id(state: &AppState, requested: &str) -> Option<Stri
     let store = state.profile_store.as_ref()?;
     let mut profiles = store.list().ok()?;
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
-    profiles
-        .into_iter()
-        .find(|p| p.enabled)
-        .map(|p| p.id)
+    profiles.into_iter().find(|p| p.enabled).map(|p| p.id)
 }
 
 fn profile_is_known(state: &AppState, profile_id: &str) -> bool {
@@ -10923,18 +10920,18 @@ fn runtime_policy_stamp_for_profile(
     session_id: Option<&SessionKey>,
     profile: Option<&crate::profiles::UserProfile>,
 ) -> Value {
-    let runtime = state.profiles.get(profile_id);
+    let runtime = resolve_session_profile_runtime(state, Some(profile_id));
     let primary = profile.and_then(|profile| profile.config.primary_llm());
     // The stamp reports the model that will actually SERVE the next turn,
-    // matching `resolve_session_profile_runtime`'s precedence:
-    // - a profile pinned in startup-config `state.profiles` keeps serving
-    //   that immutable runtime until restart (`profile/llm/select` only
-    //   warns for these), so the boot snapshot is the truth even when the
-    //   stored file has since changed;
-    // - a store-backed (dynamic) profile re-bootstraps from the FILE after
-    //   select evicts, so the file's primary is the truth — the old
-    //   unconditional runtime-first order made every status/read stomp a
-    //   freshly-applied selection back to the boot-time model.
+    // matching `resolve_session_profile_runtime`'s dynamic-first precedence:
+    // - after an LLM mutation the hot-reloaded runtime sits in the dynamic
+    //   cache (startup-pinned profiles included), so the runtime's chain is
+    //   the truth — reporting the immutable boot snapshot here used to stomp
+    //   a freshly-applied selection back to the boot-time model;
+    // - a startup-pinned profile with NO mutation resolves to the boot
+    //   snapshot itself, which is exactly what will serve;
+    // - only with no runtime at all (dynamic profile pre-bootstrap, or a
+    //   deferred/empty cache) does the stored file's primary speak.
     let (model, provider) = if let Some(runtime) = runtime {
         (
             Some(runtime.primary_model_id.clone()),
@@ -11243,8 +11240,7 @@ async fn raw_session_status_result(
     let profile_id = raw_profile_id(&params, connection_profile_id);
     // Issue #9-B: an unscoped `_main` open on a store that has enabled
     // profiles must not hard-fail — land on the first enabled profile.
-    let profile_id = fallback_enabled_profile_id(state, &profile_id)
-        .unwrap_or(profile_id);
+    let profile_id = fallback_enabled_profile_id(state, &profile_id).unwrap_or(profile_id);
     let profile = state
         .profile_store
         .as_ref()
@@ -13141,14 +13137,6 @@ async fn raw_profile_llm_select(
             .as_ref()
             .unwrap_or(&ProfileLlmRuntimeTransition::unchanged()),
     );
-    if state.profiles.contains_key(&profile_id) {
-        // Startup-pinned runtime: the selection is saved but turns keep the
-        // boot snapshot until restart (the stamp above says so too). Tell
-        // the caller instead of letting the switch silently not take —
-        // including for an idempotent re-select of the already-active
-        // primary, which performs no transition of its own.
-        result["restart_required"] = json!(true);
-    }
     Ok(result)
 }
 
@@ -13851,7 +13839,10 @@ enum ProfileRuntimeDisposition {
     /// next turn deterministically re-derives, reporting typed
     /// runtime-unavailable truth when the selection is gone.
     Deferred,
-    /// Startup-pinned profile: the boot snapshot keeps serving until restart.
+    /// Retired wire value: startup-pinned profiles used to report this until
+    /// restart; they now hot-reload like dynamic profiles. Kept (never
+    /// constructed) so old clients parsing the string stay compatible.
+    #[allow(dead_code)]
     RestartRequired,
     /// Dynamic profile: caches evicted but the rebuild FAILED — the next turn
     /// retries the bootstrap (retry/restart recovers). Reported explicitly on
@@ -13899,15 +13890,17 @@ impl ProfileLlmRuntimeTransition {
 /// The ONE post-commit transition shared by `profile/llm/select`, `upsert`,
 /// and `delete` (#2164): evict every cached SessionRuntime for the profile,
 /// bump the dynamic-runtime generation and drop the cached ProfileRuntime,
-/// then either rebuild it (dynamic profile) or report `restart_required`
-/// (startup-pinned boot snapshot). A caller whose persistence FAILED must not
-/// reach this — a healthy runtime stays healthy.
+/// then rebuild it from the committed file. Startup-pinned profiles take the
+/// SAME path — `ensure_session_profile_runtime` declines the immutable boot
+/// snapshot once the generation is bumped and hot-reloads the LLM layer onto
+/// the dynamic cache (which dynamic-first resolution then serves). A caller
+/// whose persistence FAILED must not reach this — a healthy runtime stays
+/// healthy.
 async fn commit_profile_llm_runtime_transition(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
 ) -> ProfileLlmRuntimeTransition {
-    let startup_pinned = state.profiles.contains_key(profile_id);
     // Evict FIRST, generation before removal: the session cache bumps its own
     // guard inside `invalidate_profile`, and the dynamic map's guard must be
     // bumped before the drop so an in-flight bootstrap that read the
@@ -13919,21 +13912,6 @@ async fn commit_profile_llm_runtime_transition(
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
-    }
-
-    if startup_pinned {
-        // Startup-config profiles live in an immutable map — the saved
-        // mutation persists but cannot rebuild without a restart.
-        tracing::warn!(
-            profile_id = %profile_id,
-            "profile LLM mutation saved, but this startup-config profile's runtime \
-             rebuilds on restart only"
-        );
-        return ProfileLlmRuntimeTransition {
-            disposition: ProfileRuntimeDisposition::RestartRequired,
-            config_revision,
-            error: None,
-        };
     }
 
     match ensure_session_profile_runtime(state, Some(profile_id)).await {
@@ -19065,8 +19043,8 @@ fn normalize_session_key_at_entry(
         .ledger
         .get()
         .and_then(|l| l.config_data_dir());
-    let profile_data = resolve_session_profile_runtime(state, connection_profile_id)
-        .map(|rt| rt.data_dir.clone());
+    let profile_data =
+        resolve_session_profile_runtime(state, connection_profile_id).map(|rt| rt.data_dir.clone());
     if legacy_session_data_exists(ledger_root.as_deref(), profile_data.as_deref(), session_id) {
         session_id.clone() // legacy data lives under the bare key — keep it
     } else {
@@ -19074,7 +19052,10 @@ fn normalize_session_key_at_entry(
     }
 }
 
-fn mint_canonical_session_key(session_id: &SessionKey, profile_id: Option<&str>) -> Option<SessionKey> {
+fn mint_canonical_session_key(
+    session_id: &SessionKey,
+    profile_id: Option<&str>,
+) -> Option<SessionKey> {
     if session_id.profile_id().is_some() {
         return None; // already profile-scoped
     }
@@ -19087,7 +19068,8 @@ fn mint_canonical_session_key(session_id: &SessionKey, profile_id: Option<&str>)
     }
 }
 
-fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {    match identity {
+fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
+    match identity {
         AuthIdentity::User { id, .. } if !id.is_empty() => Some(id),
         AuthIdentity::User { .. } => None,
         // #40 (③): align the WS connection profile with the REST semantics —
@@ -20274,7 +20256,8 @@ async fn open_session_result(
     //
     // Legacy inference stays as a fallback for existing bare keys (no data
     // migration): only a bare id + explicit profile_id mints here.
-    if let Some(minted) = mint_canonical_session_key(&params.session_id, params.profile_id.as_deref())
+    if let Some(minted) =
+        mint_canonical_session_key(&params.session_id, params.profile_id.as_deref())
     {
         // #46 (键跟数据走): skip minting when the bare key ALREADY has on-disk
         // data under this profile (legacy ledger dir / sessions JSONL) — minting
@@ -21808,7 +21791,16 @@ pub(crate) async fn ensure_session_profile_runtime(
         return Ok(Some(runtime));
     }
     if let Some(runtime) = state.profiles.get(profile_id) {
-        return Ok(Some(runtime.clone()));
+        // The boot snapshot is the truth only until the profile's FIRST
+        // committed LLM mutation: the post-commit transition bumps the
+        // generation before rebuilding, so generation > 0 means the truth
+        // has moved to the committed store file — skip the snapshot and let
+        // the bootstrap below re-derive it. A stale snapshot must never
+        // silently serve a mutated profile (e.g. after the last model is
+        // deleted the next turn reports typed runtime-unavailable truth).
+        if current_profile_runtime_generation(&key) == 0 {
+            return Ok(Some(runtime.clone()));
+        }
     }
 
     // #2164: a profile/llm select/upsert/delete that commits while this
@@ -21843,32 +21835,50 @@ pub(crate) async fn ensure_session_profile_runtime(
         // Lazily-created profiles must honour host-level policy too — without
         // host_memory, a host opt-out of (default-on) memory refresh would not
         // bind profiles created after startup.
-        let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
-            &profile,
-            &profile_data_dir,
-            Some(store.octos_home_dir()),
-            crate::runtime::BootstrapRole::Serve,
-            None,
-            None,
-            state.host_memory.as_ref(),
-        )
-        .await
-        .map_err(|error| {
-            // Lock contention is a config mistake with a concrete fix, so it gets
-            // its own typed kind and a sentence the operator can act on. Anything
-            // else stays `runtime_unavailable` — but formatted with `{error:#}`
-            // so the eyre chain survives to the client. Plain `{error}` prints
-            // only the outermost context, which is how "failed to open episode
-            // store for profile 'x'" used to reach the TUI with its actual cause
-            // (and its remedy) silently dropped.
-            if octos_memory::is_episode_store_locked(&error) {
-                data_dir_locked_error(profile_id, &error)
-            } else {
-                runtime_unavailable_error(format!(
-                    "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
-                ))
-            }
-        })?;
+        let runtime = if let Some(pinned) = state.profiles.get(profile_id) {
+            // Startup-pinned profile AFTER an LLM mutation (generation > 0,
+            // startup map short-circuit above declined): the boot snapshot
+            // holds the profile's redb single-writer lock for the process
+            // lifetime, so a full re-bootstrap can never succeed here.
+            // Rebuild only the LLM layer on top of the snapshot's long-lived
+            // stores — the result lands in the dynamic cache, which
+            // `resolve_session_profile_runtime` prefers over the snapshot.
+            pinned
+                .rebuild_llm_layer(&profile, state.host_memory.as_ref())
+                .await
+                .map_err(|error| {
+                    runtime_unavailable_error(format!(
+                        "failed to hot-reload ProfileRuntime for profile '{profile_id}': {error:#}"
+                    ))
+                })?
+        } else {
+            crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
+                &profile,
+                &profile_data_dir,
+                Some(store.octos_home_dir()),
+                crate::runtime::BootstrapRole::Serve,
+                None,
+                None,
+                state.host_memory.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                // Lock contention is a config mistake with a concrete fix, so it gets
+                // its own typed kind and a sentence the operator can act on. Anything
+                // else stays `runtime_unavailable` — but formatted with `{error:#}`
+                // so the eyre chain survives to the client. Plain `{error}` prints
+                // only the outermost context, which is how "failed to open episode
+                // store for profile 'x'" used to reach the TUI with its actual cause
+                // (and its remedy) silently dropped.
+                if octos_memory::is_episode_store_locked(&error) {
+                    data_dir_locked_error(profile_id, &error)
+                } else {
+                    runtime_unavailable_error(format!(
+                        "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
+                    ))
+                }
+            })?
+        };
         if insert_profile_runtime_if_current(&key, generation, runtime.clone()) {
             return Ok(Some(runtime));
         }
@@ -28518,12 +28528,9 @@ async fn handle_session_messages_page(
     // REST-backed read, skipping the mint when the bare key has legacy data. The
     // connection profile comes from the authenticated identity (Admin → admin, ③).
     let conn_profile = identity.and_then(authenticated_profile_id);
-    let normalized = normalize_session_key_at_entry(
-        state,
-        &SessionKey(params.session_id.clone()),
-        conn_profile,
-    )
-    .0;
+    let normalized =
+        normalize_session_key_at_entry(state, &SessionKey(params.session_id.clone()), conn_profile)
+            .0;
     let session_id_str = normalized.clone();
     let response = super::handlers::session_messages(
         State(state.clone()),
