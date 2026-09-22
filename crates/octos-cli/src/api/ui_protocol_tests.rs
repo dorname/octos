@@ -21597,6 +21597,61 @@ fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
     );
 }
 
+/// #18 (dup user frame): the turn's initial user row must carry
+/// `client_message_id = turn_id` so the live envelope, the durable row and
+/// the hydrate snapshot share ONE stable dedup key — the AppUI client pins
+/// `turn_id == clientMessageId` to the same UUID.
+#[test]
+fn should_stamp_client_message_id_on_unbound_user_row_when_stamping_turn_prompt() {
+    let stamped = stamp_turn_prompt_client_message_id(Message::user("hello"), "turn-123");
+
+    assert_eq!(
+        stamped.client_message_id.as_deref(),
+        Some("turn-123"),
+        "user row must inherit the turn id as client_message_id"
+    );
+}
+
+#[test]
+fn should_not_stamp_client_message_id_on_non_user_rows_when_stamping_turn_prompt() {
+    let assistant = stamp_turn_prompt_client_message_id(Message::assistant("ok"), "turn-123");
+    assert_eq!(
+        assistant.client_message_id, None,
+        "assistant rows must not be stamped"
+    );
+
+    let tool = Message {
+        role: MessageRole::Tool,
+        content: "result".into(),
+        media: vec![],
+        tool_calls: None,
+        tool_call_id: Some("call-1".into()),
+        reasoning_content: None,
+        client_message_id: None,
+        thread_id: None,
+        timestamp: chrono::Utc::now(),
+    };
+    let tool = stamp_turn_prompt_client_message_id(tool, "turn-123");
+    assert_eq!(
+        tool.client_message_id, None,
+        "tool rows must not be stamped"
+    );
+}
+
+#[test]
+fn should_preserve_existing_client_message_id_when_stamping_turn_prompt() {
+    let mut user = Message::user("hi");
+    user.client_message_id = Some("explicit-cmid".into());
+
+    let stamped = stamp_turn_prompt_client_message_id(user, "turn-123");
+
+    assert_eq!(
+        stamped.client_message_id.as_deref(),
+        Some("explicit-cmid"),
+        "caller-supplied client_message_id must be preserved"
+    );
+}
+
 #[tokio::test]
 async fn abort_connection_turns_removes_only_matching_active_turns() {
     let owned_session_id = SessionKey("local:owned".into());

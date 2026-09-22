@@ -5025,6 +5025,23 @@ fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
     to_save
 }
 
+/// #18 (dup user frame): stamp the turn's initial user row with
+/// `client_message_id = turn_id` so the live `user_message` envelope
+/// (commit observer forwards the durable row's field), the durable row and
+/// the `session/hydrate` snapshot share ONE stable dedup key. The AppUI
+/// client pins `turn_id == clientMessageId` to the same UUID, so the web
+/// projection can collapse the live echo and the snapshot row of the same
+/// message into a single frame. Only the FIRST unbound user row of a turn
+/// is stamped by the persist-loop caller — steer-injected user rows keep
+/// `None` and render exactly as before.
+fn stamp_turn_prompt_client_message_id(message: Message, turn_id: &str) -> Message {
+    let mut to_save = message;
+    if to_save.role == MessageRole::User && to_save.client_message_id.is_none() {
+        to_save.client_message_id = Some(turn_id.to_owned());
+    }
+    to_save
+}
+
 /// Shared persist helper used by the api/serve background-result sender
 /// (spawn_only completions) and the `send_file` sink. Builds an assistant
 /// `Message` with the given content + media + thread_id, writes it through
@@ -37269,6 +37286,13 @@ async fn run_standalone_turn(
                     // drop the preamble's hint).
                     let mut last_persisted_preamble_assistant: Option<String> = None;
                     let mut skipped_internal_user = false;
+                    // #18: only the FIRST unbound user row of this turn gets
+                    // `client_message_id = turn_id` (the prompt row the
+                    // client's ghost/frame corresponds to). Steer-injected
+                    // user rows keep `None` — stamping them with the same id
+                    // would make the web projection collapse distinct user
+                    // messages into one.
+                    let mut turn_prompt_cmid_stamped = false;
                     // NEW-16 defense-in-depth: per-turn message-index
                     // cursor. The main fix is the append-only
                     // `turn_output_log` upstream — but if some edge
@@ -37355,6 +37379,15 @@ async fn run_standalone_turn(
                         };
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                        let to_save = if !turn_prompt_cmid_stamped
+                            && to_save.role == MessageRole::User
+                            && to_save.client_message_id.is_none()
+                        {
+                            turn_prompt_cmid_stamped = true;
+                            stamp_turn_prompt_client_message_id(to_save, &turn_thread_id_for_persist)
+                        } else {
+                            to_save
+                        };
                         let saved_for_context = to_save.clone();
                         let projection = assistant_message_projection(&response, message_index, &turn_thread_id_for_persist);
                         if let Ok(seq) = MESSAGE_PROJECTION_OVERRIDE.scope(projection, sessions

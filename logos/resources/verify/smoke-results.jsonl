@@ -11,9 +11,12 @@
 {"id":"SMOKE-INFRA404-02","status":"pass","timestamp":"2026-09-22T14:22:01Z","scenario":"fix-backend-infra-path-404"}
 {"id":"SMOKE-HEADER-LEAK-01","status":"pass","timestamp":"2026-09-22T14:45:05Z","scenario":"fix-chat-header-debug-leak","note":"playwright: new chat session header — router pill 0, cost-bar none 0, no bare none/1"}
 {"id":"SMOKE-HEADER-LEAK-02","status":"pass","timestamp":"2026-09-22T14:45:05Z","scenario":"fix-chat-header-debug-leak","note":"playwright: saved session (你好) header — router pill 0, cost-bar 0, bare none/Router/1 none; 1 = files-panel count badge (by design)"}
-{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T14:51:01Z","scenario":"S17"}
-{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T14:51:04Z","scenario":"S17"}
-{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T14:51:05Z","scenario":"S17"}
-{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T14:51:06Z","scenario":"S17"}
-{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T14:51:12Z","scenario":"S17"}
-{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T14:51:15Z","scenario":"S17"}
+{"id":"SMOKE-DUPFRAME-01","status":"pass","timestamp":"2026-09-23T01:20:00Z","scenario":"S05","note":"k8s playwright: send message, 90s window user frame==1 (3 occurrences incl. title+sidebar), assistant replied"}
+{"id":"SMOKE-DUPFRAME-02","status":"pass","timestamp":"2026-09-23T01:20:30Z","scenario":"S05","note":"k8s playwright: after page reload + session reopen user frame still ==1"}
+{"id":"SMOKE-DUPFRAME-03","status":"pass","timestamp":"2026-09-23T01:21:00Z","scenario":"S05","note":"WS capture: live user_message envelope cmid==turn_id; hydrate snapshot row carries same cmid; session/hydrate RPC count 19 over ~2min (pre-fix 6626/60s)"}
+{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T16:37:38Z","scenario":"S17"}
+{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T16:37:41Z","scenario":"S17"}
+{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T16:37:42Z","scenario":"S17"}
+{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T16:37:43Z","scenario":"S17"}
+{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T16:37:49Z","scenario":"S17"}
+{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T16:37:52Z","scenario":"S17"}
