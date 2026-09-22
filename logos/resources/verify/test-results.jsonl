@@ -152,3 +152,5 @@
 {"id": "CORE-HOTRELOAD-03", "status": "pass", "duration_ms": 590, "timestamp": "2026-09-22T13:01:11+00:00", "scenario": "fix-startup-profile-llm-hot-reload"}
 {"id": "CORE-INFRA404-01", "status": "pass", "duration_ms": 12, "timestamp": "2026-09-22T14:12:33+00:00", "scenario": "fix-backend-infra-path-404"}
 {"id": "CORE-INFRA404-02", "status": "pass", "duration_ms": 12, "timestamp": "2026-09-22T14:12:33+00:00", "scenario": "fix-backend-infra-path-404"}
+{"id": "OW-HEADER-LEAK-01", "status": "pass", "duration_ms": 27, "timestamp": "2026-09-22T14:34:17+00:00", "scenario": "fix-chat-header-debug-leak"}
+{"id": "OW-HEADER-LEAK-02", "status": "pass", "duration_ms": 27, "timestamp": "2026-09-22T14:34:17+00:00", "scenario": "fix-chat-header-debug-leak"}

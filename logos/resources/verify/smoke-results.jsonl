@@ -9,9 +9,11 @@
 {"id":"SMOKE-NGINX-03","status":"pass","timestamp":"2026-09-22T13:58:02Z","scenario":"fix-web-nginx-backend-proxy"}
 {"id":"SMOKE-INFRA404-01","status":"pass","timestamp":"2026-09-22T14:22:01Z","scenario":"fix-backend-infra-path-404"}
 {"id":"SMOKE-INFRA404-02","status":"pass","timestamp":"2026-09-22T14:22:01Z","scenario":"fix-backend-infra-path-404"}
-{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T14:28:53Z","scenario":"S17"}
-{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T14:28:56Z","scenario":"S17"}
-{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T14:28:57Z","scenario":"S17"}
-{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T14:28:58Z","scenario":"S17"}
-{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T14:29:04Z","scenario":"S17"}
-{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T14:29:07Z","scenario":"S17"}
+{"id":"SMOKE-HEADER-LEAK-01","status":"pass","timestamp":"2026-09-22T14:45:05Z","scenario":"fix-chat-header-debug-leak","note":"playwright: new chat session header — router pill 0, cost-bar none 0, no bare none/1"}
+{"id":"SMOKE-HEADER-LEAK-02","status":"pass","timestamp":"2026-09-22T14:45:05Z","scenario":"fix-chat-header-debug-leak","note":"playwright: saved session (你好) header — router pill 0, cost-bar 0, bare none/Router/1 none; 1 = files-panel count badge (by design)"}
+{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T14:51:01Z","scenario":"S17"}
+{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T14:51:04Z","scenario":"S17"}
+{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T14:51:05Z","scenario":"S17"}
+{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T14:51:06Z","scenario":"S17"}
+{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T14:51:12Z","scenario":"S17"}
+{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T14:51:15Z","scenario":"S17"}
