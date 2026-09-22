@@ -7,9 +7,11 @@
 {"id":"SMOKE-NGINX-01","status":"pass","timestamp":"2026-09-22T13:58:02Z","scenario":"fix-web-nginx-backend-proxy"}
 {"id":"SMOKE-NGINX-02","status":"pass","timestamp":"2026-09-22T13:58:02Z","scenario":"fix-web-nginx-backend-proxy"}
 {"id":"SMOKE-NGINX-03","status":"pass","timestamp":"2026-09-22T13:58:02Z","scenario":"fix-web-nginx-backend-proxy"}
-{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T14:01:22Z","scenario":"S17"}
-{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T14:01:25Z","scenario":"S17"}
-{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T14:01:27Z","scenario":"S17"}
-{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T14:01:28Z","scenario":"S17"}
-{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T14:01:34Z","scenario":"S17"}
-{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T14:01:37Z","scenario":"S17"}
+{"id":"SMOKE-INFRA404-01","status":"pass","timestamp":"2026-09-22T14:22:01Z","scenario":"fix-backend-infra-path-404"}
+{"id":"SMOKE-INFRA404-02","status":"pass","timestamp":"2026-09-22T14:22:01Z","scenario":"fix-backend-infra-path-404"}
+{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T14:28:53Z","scenario":"S17"}
+{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T14:28:56Z","scenario":"S17"}
+{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T14:28:57Z","scenario":"S17"}
+{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T14:28:58Z","scenario":"S17"}
+{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T14:29:04Z","scenario":"S17"}
+{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T14:29:07Z","scenario":"S17"}
