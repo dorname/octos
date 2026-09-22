@@ -16,9 +16,6 @@ tech_stack:
   plugin_protocol: 自包含二进制 + JSON stdin/stdout（语言无关、进程隔离）
   error_handling: eyre / color-eyre
 scenario_counter:
-  # S01 已由 change chatgpt-oauth-codex 使用(2026-09-18)
-  # S02-S15 已由 change baseline-prd 在需求文档中分配(2026-09-18)
-  # S16 已由 change k8s-cluster-deploy 使用，S17 已由 change octoloop-night-watchdog 使用(2026-09-20)
   next_id: 18
 modules:
   - id: core
@@ -31,6 +28,9 @@ modules:
       - database
       - scenario
     deployment_required: true
+  - id: octos-web
+    name: octos-web
+    lifecycle: initial
 deployment_gates:
   core:
     deployment_required: true
@@ -171,7 +171,7 @@ scenarios:
 external_dependencies:
   - name: LLM 提供商 API
     purpose: 全部对话能力
-    test_strategy: mock-service（录制/桩 provider）；真实调用测试 #[ignore] 手动触发
+    test_strategy: mock-service（录制/桩 provider）；真实调用测试
   - name: IM 平台（17 通道）
     purpose: 消息收发
     test_strategy: mock-service（通道适配层以假 InboundMessage 单测；端到端手动验证）
