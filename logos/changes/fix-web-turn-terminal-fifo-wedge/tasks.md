@@ -6,5 +6,5 @@
 - [x] 单切片：① projection-store/hydrate-projection 消费 `projection_thread_sequences` checkpoints——快照内孤立 `TurnTerminal`（前驱 seq 因服务端压缩缺失）按 checkpoint 对齐 admitted 并结算 FIFO；canonical 快照缺消息行的 thread 回退 `messages` 转录行重建，reset→hydrate 循环不丢已渲染行；② projection-render-adapter 时间戳 fallback 去 seq 化（回退接收时刻或隐藏，禁 epoch）；③ 清理 ui-protocol-runtime.ts 调试 console.log；同步 UT（孤立 terminal+checkpoint→admitted 结算 / compacted thread 转录回退渲染 / 缺 persisted_at→非 epoch 三类用例 + 既有套件不回退）+ OpenLogos reporter 写入 logos/resources/verify/test-results.jsonl（octos-web 262e79b：vitest 1112 passed，72 失败均为预存失败；tsc -b + vite build PASS）
 
 ## [deploy] 部署任务
-- [ ] 重新构建 octos-web dist（strict build）并注入本地 docker-desktop `octos` ns 的 web pod（nginx webroot），滚动重启后重挂 port-forward，供操作员真机复验 issue #19 验收标准
-- [ ] 若服务端（crates/octos-cli）改动落地：musl 重建注入 k8s（路径同 #12 修复），本地 fixture smoke + k8s WS 复验
+- [x] 重新构建 octos-web dist（strict build）并注入本地 docker-desktop `octos` ns 的 web pod（nginx webroot），滚动重启后重挂 port-forward，供操作员真机复验 issue #19 验收标准（2026-09-23 完成：dist 262e79b 构建 → tarball 替换 /tmp/octos-k8s-bin/octos-web-dist.tar.gz（旧包备份 .bak-c21a539 作回滚留存）→ rollout restart → pod webroot 与 127.0.0.1:5174 均服务 index-BJG6TXB5.js；期间发现 18088 服务根为 /tmp/octos-k8s-bin 而非仓库根，已纠正）
+- [x] ~~若服务端（crates/octos-cli）改动落地：musl 重建注入 k8s~~ — 不适用：本次为纯前端修复，服务端零改动

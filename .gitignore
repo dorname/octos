@@ -213,3 +213,4 @@ specs/task-c5-cron-durable-firing.spec.md
 # already covered by *.md above; these are run journals and session state)
 /.agent-spec/runs/
 /.omc/
+octos-web-dist.tar.gz
