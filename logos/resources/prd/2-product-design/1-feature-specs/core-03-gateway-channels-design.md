@@ -26,7 +26,7 @@
 }
 ```
 
-**支持的 17 个通道**：api、cli、dingtalk、discord、email（feature-gated）、feishu、line、matrix、matrix-user、qq-bot、slack、telegram、twilio、wechat、wecom、wecom-bot、whatsapp。
+**支持的 11 个通道**：api、cli、discord、feishu、matrix、matrix-user、telegram、twilio、wecom、wecom-bot、whatsapp。（2026-09-29 trim-unused-features：dingtalk / slack / line / email / qq-bot / wechat 已移除；matrix / matrix-user 因 `api` feature 编译耦合保留。）
 
 **交互流程**：
 1. 用户在 config.json 配置通道凭据（token 走环境变量，不落盘明文）并启用通道
