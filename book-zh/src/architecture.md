@@ -1058,14 +1058,11 @@ pub trait Channel: Send + Sync {
 | **CLI** | stdin/stdout | （始终启用） | 无 | 无 |
 | **Telegram** | teloxide 长轮询 | `telegram` | Bot token (env) | teloxide 内置 |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity 内置 |
-| **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket 桥接 (ws://localhost:3001) | `whatsapp` | Baileys 桥接 | HashSet（10K 上限，溢出时清空） |
 | **飞书** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet（10K 上限，溢出时清空） |
-| **邮件** | IMAP 轮询 + SMTP 发送 | `email` | 用户名/密码，rustls TLS | IMAP UNSEEN 标志 |
 | **企业微信** | 企业微信 API | `wecom` | Corp ID + Agent Secret | message_id |
 | **Twilio** | Twilio SMS/MMS | `twilio` | Account SID + Auth Token | message SID |
 
-**邮件细节**：IMAP 通过 `async-imap` + rustls 接收（轮询未读，标记 \Seen）。SMTP 通过 `lettre` 发送（端口 465=隐式 TLS，其他=STARTTLS）。`mailparse` 用于 RFC822 正文提取。正文通过 `truncate_utf8(max_body_chars)` 截断。
 
 **飞书细节**：带 TTL 缓存的 Tenant Access Token（6000 秒）。从 `/callback/ws/endpoint` 获取 WebSocket 网关 URL。通过 `header.event_type == "im.message.receive_v1"` 检测消息类型。支持 `oc_*`（chat_id）vs `ou_*`（open_id）路由。
 
@@ -1083,7 +1080,6 @@ pub trait Channel: Send + Sync {
 |---|---|
 | Telegram | 4000 |
 | Discord | 1900 |
-| Slack | 3900 |
 
 **断开优先级**：段落（`\n\n`）> 换行（`\n`）> 句号（`. `）> 空格（` `）> 硬截断。
 
@@ -1268,10 +1264,8 @@ JSON 持久化位于 `.octos/cron.json`。
 # octos-bus
 telegram = ["teloxide"]
 discord  = ["serenity"]
-slack    = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu   = ["tokio-tungstenite"]
-email    = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 # octos-agent (browser is always compiled in, no longer feature-gated)
 git      = ["gix"]                  # git operations via gitoxide
@@ -1286,7 +1280,6 @@ twilio   = [...]                    # Twilio SMS/MMS channel
 api      = ["axum", "tower-http", "futures"]
 telegram = ["octos-bus/telegram"]
 discord  = ["octos-bus/discord"]
-slack    = ["octos-bus/slack"]
 whatsapp = ["octos-bus/whatsapp"]
 feishu   = ["octos-bus/feishu"]
 email    = ["octos-bus/email"]
@@ -1329,8 +1322,8 @@ crates/
 ├── octos-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs, coalesce.rs, media.rs
 │   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
-│   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
-│   ├── wecom_channel.rs, twilio_channel.rs, markdown_html.rs
+│   ├── whatsapp_channel.rs, feishu_channel.rs
+│   ├── wecom_channel.rs, wecom_bot_channel.rs, twilio_channel.rs, markdown_html.rs
 │   ├── cron_service.rs, cron_types.rs, heartbeat.rs
 └── octos-cli/src/
     ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs

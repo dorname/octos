@@ -15,9 +15,6 @@ impl ChunkConfig {
     pub fn discord() -> Self {
         Self { max_chars: 1900 }
     }
-    pub fn slack() -> Self {
-        Self { max_chars: 3900 }
-    }
     pub fn default_limit() -> Self {
         Self { max_chars: 4000 }
     }

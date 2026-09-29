@@ -4,7 +4,7 @@
 
 ## Octos 是什么？
 
-Octos 是一个开源 AI 智能体平台，能将任意大语言模型变成多渠道、多用户的智能助手。你只需部署一个 Rust 编译的二进制文件，配置好 LLM API 密钥和消息渠道（Telegram、Discord、Slack、WhatsApp、Email、微信等），Octos 会处理其余一切——对话路由、工具执行、记忆管理、模型故障切换，以及多租户隔离。
+Octos 是一个开源 AI 智能体平台，能将任意大语言模型变成多渠道、多用户的智能助手。你只需部署一个 Rust 编译的二进制文件，配置好 LLM API 密钥和消息渠道（Telegram、Discord、WhatsApp、飞书、企业微信、Matrix 等），Octos 会处理其余一切——对话路由、工具执行、记忆管理、模型故障切换，以及多租户隔离。
 
 可以把它理解为 **AI 智能体的后端操作系统**。你无需为每个场景从零搭建聊天机器人，只需配置 Octos 的 Profile——每个 Profile 拥有独立的系统提示词、模型、工具和渠道——然后通过 Web 仪表板或 REST API 统一管理。一个小团队就能在一台机器上运行数百个专用 AI 智能体。
 
@@ -33,7 +33,7 @@ Octos 有三种主要运行模式：
 | **Profile** | 具名、隔离的智能体配置（提示词、模型、工具、渠道、数据目录）；多租户的基本单位 |
 | **Tool（工具）** | 一项能力（Shell、文件操作、搜索、消息发送等） |
 | **Provider（供应商）** | LLM API 服务（Anthropic、OpenAI 等） |
-| **Channel（渠道）** | 消息平台（CLI、Telegram、Slack 等） |
+| **Channel（渠道）** | 消息平台（CLI、Telegram、Discord 等） |
 | **UI Protocol** | `octos serve` 与其客户端（web、TUI）之间的带版本 JSON-RPC 契约（WS/stdio） |
 | **Session（会话）** | 按渠道和聊天 ID 划分的对话历史 |
 | **Sandbox（沙箱）** | 隔离的执行环境（bwrap、macOS sandbox-exec、Docker） |

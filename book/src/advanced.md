@@ -488,7 +488,6 @@ Long responses are automatically split into channel-safe chunks before sending:
 |---------|-----------------------|
 | Telegram | 4000 |
 | Discord | 1900 |
-| Slack | 3900 |
 
 Split preference: paragraph boundary > newline > sentence end > space > hard cut. Messages exceeding 50 chunks are truncated with a marker.
 

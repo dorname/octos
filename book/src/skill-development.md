@@ -70,7 +70,7 @@ These belong as **plugin tools** (this guide):
 These belong as **plugin hooks** ONLY when they are **optional enrichment** (the tool would still work without them):
 
 - **Metrics / audit** hooks (after_tool_call): log cost / latency to an external system. Failure is fine — the tool still ran.
-- **Channel-side notifications**: ping Slack on completion. Optional.
+- **Channel-side notifications**: ping a channel (e.g. Telegram) on completion. Optional.
 
 ### The pipeline-guard case study (and what we'd build differently)
 

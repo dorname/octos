@@ -89,3 +89,29 @@
 修改文件：`crates/octos-bus/src/lib.rs`、`crates/octos-bus/Cargo.toml`、`crates/octos-cli/Cargo.toml`、`crates/octos-server/Cargo.toml`、`crates/octos-cli/src/commands/gateway/adapters/mod.rs`、`crates/octos-cli/src/profiles.rs`、`crates/octos-cli/src/commands/account.rs`、`crates/octos-cli/src/commands/gateway/account_handler.rs`、`crates/octos-cli/src/api/admin.rs`、`crates/octos-cli/src/api/auth_handlers.rs`、`crates/octos-cli/src/api/router.rs`、`crates/octos-cli/src/api/webhook_proxy.rs`、`crates/octos-cli/src/api/ui_protocol_transport.rs`（仅注释）、`crates/octos-cli/src/api/ui_protocol_tests.rs`（仅注释）、`crates/octos-cli/src/autonomy/escalation_notify.rs`、`crates/octos-cli/src/process_manager.rs`、`crates/octos-cli/src/commands/gateway/mod.rs`、`crates/octos-cli/src/commands/gateway/gateway_runtime.rs`、`crates/octos-cli/src/commands/channels.rs`、`crates/octos-cli/src/commands/gateway/prompt.rs`、`crates/octos-cli/src/config.rs`、`crates/octos-cli/src/session_actor.rs`（仅注释）、`crates/octos-agent/src/tools/message.rs`（工具描述示例 slack→discord）
 
 Reporter：`logos/resources/verify/test-results.jsonl` TRIM-S2-*（6 条）；工作区 jsonl 曾被 S17 复跑覆盖致 TRIM-S1-* 丢失，已自 8e975c7e 恢复追加（append-only 语义保全 S17 最新结果）。
+
+## 切片 3 验证记录（2026-09-30）
+
+### 归档
+- `DEEP_RESEARCH_TIMEOUT_FIX.md` → `docs/archive/`（git mv）
+- `OUTER_LOOP_REVIEW.md` → `docs/archive/`（untracked 历史外环黑板，内容止于 2026-09-21 admin-key-fallback-test-hermeticity 时代；`.octos/OUTER_LOOP_REVIEW.md` 运行时黑板路径不受影响）
+- `ORG-README.md` 判定为组织仓库导航文档（非一次性笔记），保留 + 数字对齐
+
+### scripts/ 审查（54 项，零删除）
+逐一引用扫描（.github/crates/scripts/docs/*.md/*.toml）+ 测试对象存在性核对：
+- 0 引用组 15 个中：9 个 `test-*` 的被测对象全部存活（`test-setup-caddy.sh`/`test-setup-frps.sh` → `scripts/frp/setup-*.sh`；`test-frps-plugin-e2e.sh` → frps 二进制 + `scripts/frp/`；`test-cloud-host-deploy.sh`→cloud-host-deploy.sh 等）
+- 烟测（smoke-s16-k8s/s17-watchdog/cross-repo-bridge/startup-profile-hot-reload）与 OpenLogos 场景 verify 绑定，保留
+- 活跃工具（render_readme_diagrams.py 是 docs/assets/readme SVG 源、olp-board-append.sh 外环黑板工具、deepseek-chat-compat-proxy.py 等）保留
+- **修复 3 个脚本的已删通道 feature 引用**（否则构建必挂）：`milestone-ci.sh:7` FEATURES 删 dingtalk、`local-tenant-deploy.sh:8/313` 通道列表删 dingtalk/slack/email、`install.sh:1378` 提示文案删 dingtalk
+
+### 文档对齐
+- `CLAUDE.md`：38-member/23 平台 → 35-member/20 平台；15 IM channels/17 impls → 9 IM channels/11 impls（列举同步删 Slack/Email/WeChat）
+- `ORG-README.md`：14 channels ×2 处 → 9 IM channels，列举删 Slack/Email/WeChat/QQ Bot
+- `book/` + `book-zh/`（文档站，16 文件）：channels.md 删 Slack/DingTalk/Email/WeChat-WorkBuddy 桥/LINE 五整章 ×2 语言；installation/configuration/architecture/troubleshooting/introduction/advanced/skill-development 的 feature 组合、环境变量表、目录树、coalesce 表、泛例全部对齐。README-zh 的 3 处"提供者通道"为 LLM sub-provider 语义，非 IM 通道，不改
+- 顺带修复切片 2 漏网：`octos-bus/src/coalesce.rs` `ChunkConfig::slack()` 死代码删除（切片 2 扫描因 `head -30` 截断漏检；telegram()/discord()/default_limit() 亦无调用方，但对应保留通道，超出本提案范围不动，另行处置）
+
+### 验证
+- `node scripts/check-mermaid.mjs`：35 块，语法失败 0
+- `cargo build --workspace --jobs 4`：0 error 0 warning
+- `cargo test -p octos-bus`（--skip cron_service_pg）：293 PASS / 0 failed；cron_service_pg ×4 = 环境伪失败（k8s PG 容器未映射宿主端口，PoolTimedOut，切片 1 已定性）
+- Reporter：TRIM-S3-mermaid-check / TRIM-S3-workspace-build / TRIM-S3-bus-regression

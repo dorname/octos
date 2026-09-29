@@ -32,7 +32,6 @@
       {"type": "cli"},
       {"type": "telegram", "allowed_senders": ["123456789"]},
       {"type": "discord", "settings": {"token_env": "DISCORD_BOT_TOKEN"}},
-      {"type": "slack", "settings": {"bot_token_env": "SLACK_BOT_TOKEN", "app_token_env": "SLACK_APP_TOKEN"}},
       {"type": "whatsapp", "settings": {"bridge_url": "ws://localhost:3001"}},
       {"type": "feishu", "settings": {"app_id_env": "FEISHU_APP_ID", "app_secret_env": "FEISHU_APP_SECRET"}}
     ],
@@ -156,8 +155,6 @@
     "allow_network": false
   },
 
-  // 邮件（用于邮件渠道）
-  "email": null,
 
   // 记忆注入 + 自动刷新（见「记忆与技能」）
   "memory": {
@@ -276,14 +273,10 @@ Origin 应使用 HTTPS。浏览器认证 token 按 Origin 存储；URL 变化后
 |------|------|
 | `TELEGRAM_BOT_TOKEN` | Telegram 机器人令牌 |
 | `DISCORD_BOT_TOKEN` | Discord 机器人令牌 |
-| `SLACK_BOT_TOKEN` | Slack 机器人令牌 |
-| `SLACK_APP_TOKEN` | Slack 应用级令牌 |
 | `FEISHU_APP_ID` | 飞书/Lark 应用 ID |
 | `FEISHU_APP_SECRET` | 飞书/Lark 应用密钥 |
 | `WECOM_CORP_ID` | 企业微信企业 ID |
 | `WECOM_AGENT_SECRET` | 企业微信应用密钥 |
-| `EMAIL_USERNAME` | 邮箱账户用户名 |
-| `EMAIL_PASSWORD` | 邮箱账户密码 |
 
 ### 邮件（send-email 技能）
 

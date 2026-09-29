@@ -121,11 +121,7 @@ export WECOM_BOT_SECRET="your_secret"
 | `RUST_LOG` | 日志级别（`error` / `warn` / `info` / `debug` / `trace`） |
 | `TELEGRAM_BOT_TOKEN` | Telegram 机器人令牌 |
 | `DISCORD_BOT_TOKEN` | Discord 机器人令牌 |
-| `SLACK_BOT_TOKEN` | Slack 机器人令牌 |
-| `SLACK_APP_TOKEN` | Slack 应用级令牌 |
 | `FEISHU_APP_ID` | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | 飞书应用密钥 |
-| `EMAIL_USERNAME` | 邮箱账户用户名 |
-| `EMAIL_PASSWORD` | 邮箱账户密码 |
 | `WECOM_CORP_ID` | 企业微信企业 ID |
 | `WECOM_AGENT_SECRET` | 企业微信应用密钥 |

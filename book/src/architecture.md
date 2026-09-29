@@ -1058,15 +1058,11 @@ pub trait Channel: Send + Sync {
 | **CLI** | stdin/stdout | (always) | N/A | N/A |
 | **Telegram** | teloxide long-poll | `telegram` | Bot token (env) | teloxide built-in |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity built-in |
-| **DingTalk** | custom robot send + outgoing robot webhook | `dingtalk` | Webhook URL + signing secret | msgId |
-| **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
 | **Feishu** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet (10K cap, clear on overflow) |
-| **Email** | IMAP poll + SMTP send | `email` | Username/password, rustls TLS | IMAP UNSEEN flag |
 | **WeCom** | WeCom/WeChat Work API | `wecom` | Corp ID + Agent Secret | message_id |
 | **Twilio** | Twilio SMS/MMS | `twilio` | Account SID + Auth Token | message SID |
 
-**Email specifics**: IMAP `async-imap` with rustls for inbound (poll unseen, mark \Seen). SMTP `lettre` for outbound (port 465=implicit TLS, other=STARTTLS). `mailparse` for RFC822 body extraction. Body truncated via `truncate_utf8(max_body_chars)`.
 
 **Feishu specifics**: Tenant access token with TTL cache (6000s). WebSocket gateway URL from `/callback/ws/endpoint`. Message type detection via `header.event_type == "im.message.receive_v1"`. Supports `oc_*` (chat_id) vs `ou_*` (open_id) routing.
 
@@ -1084,7 +1080,6 @@ Splits oversized messages into channel-safe chunks:
 |---|---|
 | Telegram | 4000 |
 | Discord | 1900 |
-| Slack | 3900 |
 
 **Break preference**: paragraph (`\n\n`) > newline (`\n`) > sentence (`. `) > space (` `) > hard cut.
 
@@ -1267,10 +1262,8 @@ System messages (cron, heartbeat, spawn results) flow through the same bus with 
 # octos-bus
 telegram = ["teloxide"]
 discord  = ["serenity"]
-slack    = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu   = ["tokio-tungstenite"]
-email    = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 # octos-agent (browser is always compiled in, no longer feature-gated)
 git      = ["gix"]                  # git operations via gitoxide
@@ -1285,7 +1278,6 @@ twilio   = [...]                    # Twilio SMS/MMS channel
 api      = ["axum", "tower-http", "futures"]
 telegram = ["octos-bus/telegram"]
 discord  = ["octos-bus/discord"]
-slack    = ["octos-bus/slack"]
 whatsapp = ["octos-bus/whatsapp"]
 feishu   = ["octos-bus/feishu"]
 email    = ["octos-bus/email"]
@@ -1328,8 +1320,8 @@ crates/
 ├── octos-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs, coalesce.rs, media.rs
 │   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
-│   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
-│   ├── wecom_channel.rs, twilio_channel.rs, markdown_html.rs
+│   ├── whatsapp_channel.rs, feishu_channel.rs
+│   ├── wecom_channel.rs, wecom_bot_channel.rs, twilio_channel.rs, markdown_html.rs
 │   ├── cron_service.rs, cron_types.rs, heartbeat.rs
 └── octos-cli/src/
     ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs

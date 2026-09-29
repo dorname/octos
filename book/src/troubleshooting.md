@@ -121,13 +121,7 @@ Messages over 4096 characters are automatically split into multiple chunks by oc
 | `RUST_LOG` | Log level (`error` / `warn` / `info` / `debug` / `trace`) |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
-| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
-| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
-| `SLACK_BOT_TOKEN` | Slack bot token |
-| `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu app ID |
 | `FEISHU_APP_SECRET` | Feishu app secret |
-| `EMAIL_USERNAME` | Email account username |
-| `EMAIL_PASSWORD` | Email account password |
 | `WECOM_CORP_ID` | WeCom corp ID |
 | `WECOM_AGENT_SECRET` | WeCom agent secret |

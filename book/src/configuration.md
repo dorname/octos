@@ -32,7 +32,6 @@ To run Octos as a multi-channel daemon, add a `gateway` section:
       {"type": "cli"},
       {"type": "telegram", "allowed_senders": ["123456789"]},
       {"type": "discord", "settings": {"token_env": "DISCORD_BOT_TOKEN"}},
-      {"type": "slack", "settings": {"bot_token_env": "SLACK_BOT_TOKEN", "app_token_env": "SLACK_APP_TOKEN"}},
       {"type": "whatsapp", "settings": {"bridge_url": "ws://localhost:3001"}},
       {"type": "feishu", "settings": {"app_id_env": "FEISHU_APP_ID", "app_secret_env": "FEISHU_APP_SECRET"}}
     ],
@@ -173,8 +172,6 @@ The complete configuration structure with all available fields:
     "allow_network": false
   },
 
-  // Email (for email channel)
-  "email": null,
 
   // Memory injection + automatic refresh (see Memory & Skills)
   "memory": {
@@ -355,16 +352,10 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
-| `DINGTALK_BOT_WEBHOOK` | DingTalk custom robot webhook URL |
-| `DINGTALK_BOT_SECRET` | DingTalk robot signing secret |
-| `SLACK_BOT_TOKEN` | Slack bot token |
-| `SLACK_APP_TOKEN` | Slack app-level token |
 | `FEISHU_APP_ID` | Feishu/Lark app ID |
 | `FEISHU_APP_SECRET` | Feishu/Lark app secret |
 | `WECOM_CORP_ID` | WeCom corp ID |
 | `WECOM_AGENT_SECRET` | WeCom agent secret |
-| `EMAIL_USERNAME` | Email account username |
-| `EMAIL_PASSWORD` | Email account password |
 
 ### Email (send-email skill)
 

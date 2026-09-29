@@ -1,6 +1,6 @@
 # 网关与频道
 
-Octos 以**网关**模式运行，将各消息平台桥接到你的 LLM 智能体。每个平台连接称为一个**频道**。你可以在同一个网关进程中同时运行多个频道——例如同时接入 Telegram 和 Slack。
+Octos 以**网关**模式运行，将各消息平台桥接到你的 LLM 智能体。每个平台连接称为一个**频道**。你可以在同一个网关进程中同时运行多个频道——例如同时接入 Telegram 和 Discord。
 
 ## 频道概览
 
@@ -35,27 +35,6 @@ export TELEGRAM_BOT_TOKEN="123456:ABC..."
 ```
 
 Telegram 支持 bot 命令、内联键盘、语音消息、图片和文件。
-
----
-
-## Slack
-
-需要一个 Socket Mode 应用，同时提供 bot token 和 app-level token。
-
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_APP_TOKEN="xapp-..."
-```
-
-```json
-{
-  "type": "slack",
-  "settings": {
-    "bot_token_env": "SLACK_BOT_TOKEN",
-    "app_token_env": "SLACK_APP_TOKEN"
-  }
-}
-```
 
 ---
 
@@ -222,35 +201,6 @@ LARK_APP_ID="cli_xxxxx" LARK_APP_SECRET="xxxxx" octos gateway --cwd /path/to/wor
 
 ---
 
-## 邮件（IMAP/SMTP）
-
-通过 IMAP 轮询收件箱获取入站消息，通过 SMTP 发送回复。需启用 `email` feature flag。
-
-```bash
-export EMAIL_USERNAME="bot@example.com"
-export EMAIL_PASSWORD="app-specific-password"
-```
-
-```json
-{
-  "type": "email",
-  "allowed_senders": ["trusted@example.com"],
-  "settings": {
-    "imap_host": "imap.gmail.com",
-    "imap_port": 993,
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": 465,
-    "username_env": "EMAIL_USERNAME",
-    "password_env": "EMAIL_PASSWORD",
-    "from_address": "bot@example.com",
-    "poll_interval_secs": 30,
-    "max_body_chars": 10000
-  }
-}
-```
-
----
-
 ## 企业微信（WeCom）
 
 需要一个配置了消息回调 URL 的自建应用。需启用 `wecom` feature flag。
@@ -272,103 +222,6 @@ export WECOM_AGENT_SECRET="..."
     "webhook_port": 9322
   }
 }
-```
-
----
-
-## 微信（通过 WorkBuddy 桥接）
-
-普通微信用户可以通过 WorkBuddy 桌面端桥接连接到你的智能体。WorkBuddy 负责微信传输层；Octos 通过其 WeCom Bot 频道处理 AI 逻辑。
-
-```
-微信（手机） --> WorkBuddy（桌面端） --> 企业微信群机器人（WSS） --> octos wecom-bot 频道
-```
-
-### 配置步骤
-
-1. 在[企业微信管理后台](https://work.weixin.qq.com/)的"应用管理 > 群机器人"中创建一个**企业微信群机器人**，记下 Bot ID 和 Secret。
-
-2. 配置 `wecom-bot` 频道：
-
-```bash
-export WECOM_BOT_SECRET="your_robot_secret_here"
-```
-
-```json
-{
-  "type": "wecom-bot",
-  "allowed_senders": [],
-  "settings": {
-    "bot_id": "YOUR_BOT_ID",
-    "secret_env": "WECOM_BOT_SECRET"
-  }
-}
-```
-
-3. 构建并启动：
-
-```bash
-cargo build --release -p octos-cli --features "wecom-bot"
-octos gateway
-```
-
-4. 安装 **WorkBuddy** 桌面客户端，通过扫码关联你的微信，并连接到同一个企业微信群机器人。
-
-### 连接详情
-
-| 属性 | 值 |
-|----------|-------|
-| 协议 | WebSocket (WSS) |
-| 端点 | `wss://openws.work.weixin.qq.com` |
-| 心跳 | 每 30 秒 Ping/pong |
-| 自动重连 | 支持，指数退避（5s--60s） |
-| 最大消息长度 | 4096 字符 |
-| 消息格式 | Markdown |
-
-`wecom-bot` 频道使用出站 WebSocket 连接——无需公网 URL 或端口转发。适合部署在 NAT 或防火墙后的服务器。
-
-### 限制
-
-- **仅支持文本** -- 语音和图片消息以占位符形式传递
-- **不支持消息编辑** -- 回复以新消息形式发送
-- **单向触发** -- 微信到 Octos 自动触发；主动推送需使用定时任务
-
----
-
-## DingTalk（钉钉）
-
-钉钉支持通过自定义机器人向外发送消息，以及接收 outgoing-robot 回调。
-
-```bash
-export DINGTALK_BOT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
-export DINGTALK_BOT_SECRET="SEC..."
-```
-
-```json
-{
-  "type": "dingtalk",
-  "allowed_senders": ["staff-id-1"],
-  "settings": {
-    "webhook_url_env": "DINGTALK_BOT_WEBHOOK",
-    "secret_env": "DINGTALK_BOT_SECRET",
-    "webhook_port": 8650
-  }
-}
-```
-
-入站事件请配置钉钉 outgoing 机器人的回调 URL。在 `octos serve` 之后使用代理路由；在独立的 `octos gateway` 模式下，则指向该渠道自带的 webhook 服务器（`webhook_port`）：
-
-```text
-# 在 octos serve 之后（代理）
-https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
-# 独立的 octos gateway
-http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
-```
-
-使用 `dingtalk` 特性标志编译：
-
-```bash
-cargo build --release -p octos-cli --features dingtalk
 ```
 
 ---
@@ -420,32 +273,6 @@ Matrix 是一等公民频道，也是本章多处提到的「人工审批」与�
 ```
 
 使用 `matrix` 特性标志编译。在 **appservice / 管理机器人**房间中，Matrix 会为[人工审批规则](./configuration.md)渲染原生的 批准/拒绝 卡片（通过 Robrix），并处理 `/schedule`、`/schedules`、`/unschedule`、`/allbots` 聊天命令（见下文[定时任务](#定时任务)）。而普通的 `mode: "user"` 账户渠道本身并不解释这些管理命令；它会把消息文本转发给 agent，但**默认仅在机器人被 @ 提及时**转发（`require_mention` 默认为 `true`——在其 settings 中设置 `"require_mention": false` 可转发每一条消息）。即使关闭了 `require_mention`，群房里显式提及他人的消息（`m.mentions` 条目、matrix.to pill、或手打的 `@user:server`）也会被视为发给对方而不予回复，这样多个机器人共处一室时不会对每条指明对象的消息全体抢答；私聊（DM）不受此限，设置 `"mention_policy": "open"` 可恢复"不论提及谁都回复"的旧行为。
-
----
-
-## LINE
-
-入站 webhook + 出站 Messaging API。由 `line` 特性门控。
-
-```bash
-export LINE_CHANNEL_SECRET="..."
-export LINE_CHANNEL_ACCESS_TOKEN="..."
-```
-
-```json
-{
-  "type": "line",
-  "settings": {
-    "channel_secret_env": "LINE_CHANNEL_SECRET",
-    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
-    "webhook_port": 9323,
-    "bot_user_id": "U...",
-    "require_mention": false
-  }
-}
-```
-
-在独立的 `octos gateway` 模式下，LINE 将事件推送到该渠道自带的 webhook 服务器 `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`；在 `octos serve` 之后，则改用代理路由 `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>`。入站签名针对请求**体**用 channel secret 校验（HMAC-SHA256），因此两种 URL 均可用。使用 `line` 特性标志编译。
 
 ---
 
@@ -566,7 +393,6 @@ octos cron enable <job-id> --disable     # 禁用任务
 |---------|-----------------------|
 | Telegram | 4000 |
 | Discord | 1900 |
-| Slack | 3900 |
 
 拆分优先级：段落边界 > 换行符 > 句末 > 空格 > 硬截断。
 

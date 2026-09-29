@@ -30,10 +30,9 @@ cd octos
 # 推荐：规范特性集（与 scripts/milestone-ci.sh 一致）。
 # 包含 REST API + 仪表板（`octos serve`）以及常用的消息渠道适配器——
 # 这是 CI 所构建的集合。（发布工作流使用相近的集合；确切的发布特性
-# 请查看 .github/workflows。）如需其他渠道（slack、email、matrix、
-# line、qq-bot、wechat），从下方列表按需添加。
+# 请查看 .github/workflows。）如需其他渠道（matrix），从下方列表按需添加。
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 最小：仅 CLI + chat + gateway（仅 CLI 渠道）。
 # 该二进制不含 `octos serve`（是 api 特性注册了该子命令），
@@ -41,13 +40,12 @@ cargo install --path crates/octos-cli \
 cargo install --path crates/octos-cli
 
 # 按需裁剪特性列表。可用的渠道特性：
-#   telegram、discord、dingtalk、slack、whatsapp、feishu、email、wecom、wecom-bot、
-#   matrix、line、qq-bot、twilio、wechat
+#   telegram、discord、whatsapp、feishu、wecom、wecom-bot、matrix、twilio
 # `octos serve` 必需：api
 # 其他特性：git（gitoxide）、ast（tree-sitter）、
 #   audio_mp3（用于音频工作区契约校验的 MP3 解码）
 # 注意：浏览器工具（通过 CDP 的无头 Chrome）始终编译在内——没有 `browser` 特性。
-cargo install --path crates/octos-cli --features "api,telegram,slack"
+cargo install --path crates/octos-cli --features "api,telegram,discord"
 
 # 验证安装
 octos --version
@@ -191,7 +189,7 @@ rustup-init.exe
 git clone https://github.com/octos-org/octos.git
 cd octos
 cargo install --path crates/octos-cli `
-    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 # 3. 设置 API 密钥并运行
 $env:ANTHROPIC_API_KEY = "sk-ant-..."

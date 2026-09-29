@@ -1,6 +1,6 @@
 # Gateway & Channels
 
-Octos runs as a **gateway** that bridges messaging platforms to your LLM agent. Each platform connection is called a **channel**. You can run multiple channels simultaneously -- for example, Telegram and Slack in the same gateway process.
+Octos runs as a **gateway** that bridges messaging platforms to your LLM agent. Each platform connection is called a **channel**. You can run multiple channels simultaneously -- for example, Telegram and Discord in the same gateway process.
 
 ## Channel Overview
 
@@ -38,27 +38,6 @@ Telegram supports bot commands, inline keyboards, voice messages, images, and fi
 
 ---
 
-## Slack
-
-Requires a Socket Mode app with both a bot token and an app-level token.
-
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_APP_TOKEN="xapp-..."
-```
-
-```json
-{
-  "type": "slack",
-  "settings": {
-    "bot_token_env": "SLACK_BOT_TOKEN",
-    "app_token_env": "SLACK_APP_TOKEN"
-  }
-}
-```
-
----
-
 ## Discord
 
 Requires a bot token from the [Discord Developer Portal](https://discord.com/developers/applications).
@@ -74,44 +53,6 @@ export DISCORD_BOT_TOKEN="..."
     "token_env": "DISCORD_BOT_TOKEN"
   }
 }
-```
-
----
-
-## DingTalk
-
-DingTalk supports outbound custom-robot sends and incoming outgoing-robot callbacks.
-
-```bash
-export DINGTALK_BOT_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
-export DINGTALK_BOT_SECRET="SEC..."
-```
-
-```json
-{
-  "type": "dingtalk",
-  "allowed_senders": ["staff-id-1"],
-  "settings": {
-    "webhook_url_env": "DINGTALK_BOT_WEBHOOK",
-    "secret_env": "DINGTALK_BOT_SECRET",
-    "webhook_port": 8650
-  }
-}
-```
-
-For inbound events, configure the DingTalk outgoing robot callback URL. Behind `octos serve`, use the proxy route; in standalone `octos gateway` mode, point at the channel's own webhook server on `webhook_port`:
-
-```text
-# behind octos serve (proxy)
-https://YOUR_OCTOS_HOST/webhook/dingtalk/<profile_id>
-# standalone octos gateway
-http://YOUR_OCTOS_HOST:<webhook_port>/dingtalk/webhook
-```
-
-Build with the `dingtalk` feature flag:
-
-```bash
-cargo build --release -p octos-cli --features dingtalk
 ```
 
 ---
@@ -260,35 +201,6 @@ LARK_APP_ID="cli_xxxxx" LARK_APP_SECRET="xxxxx" octos gateway --cwd /path/to/wor
 
 ---
 
-## Email (IMAP/SMTP)
-
-Polls an IMAP inbox for inbound messages and replies via SMTP. Feature-gated behind `email`.
-
-```bash
-export EMAIL_USERNAME="bot@example.com"
-export EMAIL_PASSWORD="app-specific-password"
-```
-
-```json
-{
-  "type": "email",
-  "allowed_senders": ["trusted@example.com"],
-  "settings": {
-    "imap_host": "imap.gmail.com",
-    "imap_port": 993,
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": 465,
-    "username_env": "EMAIL_USERNAME",
-    "password_env": "EMAIL_PASSWORD",
-    "from_address": "bot@example.com",
-    "poll_interval_secs": 30,
-    "max_body_chars": 10000
-  }
-}
-```
-
----
-
 ## WeCom (WeChat Work)
 
 Requires a Custom App with a message callback URL. Feature-gated behind `wecom`.
@@ -311,65 +223,6 @@ export WECOM_AGENT_SECRET="..."
   }
 }
 ```
-
----
-
-## WeChat (via WorkBuddy Bridge)
-
-Regular WeChat users can connect to your agent through a WorkBuddy desktop bridge. WorkBuddy handles the WeChat transport; Octos handles the AI logic via its WeCom Bot channel.
-
-```
-WeChat (mobile) --> WorkBuddy (desktop) --> WeCom group robot (WSS) --> octos wecom-bot channel
-```
-
-### Setup
-
-1. Create a **WeCom group robot** in the [WeCom Admin Console](https://work.weixin.qq.com/) under Applications > Group Robot. Note the Bot ID and Secret.
-
-2. Configure the `wecom-bot` channel:
-
-```bash
-export WECOM_BOT_SECRET="your_robot_secret_here"
-```
-
-```json
-{
-  "type": "wecom-bot",
-  "allowed_senders": [],
-  "settings": {
-    "bot_id": "YOUR_BOT_ID",
-    "secret_env": "WECOM_BOT_SECRET"
-  }
-}
-```
-
-3. Build and start:
-
-```bash
-cargo build --release -p octos-cli --features "wecom-bot"
-octos gateway
-```
-
-4. Install the **WorkBuddy** desktop client, link it to your WeChat via QR scan, and connect it to the same WeCom group robot.
-
-### Connection Details
-
-| Property | Value |
-|----------|-------|
-| Protocol | WebSocket (WSS) |
-| Endpoint | `wss://openws.work.weixin.qq.com` |
-| Heartbeat | Ping/pong every 30 seconds |
-| Auto-reconnect | Yes, exponential backoff (5s--60s) |
-| Max message length | 4096 characters |
-| Message format | Markdown |
-
-The `wecom-bot` channel uses an outbound WebSocket connection -- no public URL or port forwarding is required. This makes it suitable for servers behind NAT or firewalls.
-
-### Limitations
-
-- **Text only** -- voice and image messages are passed as placeholders
-- **No message editing** -- responses are sent as new messages
-- **One direction** -- WeChat-to-Octos is automatic; for proactive messages, use cron jobs
 
 ---
 
@@ -420,32 +273,6 @@ Log in with an `access_token` (preferred), or with `user_id` + `password` (both 
 ```
 
 Build with the `matrix` feature flag. In **appservice / management-bot** rooms, Matrix renders native Approve/Deny cards for [Human Approval Rules](./configuration.md) (via Robrix) and handles the `/schedule`, `/schedules`, `/unschedule`, and `/allbots` chat commands (see [Cron Jobs](#cron-jobs) below). A plain `mode: "user"` account channel does not interpret those management commands; it forwards message text to the agent, but **by default only when the bot is mentioned** (`require_mention` defaults to `true` — set `"require_mention": false` in its settings to forward every message). Even with `require_mention` off, a group-room message that explicitly mentions someone else (an `m.mentions` entry, a matrix.to pill, or a hand-typed `@user:server`) is treated as directed at them and stays unanswered, so several bots can share a room without all replying to every addressed message; direct chats are exempt, and `"mention_policy": "open"` restores answering regardless of mentions.
-
----
-
-## LINE
-
-Inbound webhook + outbound Messaging API. Feature-gated behind `line`.
-
-```bash
-export LINE_CHANNEL_SECRET="..."
-export LINE_CHANNEL_ACCESS_TOKEN="..."
-```
-
-```json
-{
-  "type": "line",
-  "settings": {
-    "channel_secret_env": "LINE_CHANNEL_SECRET",
-    "channel_access_token_env": "LINE_CHANNEL_ACCESS_TOKEN",
-    "webhook_port": 9323,
-    "bot_user_id": "U...",
-    "require_mention": false
-  }
-}
-```
-
-In standalone `octos gateway` mode, LINE pushes events to the channel's own webhook server at `http://YOUR_OCTOS_HOST:<webhook_port>/line/webhook`; behind `octos serve`, use the proxy route `https://YOUR_OCTOS_HOST/webhook/line/<profile_id>` instead. Inbound signatures are verified over the request **body** with the channel secret (HMAC-SHA256), so either URL works. Build with the `line` feature flag.
 
 ---
 
@@ -581,8 +408,6 @@ Long responses are automatically split into channel-safe chunks:
 |---------|-----------------------|
 | Telegram | 4000 |
 | Discord | 1900 |
-| DingTalk | 3600 |
-| Slack | 3900 |
 
 Split preference: paragraph boundary > newline > sentence end > space > hard cut.
 

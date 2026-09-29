@@ -34,7 +34,7 @@ cargo install --path crates/octos-cli \
 
 ## Architecture
 
-octos is a Rust-native, API-first Agentic OS — multi-tenant AI agent platform. 38-member workspace (23 platform crates + 15 skill crates), core layering:
+octos is a Rust-native, API-first Agentic OS — multi-tenant AI agent platform. 35-member workspace (20 platform crates + 15 skill crates), core layering:
 
 ```
 octos-cli  (CLI: clap commands, config loading, config watcher)
@@ -47,7 +47,7 @@ octos-memory   octos-llm  (hybrid search + memory store | LLM providers)
 ```
 
 Alongside octos-agent:
-- **octos-bus**: Message bus, 15 IM channels (Telegram/Discord/Slack/WhatsApp/Email/WeChat/...; 17 channel impls incl. api/cli local), sessions, coalescing, cron, heartbeat
+- **octos-bus**: Message bus, 9 IM channels (Telegram/Discord/WhatsApp/Feishu/Twilio/WeCom/Matrix/...; 11 channel impls incl. api/cli local), sessions, coalescing, cron, heartbeat
 - **octos-pipeline**: DOT-graph pipeline engine — per-node model selection, parallel fan-out, checkpoints, human gates
 - **octos-plugin**: Plugin SDK — manifest parsing, discovery, gating (binary/env/OS checks)
 
