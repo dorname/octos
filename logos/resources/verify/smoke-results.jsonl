@@ -19,9 +19,9 @@
 {"id":"SMOKE-RPC-03","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"admin 裸 session/open 成功(profile store 为空,不报 profile_unresolved)"}
 {"id":"SMOKE-RPC-04","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"fixture turn 全事件以 envelope 到达:turn/started→assistant_delta(回显 CJK prompt)→turn_terminal(completed),无 legacy 帧"}
 {"id":"SMOKE-RPC-05","status":"pass","timestamp":"2026-09-22T18:57:46Z","scenario":"fix-rpc-method-not-found-contract","note":"musl 重建注入 k8s(ns octos),rollout 成功,/health 200,WS 复验:-32601 + admin 裸 open 通过"}
-{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-22T19:01:07Z","scenario":"S17"}
-{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-22T19:01:09Z","scenario":"S17"}
-{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-22T19:01:10Z","scenario":"S17"}
-{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-22T19:01:11Z","scenario":"S17"}
-{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-22T19:01:17Z","scenario":"S17"}
-{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-22T19:01:20Z","scenario":"S17"}
+{"id":"SMOKE-S17-01","status":"pass","timestamp":"2026-09-29T12:57:10Z","scenario":"S17"}
+{"id":"SMOKE-S17-02","status":"pass","timestamp":"2026-09-29T12:57:13Z","scenario":"S17"}
+{"id":"SMOKE-S17-03","status":"pass","timestamp":"2026-09-29T12:57:14Z","scenario":"S17"}
+{"id":"SMOKE-S17-04","status":"pass","timestamp":"2026-09-29T12:57:15Z","scenario":"S17"}
+{"id":"SMOKE-S17-05","status":"pass","timestamp":"2026-09-29T12:57:20Z","scenario":"S17"}
+{"id":"SMOKE-S17-06","status":"pass","timestamp":"2026-09-29T12:57:23Z","scenario":"S17"}
