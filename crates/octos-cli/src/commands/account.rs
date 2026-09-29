@@ -486,17 +486,11 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
     match ch {
         ChannelCredentials::Telegram { .. } => "telegram",
         ChannelCredentials::Discord { .. } => "discord",
-        ChannelCredentials::DingTalk { .. } => "dingtalk",
-        ChannelCredentials::Slack { .. } => "slack",
         ChannelCredentials::WhatsApp { .. } => "whatsapp",
         ChannelCredentials::Feishu { .. } => "feishu",
-        ChannelCredentials::Email { .. } => "email",
         ChannelCredentials::Twilio { .. } => "twilio",
         ChannelCredentials::Api { .. } => "api",
         ChannelCredentials::WeComBot { .. } => "wecom-bot",
         ChannelCredentials::Matrix { .. } => "matrix",
-        ChannelCredentials::QQBot { .. } => "qq-bot",
-        ChannelCredentials::WeChat { .. } => "wechat",
-        ChannelCredentials::Line { .. } => "line",
     }
 }

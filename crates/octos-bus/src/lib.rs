@@ -18,30 +18,18 @@ pub mod session;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
-#[cfg(feature = "dingtalk")]
-pub mod dingtalk_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
-#[cfg(feature = "email")]
-pub mod email_channel;
 #[cfg(feature = "feishu")]
 pub mod feishu_channel;
-#[cfg(feature = "line")]
-pub mod line_channel;
 #[cfg(feature = "matrix")]
 pub mod matrix_channel;
 #[cfg(feature = "matrix")]
 pub mod matrix_user_channel;
-#[cfg(feature = "qq-bot")]
-pub mod qq_bot_channel;
-#[cfg(feature = "slack")]
-pub mod slack_channel;
 #[cfg(feature = "telegram")]
 pub mod telegram_channel;
 #[cfg(feature = "twilio")]
 pub mod twilio_channel;
-#[cfg(feature = "wechat")]
-pub mod wechat_channel;
 #[cfg(feature = "wecom-bot")]
 pub mod wecom_bot_channel;
 #[cfg(feature = "wecom")]
@@ -72,16 +60,10 @@ pub use session::{
 
 #[cfg(feature = "api")]
 pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
-#[cfg(feature = "dingtalk")]
-pub use dingtalk_channel::DingTalkChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
-#[cfg(feature = "email")]
-pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
-#[cfg(feature = "line")]
-pub use line_channel::LineChannel;
 #[cfg(feature = "matrix")]
 pub use matrix_channel::{
     BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel, MatrixEventId, MatrixRoomId,
@@ -93,16 +75,10 @@ pub use matrix_user_channel::{
     MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixMentionPolicy, MatrixPendingInvite,
     MatrixUserChannel,
 };
-#[cfg(feature = "qq-bot")]
-pub use qq_bot_channel::QQBotChannel;
-#[cfg(feature = "slack")]
-pub use slack_channel::SlackChannel;
 #[cfg(feature = "telegram")]
 pub use telegram_channel::TelegramChannel;
 #[cfg(feature = "twilio")]
 pub use twilio_channel::TwilioChannel;
-#[cfg(feature = "wechat")]
-pub use wechat_channel::WeChatChannel;
 #[cfg(feature = "wecom-bot")]
 pub use wecom_bot_channel::WeComBotChannel;
 #[cfg(feature = "wecom")]

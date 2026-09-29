@@ -10618,7 +10618,8 @@ fn session_id_encodes_non_solo_scope(session_id: &SessionKey) -> bool {
 /// `SessionKey::new("line", "tenant:123")` whose chat-id text starts
 /// with `tenant:` would be misclassified as tenant-scoped without
 /// recognising `line` here. Keep in sync when new gateway channels
-/// are added.
+/// are added. dingtalk/slack/line/email/qq-bot/wechat 通道虽已随
+/// trim-unused-features 裁剪，名称仍保留于此以正确解析历史会话键。
 fn is_registered_channel_name(value: &str) -> bool {
     matches!(
         value,

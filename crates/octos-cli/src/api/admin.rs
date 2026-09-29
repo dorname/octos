@@ -1836,24 +1836,10 @@ pub(crate) fn validate_channel_credentials(
                     return Err("Telegram channel: token_env must be non-empty".into());
                 }
             }
-            ChannelCredentials::WeChat { token_env, .. } => {
-                if token_env.is_empty() {
-                    return Err("WeChat channel: token_env must be non-empty".into());
-                }
-            }
             ChannelCredentials::Feishu { app_id_env, .. } => {
                 if app_id_env.is_empty() {
                     return Err("Feishu channel: app_id_env must be non-empty".into());
                 }
-            }
-            ChannelCredentials::DingTalk {
-                webhook_url_env,
-                secret_env,
-                ..
-            } if webhook_url_env.is_empty() && secret_env.is_empty() => {
-                return Err(
-                    "DingTalk channel: webhook_url_env or secret_env must be non-empty".into(),
-                );
             }
             _ => {}
         }
@@ -3999,18 +3985,12 @@ pub async fn config_check(
         .map(|c| match c {
             crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
             crate::profiles::ChannelCredentials::Discord { .. } => "discord",
-            crate::profiles::ChannelCredentials::DingTalk { .. } => "dingtalk",
-            crate::profiles::ChannelCredentials::Slack { .. } => "slack",
             crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
-            crate::profiles::ChannelCredentials::Email { .. } => "email",
             crate::profiles::ChannelCredentials::Twilio { .. } => "twilio",
             crate::profiles::ChannelCredentials::Api { .. } => "api",
             crate::profiles::ChannelCredentials::WeComBot { .. } => "wecom-bot",
             crate::profiles::ChannelCredentials::Matrix { .. } => "matrix",
-            crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
-            crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
-            crate::profiles::ChannelCredentials::Line { .. } => "line",
         })
         .collect();
 
@@ -4141,21 +4121,6 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             crate::profiles::ChannelCredentials::Discord { token_env, .. } => {
                 insert_ref(token_env, "channels");
             }
-            crate::profiles::ChannelCredentials::DingTalk {
-                webhook_url_env,
-                secret_env,
-                ..
-            } => {
-                insert_ref(webhook_url_env, "channels");
-                insert_ref(secret_env, "channels");
-            }
-            crate::profiles::ChannelCredentials::Slack {
-                bot_token_env,
-                app_token_env,
-            } => {
-                insert_ref(bot_token_env, "channels");
-                insert_ref(app_token_env, "channels");
-            }
             crate::profiles::ChannelCredentials::Feishu {
                 app_id_env,
                 app_secret_env,
@@ -4168,14 +4133,6 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
                 insert_ref(verification_token_env, "channels");
                 insert_ref(encrypt_key_env, "channels");
             }
-            crate::profiles::ChannelCredentials::Email {
-                username_env,
-                password_env,
-                ..
-            } => {
-                insert_ref(username_env, "channels");
-                insert_ref(password_env, "channels");
-            }
             crate::profiles::ChannelCredentials::Twilio {
                 account_sid_env,
                 auth_token_env,
@@ -4186,22 +4143,6 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
             crate::profiles::ChannelCredentials::WeComBot { secret_env, .. } => {
                 insert_ref(secret_env, "channels");
-            }
-            crate::profiles::ChannelCredentials::QQBot {
-                client_secret_env, ..
-            } => {
-                insert_ref(client_secret_env, "channels");
-            }
-            crate::profiles::ChannelCredentials::WeChat { token_env, .. } => {
-                insert_ref(token_env, "channels");
-            }
-            crate::profiles::ChannelCredentials::Line {
-                channel_secret_env,
-                channel_access_token_env,
-                ..
-            } => {
-                insert_ref(channel_secret_env, "channels");
-                insert_ref(channel_access_token_env, "channels");
             }
             crate::profiles::ChannelCredentials::WhatsApp { .. }
             | crate::profiles::ChannelCredentials::Api { .. }
@@ -6727,193 +6668,4 @@ mod tests {
         assert_eq!(body["err_total_lines"], 1);
     }
 
-    // #1440: a WeChat QR flow started against a profile that does not exist
-    // must fail fast instead of reporting "confirmed" with the token dropped.
-    #[tokio::test]
-    async fn wechat_qr_start_rejects_unknown_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
-        let state = Arc::new(AppState {
-            profile_store: Some(profile_store),
-            ..AppState::empty_for_tests()
-        });
-
-        let status = match wechat_qr_start(State(state), Path("ghost".into())).await {
-            Err((status, _)) => status,
-            Ok(_) => panic!("unknown profile must be rejected"),
-        };
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn wechat_qr_poll_rejects_unknown_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
-        let state = Arc::new(AppState {
-            profile_store: Some(profile_store),
-            ..AppState::empty_for_tests()
-        });
-
-        let status = match wechat_qr_poll(
-            State(state),
-            Path("ghost".into()),
-            Json(WeChatQrPollRequest {
-                session_key: "sk-1".into(),
-            }),
-        )
-        .await
-        {
-            Err((status, _)) => status,
-            Ok(_) => panic!("unknown profile must be rejected"),
-        };
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WeChat QR Login
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize)]
-pub struct WeChatQrStartResponse {
-    pub qrcode_url: String,
-    pub session_key: String,
-}
-
-/// GET /api/admin/profiles/{id}/wechat/qr-start
-pub async fn wechat_qr_start(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<WeChatQrStartResponse>, (StatusCode, String)> {
-    // Fail fast before the user scans a QR bound for a profile that does not
-    // exist — the poll below would have nowhere to land the token.
-    require_admin_profile(&state, &id)?;
-
-    let client = reqwest::Client::new();
-    let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to fetch QR: {e}")))?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("invalid QR response: {e}")))?;
-    let qrcode = body["qrcode"]
-        .as_str()
-        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode field".into()))?
-        .to_string();
-    let qrcode_url = body["qrcode_img_content"]
-        .as_str()
-        .ok_or((StatusCode::BAD_GATEWAY, "missing qrcode_img_content".into()))?
-        .to_string();
-
-    Ok(Json(WeChatQrStartResponse {
-        qrcode_url,
-        session_key: qrcode,
-    }))
-}
-
-#[derive(serde::Deserialize)]
-pub struct WeChatQrPollRequest {
-    pub session_key: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct WeChatQrPollResponse {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_id: Option<String>,
-}
-
-/// Load the named profile or fail the request: a QR flow for a profile that
-/// does not exist would report "confirmed" while the token lands nowhere.
-fn require_admin_profile(
-    state: &Arc<AppState>,
-    id: &str,
-) -> Result<Arc<crate::profiles::ProfileStore>, (StatusCode, String)> {
-    let store = state.profile_store.clone().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "admin not configured".into(),
-    ))?;
-    store
-        .get(id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
-    Ok(store)
-}
-
-/// POST /api/admin/profiles/{id}/wechat/qr-poll
-pub async fn wechat_qr_poll(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<WeChatQrPollRequest>,
-) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
-    let store = require_admin_profile(&state, &id)?;
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(40))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let encoded_key: String = req
-        .session_key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect();
-    let url = format!(
-        "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode={}",
-        encoded_key
-    );
-    let resp = client
-        .get(&url)
-        .header("iLink-App-ClientVersion", "1")
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                return (StatusCode::OK, "".into());
-            }
-            (StatusCode::BAD_GATEWAY, format!("poll failed: {e}"))
-        })?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("invalid poll response: {e}"),
-        )
-    })?;
-
-    let status = body["status"].as_str().unwrap_or("wait").to_string();
-
-    if status == "confirmed" {
-        let bot_token = body["bot_token"].as_str().unwrap_or_default().to_string();
-        let bot_id = body["ilink_bot_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-
-        // Save token to the profile being edited
-        super::auth_handlers::persist_wechat_bot_token(&store, &id, &bot_token);
-
-        // Don't expose bot_token to the client — it's already saved server-side
-        return Ok(Json(WeChatQrPollResponse {
-            status,
-            bot_token: None,
-            bot_id: Some(bot_id),
-        }));
-    }
-
-    Ok(Json(WeChatQrPollResponse {
-        status,
-        bot_token: None,
-        bot_id: None,
-    }))
 }

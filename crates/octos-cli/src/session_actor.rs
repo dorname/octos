@@ -6445,7 +6445,7 @@ impl SessionActor {
 
     /// Wave-4 B3 — `/router` chat-command surface for the gateway. Mirrors
     /// the Wave-4-A UI-protocol `RouterStatusEvent` / `RouterFailoverEvent`
-    /// pair so bus users (Telegram, Discord, Slack, Feishu, WeChat, …) can
+    /// pair so bus users (Telegram, Discord, Feishu, WhatsApp, …) can
     /// inspect or switch the adaptive router state from any channel.
     ///
     /// Usage:

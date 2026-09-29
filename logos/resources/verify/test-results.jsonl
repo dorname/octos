@@ -1,40 +1,46 @@
-{"id":"ST-S17-01","status":"pass","duration_ms":17,"timestamp":"2026-09-29T17:16:39.442073447+00:00","scenario":"S17"}
-{"id":"ST-S17-02","status":"pass","duration_ms":28,"timestamp":"2026-09-29T17:16:39.470516828+00:00","scenario":"S17"}
-{"id":"ST-S17-03","status":"pass","duration_ms":16,"timestamp":"2026-09-29T17:16:39.487721747+00:00","scenario":"S17"}
-{"id":"ST-S17-04","status":"pass","duration_ms":16,"timestamp":"2026-09-29T17:16:39.504946926+00:00","scenario":"S17"}
-{"id":"ST-S17-05","status":"pass","duration_ms":16,"timestamp":"2026-09-29T17:16:39.522230496+00:00","scenario":"S17"}
-{"id":"ST-S17-06","status":"pass","duration_ms":32,"timestamp":"2026-09-29T17:16:39.554935647+00:00","scenario":"S17"}
-{"id":"ST-S17-07","status":"pass","duration_ms":67,"timestamp":"2026-09-29T17:16:39.622832361+00:00","scenario":"S17"}
-{"id":"ST-S17-08","status":"pass","duration_ms":32,"timestamp":"2026-09-29T17:16:39.655516499+00:00","scenario":"S17"}
-{"id":"ST-S17-09","status":"pass","duration_ms":17,"timestamp":"2026-09-29T17:16:39.673530765+00:00","scenario":"S17"}
-{"id":"ST-S17-10","status":"pass","duration_ms":18,"timestamp":"2026-09-29T17:16:39.692735533+00:00","scenario":"S17"}
-{"id":"ST-S17-11","status":"pass","duration_ms":28,"timestamp":"2026-09-29T17:16:39.721158703+00:00","scenario":"S17"}
-{"id":"ST-S17-12","status":"pass","duration_ms":29,"timestamp":"2026-09-29T17:16:39.750769929+00:00","scenario":"S17"}
-{"id":"ST-S17-13","status":"skip","duration_ms":0,"timestamp":"2026-09-29T17:16:39.751153397+00:00","scenario":"S17","error":"需要隔离的 systemd --user 部署环境，由 smoke runner 覆盖"}
-{"id":"ST-S17-14","status":"pass","duration_ms":16,"timestamp":"2026-09-29T17:16:39.767938567+00:00","scenario":"S17"}
-{"id":"UT-S17-01","status":"pass","duration_ms":16,"timestamp":"2026-09-29T17:16:39.785128989+00:00","scenario":"S17"}
-{"id":"UT-S17-02","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.786632764+00:00","scenario":"S17"}
-{"id":"UT-S17-03","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.788191284+00:00","scenario":"S17"}
-{"id":"UT-S17-04","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.789552212+00:00","scenario":"S17"}
-{"id":"UT-S17-05","status":"pass","duration_ms":26,"timestamp":"2026-09-29T17:16:39.816537844+00:00","scenario":"S17"}
-{"id":"UT-S17-06","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.818020809+00:00","scenario":"S17"}
-{"id":"UT-S17-07","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.819461394+00:00","scenario":"S17"}
-{"id":"UT-S17-08","status":"pass","duration_ms":18,"timestamp":"2026-09-29T17:16:39.838034904+00:00","scenario":"S17"}
-{"id":"UT-S17-09","status":"pass","duration_ms":50,"timestamp":"2026-09-29T17:16:39.888613312+00:00","scenario":"S17"}
-{"id":"UT-S17-10","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:16:39.888987004+00:00","scenario":"S17"}
-{"id":"UT-S17-11","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:16:39.889233504+00:00","scenario":"S17"}
-{"id":"UT-S17-12","status":"pass","duration_ms":21,"timestamp":"2026-09-29T17:16:39.911203605+00:00","scenario":"S17"}
-{"id":"UT-S17-13","status":"pass","duration_ms":56,"timestamp":"2026-09-29T17:16:39.968405347+00:00","scenario":"S17"}
-{"id":"UT-S17-14","status":"pass","duration_ms":11,"timestamp":"2026-09-29T17:16:39.980081374+00:00","scenario":"S17"}
-{"id":"UT-S17-15","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.982019616+00:00","scenario":"S17"}
-{"id":"UT-S17-16","status":"pass","duration_ms":1,"timestamp":"2026-09-29T17:16:39.984204845+00:00","scenario":"S17"}
-{"id":"UT-S17-17","status":"pass","duration_ms":45,"timestamp":"2026-09-29T17:16:40.029934050+00:00","scenario":"S17"}
-{"id":"UT-S17-18","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:16:40.030756569+00:00","scenario":"S17"}
-{"id":"UT-S17-19","status":"pass","duration_ms":7,"timestamp":"2026-09-29T17:16:40.038022735+00:00","scenario":"S17"}
-{"id":"UT-S17-20","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:16:40.038368604+00:00","scenario":"S17"}
+{"id":"ST-S17-01","status":"pass","duration_ms":17,"timestamp":"2026-09-29T18:19:46.183391661+00:00","scenario":"S17"}
+{"id":"ST-S17-02","status":"pass","duration_ms":26,"timestamp":"2026-09-29T18:19:46.210096041+00:00","scenario":"S17"}
+{"id":"ST-S17-03","status":"pass","duration_ms":17,"timestamp":"2026-09-29T18:19:46.228139254+00:00","scenario":"S17"}
+{"id":"ST-S17-04","status":"pass","duration_ms":16,"timestamp":"2026-09-29T18:19:46.245293334+00:00","scenario":"S17"}
+{"id":"ST-S17-05","status":"pass","duration_ms":18,"timestamp":"2026-09-29T18:19:46.264207716+00:00","scenario":"S17"}
+{"id":"ST-S17-06","status":"pass","duration_ms":32,"timestamp":"2026-09-29T18:19:46.296842490+00:00","scenario":"S17"}
+{"id":"ST-S17-07","status":"pass","duration_ms":72,"timestamp":"2026-09-29T18:19:46.369522013+00:00","scenario":"S17"}
+{"id":"ST-S17-08","status":"pass","duration_ms":26,"timestamp":"2026-09-29T18:19:46.396572695+00:00","scenario":"S17"}
+{"id":"ST-S17-09","status":"pass","duration_ms":16,"timestamp":"2026-09-29T18:19:46.413839829+00:00","scenario":"S17"}
+{"id":"ST-S17-10","status":"pass","duration_ms":16,"timestamp":"2026-09-29T18:19:46.430995543+00:00","scenario":"S17"}
+{"id":"ST-S17-11","status":"pass","duration_ms":26,"timestamp":"2026-09-29T18:19:46.458198654+00:00","scenario":"S17"}
+{"id":"ST-S17-12","status":"pass","duration_ms":26,"timestamp":"2026-09-29T18:19:46.485366985+00:00","scenario":"S17"}
+{"id":"ST-S17-13","status":"skip","duration_ms":0,"timestamp":"2026-09-29T18:19:46.485651434+00:00","scenario":"S17","error":"需要隔离的 systemd --user 部署环境，由 smoke runner 覆盖"}
+{"id":"ST-S17-14","status":"pass","duration_ms":16,"timestamp":"2026-09-29T18:19:46.502657456+00:00","scenario":"S17"}
+{"id":"UT-S17-01","status":"pass","duration_ms":17,"timestamp":"2026-09-29T18:19:46.519971266+00:00","scenario":"S17"}
+{"id":"UT-S17-02","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.521512257+00:00","scenario":"S17"}
+{"id":"UT-S17-03","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.523009269+00:00","scenario":"S17"}
+{"id":"UT-S17-04","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.524411545+00:00","scenario":"S17"}
+{"id":"UT-S17-05","status":"pass","duration_ms":26,"timestamp":"2026-09-29T18:19:46.551141636+00:00","scenario":"S17"}
+{"id":"UT-S17-06","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.552646454+00:00","scenario":"S17"}
+{"id":"UT-S17-07","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.554144133+00:00","scenario":"S17"}
+{"id":"UT-S17-08","status":"pass","duration_ms":16,"timestamp":"2026-09-29T18:19:46.571237074+00:00","scenario":"S17"}
+{"id":"UT-S17-09","status":"pass","duration_ms":54,"timestamp":"2026-09-29T18:19:46.625888642+00:00","scenario":"S17"}
+{"id":"UT-S17-10","status":"pass","duration_ms":0,"timestamp":"2026-09-29T18:19:46.626225422+00:00","scenario":"S17"}
+{"id":"UT-S17-11","status":"pass","duration_ms":0,"timestamp":"2026-09-29T18:19:46.626524624+00:00","scenario":"S17"}
+{"id":"UT-S17-12","status":"pass","duration_ms":21,"timestamp":"2026-09-29T18:19:46.648334822+00:00","scenario":"S17"}
+{"id":"UT-S17-13","status":"pass","duration_ms":55,"timestamp":"2026-09-29T18:19:46.703862295+00:00","scenario":"S17"}
+{"id":"UT-S17-14","status":"pass","duration_ms":11,"timestamp":"2026-09-29T18:19:46.715708894+00:00","scenario":"S17"}
+{"id":"UT-S17-15","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.717612639+00:00","scenario":"S17"}
+{"id":"UT-S17-16","status":"pass","duration_ms":1,"timestamp":"2026-09-29T18:19:46.719151641+00:00","scenario":"S17"}
+{"id":"UT-S17-17","status":"pass","duration_ms":46,"timestamp":"2026-09-29T18:19:46.766355060+00:00","scenario":"S17"}
+{"id":"UT-S17-18","status":"pass","duration_ms":0,"timestamp":"2026-09-29T18:19:46.767018097+00:00","scenario":"S17"}
+{"id":"UT-S17-19","status":"pass","duration_ms":6,"timestamp":"2026-09-29T18:19:46.773528091+00:00","scenario":"S17"}
+{"id":"UT-S17-20","status":"pass","duration_ms":0,"timestamp":"2026-09-29T18:19:46.773896793+00:00","scenario":"S17"}
 {"id":"TRIM-S1-cargo-build-workspace","status":"pass","duration_ms":121000,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：cargo build --workspace 通过（FFI 三 crate 移除后 35 member 全量编译，2m01s）"}
 {"id":"TRIM-S1-agent-lib","status":"pass","duration_ms":44520,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：octos-agent lib 2884 passed / 0 failed / 3 ignored（skip execute_timeout_returns_error：WSL2 procps kill 裸形式 kill(0) 进程组误杀，预存环境问题见 NOTES）"}
 {"id":"TRIM-S1-agent-integration","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：octos-agent 集成+doc 测试 50 组全 ok"}
 {"id":"TRIM-S1-per-crate-suite","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：其余 33 个 crate cargo test -p 全部通过（bus/pipeline 二轮带 skip 后 PASS；24 skill/platform crate 全绿）"}
 {"id":"TRIM-S1-cli-lib","status":"pass","duration_ms":174000,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：octos-cli lib 3927 passed / 7 failed（root 环境伪失败：0o555/0o000 权限注入被 CAP_DAC_OVERRIDE 击穿 ×6 + HOME=/root 触发 workspace 守卫 ×1，trim 未触及这些文件，预存）"}
 {"id":"TRIM-S1-cli-integration","status":"pass","duration_ms":0,"timestamp":"2026-09-29T17:21:30.835096081Z","scenario":"trim-unused-features 切片1：octos-cli 集成+doc 测试 24 组 ok（151 tests），--no-fail-fast 覆盖"}
+{"id": "TRIM-S2-workspace-build", "status": "pass", "duration_ms": 90000, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "cargo build --workspace --jobs 4: 0 error 0 warning（1m30s）"}
+{"id": "TRIM-S2-bus-regression", "status": "pass", "duration_ms": 5000, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "cargo test -p octos-bus: 263+13+15+2 = 293 passed, 0 failed"}
+{"id": "TRIM-S2-agent-lib-regression", "status": "pass", "duration_ms": 44180, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "cargo test -p octos-agent --lib: 2884 passed, 3 ignored"}
+{"id": "TRIM-S2-cli-lib-regression", "status": "pass", "duration_ms": 173880, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "cargo test -p octos-cli --lib: 3919 passed, 7 failed 全部定性为环境(5: root 0o555/0o444 注入×4 + HOME=/root workspace_root_escape×1)或预存(2: #12 dispatch -32601 vs #2265 断言 -32004; db396b8f cron reconcile 退化) —— 详见 NOTES.md 切片 2 验证记录; trim 引入的 test_config_from_profile 断言漏改已修复转绿"}
+{"id": "TRIM-S2-cli-integration-regression", "status": "pass", "duration_ms": 460000, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "octos-cli 集成测试 23/23 文件全绿（acp/build/cli_tests/mcp_serve/olp_obs/preview/serve_sigterm/swarm_api/ws_* 等）"}
+{"id": "TRIM-S2-canonical-feature-check", "status": "pass", "duration_ms": 80000, "timestamp": "2026-09-29T18:31:09.912953+00:00", "scenario": "TRIM", "note": "cargo check -p octos-cli --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3\": PASS（默认含 embed-llama）"}

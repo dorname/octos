@@ -88,7 +88,7 @@ impl Tool for MessageTool {
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Target channel (e.g. 'telegram', 'slack'). Defaults to current."
+                    "description": "Target channel (e.g. 'telegram', 'discord'). Defaults to current."
                 },
                 "chat_id": {
                     "type": "string",

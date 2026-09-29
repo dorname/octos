@@ -16,28 +16,16 @@ use crate::config::ChannelEntry;
 #[cfg(feature = "api")]
 mod api;
 mod cli;
-#[cfg(feature = "dingtalk")]
-mod dingtalk;
 #[cfg(feature = "discord")]
 mod discord;
-#[cfg(feature = "email")]
-mod email;
 #[cfg(feature = "feishu")]
 mod feishu;
-#[cfg(feature = "line")]
-mod line;
 #[cfg(feature = "matrix")]
 mod matrix;
-#[cfg(feature = "qq-bot")]
-mod qq_bot;
-#[cfg(feature = "slack")]
-mod slack;
 #[cfg(feature = "telegram")]
 mod telegram;
 #[cfg(feature = "twilio")]
 mod twilio;
-#[cfg(feature = "wechat")]
-mod wechat;
 #[cfg(feature = "wecom")]
 mod wecom;
 #[cfg(feature = "wecom-bot")]
@@ -50,18 +38,12 @@ mod whatsapp;
 #[cfg(any(
     feature = "telegram",
     feature = "discord",
-    feature = "dingtalk",
-    feature = "slack",
     feature = "whatsapp",
-    feature = "email",
     feature = "feishu",
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
-    feature = "line",
     feature = "matrix",
-    feature = "qq-bot",
-    feature = "wechat"
 ))]
 pub(crate) use super::prompt::settings_str;
 
@@ -96,7 +78,6 @@ pub struct ChannelRegistrationCtx<'a> {
     pub task_relaunch: Option<TaskRelaunchCb>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
-    pub wechat_bridge_url: Option<&'a str>,
     /// Callback to stop the session actor when a session is deleted via API.
     pub on_session_deleted: Option<SessionDeletedCallback>,
     #[cfg(feature = "matrix")]
@@ -122,14 +103,8 @@ pub fn register_all(
             "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "discord")]
             "discord" => discord::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
-            #[cfg(feature = "dingtalk")]
-            "dingtalk" => dingtalk::register(channel_mgr, entry, ctx.shutdown)?,
-            #[cfg(feature = "slack")]
-            "slack" => slack::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "whatsapp")]
             "whatsapp" => whatsapp::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
-            #[cfg(feature = "email")]
-            "email" => email::register(channel_mgr, entry, ctx.shutdown)?,
             #[cfg(feature = "feishu")]
             "feishu" | "lark" => feishu::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "twilio")]
@@ -152,8 +127,6 @@ pub fn register_all(
             )?,
             #[cfg(feature = "wecom-bot")]
             "wecom-bot" => wecom_bot::register(channel_mgr, entry, ctx.shutdown)?,
-            #[cfg(feature = "line")]
-            "line" => line::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "matrix")]
             "matrix" => matrix::register(
                 channel_mgr,
@@ -163,10 +136,6 @@ pub fn register_all(
                 ctx.shutdown,
                 ctx.data_dir,
             )?,
-            #[cfg(feature = "qq-bot")]
-            "qq-bot" => qq_bot::register(channel_mgr, entry, ctx.shutdown)?,
-            #[cfg(feature = "wechat")]
-            "wechat" => wechat::register(channel_mgr, entry, ctx.shutdown, ctx.wechat_bridge_url)?,
             other => {
                 tracing::warn!(channel = other, "channel not supported, skipping");
             }

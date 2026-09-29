@@ -41,8 +41,6 @@ pub(crate) fn profile_first_channel_type(state_home: &Path, profile_id: &str) ->
         match first {
             crate::profiles::ChannelCredentials::Telegram { .. } => "telegram",
             crate::profiles::ChannelCredentials::Discord { .. } => "discord",
-            crate::profiles::ChannelCredentials::DingTalk { .. } => "dingtalk",
-            crate::profiles::ChannelCredentials::Slack { .. } => "slack",
             crate::profiles::ChannelCredentials::WhatsApp { .. } => "whatsapp",
             crate::profiles::ChannelCredentials::Feishu { .. } => "feishu",
             other => {

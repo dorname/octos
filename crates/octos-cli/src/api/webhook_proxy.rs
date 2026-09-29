@@ -5,8 +5,6 @@
 //!
 //! ```text
 //! POST /webhook/feishu/{profile_id}  →  127.0.0.1:{port}/webhook/event
-//! POST /webhook/line/{profile_id}    →  127.0.0.1:{port}/line/webhook
-//! POST /webhook/dingtalk/{profile_id} → 127.0.0.1:{port}/dingtalk/webhook
 //! POST /webhook/twilio/{profile_id}  →  127.0.0.1:{port}/twilio/webhook
 //! ```
 
@@ -50,36 +48,6 @@ pub async fn feishu_webhook_proxy(
     }
 
     proxy_to_gateway_with_bytes(state, profile_id, "/webhook/event", headers, body_bytes).await
-}
-
-/// Proxy LINE webhook events to the gateway's local webhook server.
-pub async fn line_webhook_proxy(
-    State(state): State<Arc<AppState>>,
-    Path(profile_id): Path<String>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    tracing::info!(profile = %profile_id, "webhook proxy: LINE event received");
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "request body too large"),
-    };
-    proxy_to_gateway_with_bytes(state, profile_id, "/line/webhook", headers, body_bytes).await
-}
-
-/// Proxy DingTalk outgoing-robot webhook events to the gateway's local webhook server.
-pub async fn dingtalk_webhook_proxy(
-    State(state): State<Arc<AppState>>,
-    Path(profile_id): Path<String>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    tracing::info!(profile = %profile_id, "webhook proxy: DingTalk event received");
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "request body too large"),
-    };
-    proxy_to_gateway_with_bytes(state, profile_id, "/dingtalk/webhook", headers, body_bytes).await
 }
 
 /// Proxy Twilio webhook events to the gateway's local webhook server.

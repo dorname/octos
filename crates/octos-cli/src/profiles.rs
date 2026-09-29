@@ -1274,22 +1274,6 @@ pub enum ChannelCredentials {
         #[serde(default = "default_discord_env")]
         token_env: String,
     },
-    DingTalk {
-        #[serde(default = "default_dingtalk_webhook_env")]
-        webhook_url_env: String,
-        #[serde(default = "default_dingtalk_secret_env")]
-        secret_env: String,
-        #[serde(default)]
-        allowed_senders: String,
-        #[serde(default)]
-        webhook_port: Option<u16>,
-    },
-    Slack {
-        #[serde(default = "default_slack_bot_env")]
-        bot_token_env: String,
-        #[serde(default = "default_slack_app_env")]
-        app_token_env: String,
-    },
     #[serde(rename = "whatsapp")]
     WhatsApp {
         #[serde(default = "default_whatsapp_url")]
@@ -1310,20 +1294,6 @@ pub enum ChannelCredentials {
         verification_token_env: String,
         #[serde(default)]
         encrypt_key_env: String,
-    },
-    Email {
-        #[serde(default)]
-        imap_host: String,
-        #[serde(default = "default_imap_port")]
-        imap_port: u16,
-        #[serde(default)]
-        smtp_host: String,
-        #[serde(default = "default_smtp_port")]
-        smtp_port: u16,
-        #[serde(default = "default_email_user_env")]
-        username_env: String,
-        #[serde(default = "default_email_pass_env")]
-        password_env: String,
     },
     Twilio {
         #[serde(default = "default_twilio_sid_env")]
@@ -1404,34 +1374,6 @@ pub enum ChannelCredentials {
         #[serde(default = "crate::config::default_true")]
         require_mention: bool,
     },
-    #[serde(rename = "qq-bot")]
-    QQBot {
-        #[serde(default)]
-        app_id: String,
-        #[serde(default = "default_qq_bot_secret_env")]
-        client_secret_env: String,
-    },
-    #[serde(rename = "wechat")]
-    WeChat {
-        #[serde(default = "default_wechat_token_env")]
-        token_env: String,
-        #[serde(default = "default_wechat_base_url")]
-        base_url: String,
-    },
-    Line {
-        #[serde(default = "default_line_secret_env")]
-        channel_secret_env: String,
-        #[serde(default = "default_line_token_env")]
-        channel_access_token_env: String,
-        #[serde(default)]
-        allowed_senders: String,
-        #[serde(default)]
-        webhook_port: Option<u16>,
-        #[serde(default)]
-        require_mention: bool,
-        #[serde(default)]
-        bot_user_id: String,
-    },
 }
 
 fn default_telegram_env() -> String {
@@ -1439,18 +1381,6 @@ fn default_telegram_env() -> String {
 }
 fn default_discord_env() -> String {
     "DISCORD_BOT_TOKEN".into()
-}
-fn default_dingtalk_webhook_env() -> String {
-    "DINGTALK_BOT_WEBHOOK".into()
-}
-fn default_dingtalk_secret_env() -> String {
-    "DINGTALK_BOT_SECRET".into()
-}
-fn default_slack_bot_env() -> String {
-    "SLACK_BOT_TOKEN".into()
-}
-fn default_slack_app_env() -> String {
-    "SLACK_APP_TOKEN".into()
 }
 fn default_whatsapp_url() -> String {
     "ws://localhost:3001".into()
@@ -1460,18 +1390,6 @@ fn default_feishu_id_env() -> String {
 }
 fn default_feishu_secret_env() -> String {
     "FEISHU_APP_SECRET".into()
-}
-fn default_imap_port() -> u16 {
-    993
-}
-fn default_smtp_port() -> u16 {
-    465
-}
-fn default_email_user_env() -> String {
-    "EMAIL_USERNAME".into()
-}
-fn default_email_pass_env() -> String {
-    "EMAIL_PASSWORD".into()
 }
 fn default_twilio_sid_env() -> String {
     "TWILIO_ACCOUNT_SID".into()
@@ -1502,21 +1420,6 @@ fn default_matrix_auto_join() -> String {
 }
 fn default_matrix_group_policy() -> String {
     "allowlist".into()
-}
-fn default_qq_bot_secret_env() -> String {
-    "QQ_BOT_CLIENT_SECRET".into()
-}
-fn default_wechat_token_env() -> String {
-    "WECHAT_BOT_TOKEN".into()
-}
-fn default_wechat_base_url() -> String {
-    "https://ilinkai.weixin.qq.com".into()
-}
-fn default_line_secret_env() -> String {
-    "LINE_CHANNEL_SECRET".into()
-}
-fn default_line_token_env() -> String {
-    "LINE_CHANNEL_ACCESS_TOKEN".into()
 }
 
 /// Gateway-specific settings.
@@ -2946,13 +2849,8 @@ pub(crate) fn config_from_profile(
                     entry["settings"]["bridge_url"] = serde_json::json!(url);
                 }
             }
-            // Override webhook_port if auto-assigned (Feishu webhook / LINE)
-            if matches!(
-                ch,
-                ChannelCredentials::Feishu { .. }
-                    | ChannelCredentials::Line { .. }
-                    | ChannelCredentials::DingTalk { .. }
-            ) {
+            // Override webhook_port if auto-assigned (Feishu webhook)
+            if matches!(ch, ChannelCredentials::Feishu { .. }) {
                 if let Some(port) = feishu_port_override {
                     entry["settings"]["webhook_port"] = serde_json::json!(port);
                 }
@@ -3135,37 +3033,6 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             "type": "discord",
             "settings": { "token_env": token_env }
         }),
-        ChannelCredentials::DingTalk {
-            webhook_url_env,
-            secret_env,
-            allowed_senders,
-            webhook_port,
-        } => {
-            let senders: Vec<&str> = allowed_senders
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut settings = serde_json::json!({
-                "webhook_url_env": webhook_url_env,
-                "secret_env": secret_env,
-            });
-            if let Some(port) = webhook_port {
-                settings["webhook_port"] = serde_json::json!(port);
-            }
-            serde_json::json!({
-                "type": "dingtalk",
-                "allowed_senders": senders,
-                "settings": settings,
-            })
-        }
-        ChannelCredentials::Slack {
-            bot_token_env,
-            app_token_env,
-        } => serde_json::json!({
-            "type": "slack",
-            "settings": { "bot_token_env": bot_token_env, "app_token_env": app_token_env }
-        }),
         ChannelCredentials::WhatsApp { bridge_url } => serde_json::json!({
             "type": "whatsapp",
             "settings": { "bridge_url": bridge_url }
@@ -3203,24 +3070,6 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "settings": settings
             })
         }
-        ChannelCredentials::Email {
-            imap_host,
-            imap_port,
-            smtp_host,
-            smtp_port,
-            username_env,
-            password_env,
-        } => serde_json::json!({
-            "type": "email",
-            "settings": {
-                "imap_host": imap_host,
-                "imap_port": imap_port,
-                "smtp_host": smtp_host,
-                "smtp_port": smtp_port,
-                "username_env": username_env,
-                "password_env": password_env,
-            }
-        }),
         ChannelCredentials::Twilio {
             account_sid_env,
             auth_token_env,
@@ -3312,56 +3161,6 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             serde_json::json!({
                 "type": "matrix",
                 "allowed_senders": allowed_senders,
-                "settings": settings,
-            })
-        }
-        ChannelCredentials::QQBot {
-            app_id,
-            client_secret_env,
-        } => serde_json::json!({
-            "type": "qq-bot",
-            "settings": {
-                "app_id": app_id,
-                "client_secret_env": client_secret_env,
-            }
-        }),
-        ChannelCredentials::WeChat {
-            token_env,
-            base_url,
-        } => serde_json::json!({
-            "type": "wechat",
-            "settings": {
-                "token_env": token_env,
-                "base_url": base_url,
-            }
-        }),
-        ChannelCredentials::Line {
-            channel_secret_env,
-            channel_access_token_env,
-            allowed_senders,
-            webhook_port,
-            require_mention,
-            bot_user_id,
-        } => {
-            let senders: Vec<&str> = allowed_senders
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut settings = serde_json::json!({
-                "channel_secret_env": channel_secret_env,
-                "channel_access_token_env": channel_access_token_env,
-                "require_mention": require_mention,
-            });
-            if let Some(port) = webhook_port {
-                settings["webhook_port"] = serde_json::json!(port);
-            }
-            if !bot_user_id.is_empty() {
-                settings["bot_user_id"] = serde_json::json!(bot_user_id);
-            }
-            serde_json::json!({
-                "type": "line",
-                "allowed_senders": senders,
                 "settings": settings,
             })
         }
@@ -3497,41 +3296,9 @@ pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     None
 }
 
-/// Check if a profile has a LINE channel and return its webhook port configuration.
-///
-/// Returns:
-/// - `Some(Some(port))` — LINE channel exists with explicit webhook port
-/// - `Some(None)` — LINE channel exists but needs an auto-assigned port
-/// - `None` — no LINE channel
-pub fn line_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
-    for ch in &profile.config.channels {
-        if let ChannelCredentials::Line { webhook_port, .. } = ch {
-            return Some(*webhook_port);
-        }
-    }
-    None
-}
-
-/// Check if a profile has a DingTalk channel and return its webhook port configuration.
-///
-/// Returns:
-/// - `Some(Some(port))` — DingTalk channel exists with explicit webhook port
-/// - `Some(None)` — DingTalk channel exists but needs an auto-assigned port
-/// - `None` — no DingTalk channel
-pub fn dingtalk_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
-    for ch in &profile.config.channels {
-        if let ChannelCredentials::DingTalk { webhook_port, .. } = ch {
-            return Some(*webhook_port);
-        }
-    }
-    None
-}
-
 /// Webhook port needed by any profile channel that listens for HTTP webhooks.
 pub fn profile_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     feishu_webhook_port(profile)
-        .or_else(|| line_webhook_port(profile))
-        .or_else(|| dingtalk_webhook_port(profile))
 }
 
 /// Get the API channel port from a profile, if one is configured.
@@ -4160,16 +3927,10 @@ mod tests {
                     llm_selection("openai", "gpt-4o", None, None),
                     vec![],
                 )),
-                channels: vec![
-                    ChannelCredentials::Telegram {
-                        token_env: "TG".into(),
-                        allowed_senders: String::new(),
-                    },
-                    ChannelCredentials::Slack {
-                        bot_token_env: "SB".into(),
-                        app_token_env: "SA".into(),
-                    },
-                ],
+                channels: vec![ChannelCredentials::Telegram {
+                    token_env: "TG".into(),
+                    allowed_senders: String::new(),
+                }],
                 gateway: GatewaySettings {
                     max_history: Some(100),
                     system_prompt: Some("Hello".into()),
@@ -4187,7 +3948,7 @@ mod tests {
         let gw = config.gateway.unwrap();
         assert_eq!(gw.max_history, 100);
         assert_eq!(gw.system_prompt.as_deref(), Some("Hello"));
-        assert_eq!(gw.channels.len(), 2);
+        assert_eq!(gw.channels.len(), 1);
     }
 
     #[test]
@@ -6031,16 +5792,6 @@ mod tests {
             ChannelCredentials::Discord {
                 token_env: "DC".into(),
             },
-            ChannelCredentials::DingTalk {
-                webhook_url_env: "DT_WEBHOOK".into(),
-                secret_env: "DT_SECRET".into(),
-                allowed_senders: "staff-1,staff-2".into(),
-                webhook_port: Some(8650),
-            },
-            ChannelCredentials::Slack {
-                bot_token_env: "SB".into(),
-                app_token_env: "SA".into(),
-            },
             ChannelCredentials::WhatsApp {
                 bridge_url: "ws://localhost:3001".into(),
             },
@@ -6053,19 +5804,11 @@ mod tests {
                 verification_token_env: String::new(),
                 encrypt_key_env: String::new(),
             },
-            ChannelCredentials::Email {
-                imap_host: "imap.test.com".into(),
-                imap_port: 993,
-                smtp_host: "smtp.test.com".into(),
-                smtp_port: 465,
-                username_env: "EU".into(),
-                password_env: "EP".into(),
-            },
         ];
 
         let json = serde_json::to_string(&channels).unwrap();
         let parsed: Vec<ChannelCredentials> = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed.len(), 4);
     }
 
     #[test]

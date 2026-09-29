@@ -69,17 +69,11 @@ api = [
 matrix = ["octos-bus/matrix"]
 telegram = ["octos-bus/telegram"]
 discord = ["octos-bus/discord"]
-dingtalk = ["octos-bus/dingtalk"]
-slack = ["octos-bus/slack"]
 whatsapp = ["octos-bus/whatsapp"]
-email = ["octos-bus/email"]
 feishu = ["octos-bus/feishu"]
 twilio = ["octos-bus/twilio"]
 wecom = ["octos-bus/wecom"]
-line = ["octos-bus/line"]
 wecom-bot = ["octos-bus/wecom-bot"]
-qq-bot = ["octos-bus/qq-bot"]
-wechat = ["octos-bus/wechat"]
 
 [lints]
 workspace = true

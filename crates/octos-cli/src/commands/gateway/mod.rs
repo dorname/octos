@@ -63,9 +63,6 @@ pub struct GatewayCommand {
     #[arg(long, hide = true)]
     pub bridge_url: Option<String>,
 
-    /// Internal: managed WeChat bridge WebSocket URL.
-    #[arg(long, hide = true)]
-    pub wechat_bridge_url: Option<String>,
 
     /// Override Feishu webhook port (used by managed gateways).
     #[arg(long, hide = true)]

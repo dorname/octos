@@ -2326,16 +2326,12 @@ impl Config {
                 "cli",
                 "telegram",
                 "discord",
-                "dingtalk",
-                "slack",
                 "whatsapp",
-                "email",
                 "feishu",
                 "twilio",
                 "wecom",
                 "wecom-bot",
-                "qq-bot",
-                "wechat",
+                "matrix",
             ];
             for ch in &gw.channels {
                 if !VALID_CHANNELS.contains(&ch.channel_type.as_str()) {

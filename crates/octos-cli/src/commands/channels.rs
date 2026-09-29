@@ -115,18 +115,12 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "telegram" => true,
         #[cfg(feature = "discord")]
         "discord" => true,
-        #[cfg(feature = "dingtalk")]
-        "dingtalk" => true,
-        #[cfg(feature = "slack")]
-        "slack" => true,
         #[cfg(feature = "whatsapp")]
         "whatsapp" => true,
         #[cfg(feature = "feishu")]
         "feishu" | "lark" => true,
         #[cfg(feature = "wecom-bot")]
         "wecom-bot" => true,
-        #[cfg(feature = "qq-bot")]
-        "qq-bot" => true,
         #[cfg(feature = "matrix")]
         "matrix" => true,
         _ => false,
@@ -199,41 +193,6 @@ fn channel_config_summary(channel_type: &str, settings: &serde_json::Value) -> S
                 format!("{env}: set")
             } else {
                 format!("{env}: not set")
-            }
-        }
-        "dingtalk" => {
-            let webhook_env = settings
-                .get("webhook_url_env")
-                .and_then(|v| v.as_str())
-                .unwrap_or("DINGTALK_BOT_WEBHOOK");
-            let secret_env = settings
-                .get("secret_env")
-                .and_then(|v| v.as_str())
-                .unwrap_or("DINGTALK_BOT_SECRET");
-            let webhook_set = std::env::var(webhook_env).is_ok();
-            let secret_set = std::env::var(secret_env).is_ok();
-            match (webhook_set, secret_set) {
-                (true, true) => "webhook + signing secret: set".into(),
-                (true, false) => format!("{webhook_env}: set, {secret_env}: not set"),
-                (false, true) => format!("{webhook_env}: not set, {secret_env}: set"),
-                (false, false) => format!("{webhook_env}/{secret_env}: not set"),
-            }
-        }
-        "slack" => {
-            let bot_env = settings
-                .get("bot_token_env")
-                .and_then(|v| v.as_str())
-                .unwrap_or("SLACK_BOT_TOKEN");
-            let app_env = settings
-                .get("app_token_env")
-                .and_then(|v| v.as_str())
-                .unwrap_or("SLACK_APP_TOKEN");
-            let bot_set = std::env::var(bot_env).is_ok();
-            let app_set = std::env::var(app_env).is_ok();
-            if bot_set && app_set {
-                "socket mode: configured".into()
-            } else {
-                format!("{bot_env}/{app_env}: not set")
             }
         }
         "whatsapp" => {

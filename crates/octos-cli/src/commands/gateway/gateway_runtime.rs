@@ -1630,7 +1630,6 @@ impl GatewayRuntime {
                 metrics_handle,
                 gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
-                wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
                 shutdown_notify: &shutdown_notify,
                 on_session_deleted: Some(Arc::new(move |id: &str| {
                     let _ = delete_tx.send(id.to_string());

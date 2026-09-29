@@ -11,18 +11,12 @@ default = []
 api = ["axum"]
 telegram = ["teloxide"]
 discord = ["serenity"]
-dingtalk = ["axum"]
-slack = ["tokio-tungstenite"]
 whatsapp = ["tokio-tungstenite"]
 feishu = ["tokio-tungstenite", "axum", "rustls", "rustls-native-certs"]
-line = ["axum"]
 twilio = ["axum"]
 wecom = ["axum"]
 matrix = ["axum"]
 wecom-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
-qq-bot = ["tokio-tungstenite", "rustls", "rustls-native-certs"]
-wechat = ["tokio-tungstenite"]
-email = ["async-imap", "tokio-rustls", "rustls", "webpki-roots", "lettre", "mailparse"]
 
 [dependencies]
 octos-core = { workspace = true }
@@ -54,14 +48,9 @@ serenity = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
-# Optional: email / wecom-bot TLS
-async-imap = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
+# Optional: channel TLS (feishu / wecom-bot)
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
-lettre = { workspace = true, optional = true }
-mailparse = { workspace = true, optional = true }
 
 [lints]
 workspace = true
