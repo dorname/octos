@@ -170,7 +170,7 @@ pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
 /// `api_key_env` is missing or typo'd would silently grade with the
 /// PRIMARY's login credential — defeating the verifier's independence with
 /// no signal. The lane build therefore sets `bypass_auth_store` (the same
-/// explicit-key-must-win escape hatch octos-ffi uses): the lane's key
+/// explicit-key-must-win escape hatch): the lane's key
 /// resolves ONLY from its declared `api_key_env` (profile `env_vars` /
 /// keychain, then process env — never the auth store). An unset/empty var
 /// fails the build → the warn below + `None` → visible fail-open to the

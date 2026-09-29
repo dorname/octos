@@ -75,18 +75,14 @@ The Rust workspace lets you compose the parts your application needs:
 | [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | Workflow graphs, parallel workers, validation, and result aggregation |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
 
-From a checkout, build the native agent library or a library for a non-Rust host:
+From a checkout, build the native agent library:
 
 ```bash
 cargo build --release -p octos-agent
-cargo build --release -p octos-ffi
 ```
 
 Pin related Octos crates to the same Git revision when integrating them into
-another workspace. For other host languages, use the
-[C ABI](crates/octos-ffi/README.md), [native Python binding](crates/octos-pyo3/README.md),
-or [Swift/Kotlin bindings](crates/octos-uniffi/README.md). The C ABI produces
-shared and static libraries. These bindings expose task execution; OUP provides
+another workspace. The crates expose task execution; OUP provides
 the session, turn, supervision, and replay interface described below.
 
 ### Platforms and architectures

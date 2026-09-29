@@ -15,7 +15,7 @@ Canonical milestone CI suites:
   dashboard               dashboard install/typecheck/build + embedded asset freshness
   swarm-app               swarm-app install/typecheck/build/test + embedded asset freshness
   hosted-fast             fmt + clippy + workspace test + milestone regressions
-  oup-runtime             real chat/ACP/OUP subprocesses + C/Python ABI contracts
+  oup-runtime             real chat/ACP/OUP subprocesses
   oup-minimal             minimal-feature CLI tests and strict lint
   workspace-all-features  workspace/all-features build + test compilation + tests
   release-bundle          release binary + skill crate build
@@ -101,10 +101,9 @@ run_workspace_all_features() {
 }
 
 run_oup_runtime() {
-  cargo build --locked -p octos-cli -p octos-ffi -p octos-uniffi
+  cargo build --locked -p octos-cli
   local build_dir="${CARGO_TARGET_DIR:-target}/debug"
   OCTOS_BIN="$build_dir/octos" python3 scripts/tests/test-oup-runtime.py
-  python3 scripts/check-oup-bindings.py --library-dir "$build_dir"
 }
 
 run_oup_minimal() {

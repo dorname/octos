@@ -69,8 +69,8 @@ wasm-bindgen-test = "0.3"
 
 # Inherits the workspace `deny(unsafe_code)`. The `#[wasm_bindgen]` macro
 # expands to `unsafe` glue (exported shims + pointer marshalling across the JS
-# boundary), so the crate root opts out with `#![allow(unsafe_code)]` — the
-# same rationale as `octos-ffi`. This crate writes NO hand-unsafe code of its
+# boundary), so the crate root opts out with `#![allow(unsafe_code)]`.
+# This crate writes NO hand-unsafe code of its
 # own; see the SAFETY note at the top of src/lib.rs.
 [lints]
 workspace = true

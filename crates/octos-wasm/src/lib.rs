@@ -7,8 +7,7 @@
 //! threads, native TLS, and the llama.cpp embedder cannot target
 //! `wasm32-unknown-unknown`. Run the agent via `octos serve` (native) and talk
 //! to it over the network; this crate is the thin protocol/codec layer on the
-//! client side. For native embedding use `octos-ffi` (C-ABI),
-//! `octos-uniffi` (Python/Swift/Kotlin), or `octos-pyo3` (Python wheel).
+//! client side.
 //!
 //! # Design
 //!
@@ -32,8 +31,7 @@
 //! The crate opts out of the workspace-wide `deny(unsafe_code)` with a
 //! crate-level `#![allow(unsafe_code)]` because the `#[wasm_bindgen]` macro
 //! expands to `unsafe` glue (exported shims, describe functions, and pointer
-//! marshalling across the JS boundary). This is the same rationale `octos-ffi`
-//! uses for its C-ABI boundary. The crate itself writes **no** hand-unsafe
+//! marshalling across the JS boundary). The crate itself writes **no** hand-unsafe
 //! code — all `unsafe` is macro-generated and upheld by wasm-bindgen.
 #![allow(unsafe_code)]
 

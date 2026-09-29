@@ -65,18 +65,14 @@ Rust workspace 可以按应用需要组合：
 | [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | 工作流图、并行执行、验证与结果汇总 |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | 会话基础设施、运行时组装、OUP 托管与适配层 |
 
-在源码仓库中，构建原生 Agent 库或供其他语言调用的库：
+在源码仓库中，构建原生 Agent 库：
 
 ```bash
 cargo build --release -p octos-agent
-cargo build --release -p octos-ffi
 ```
 
 集成到其他 workspace 时，将相关 Octos crates 固定在同一个 Git revision。
-其他宿主语言可以使用 [C ABI](crates/octos-ffi/README.md)、
-[原生 Python 绑定](crates/octos-pyo3/README.md)或
-[Swift/Kotlin 绑定](crates/octos-uniffi/README.md)。C ABI 同时提供动态库和静态库。
-这些绑定提供任务执行接口；下文的 OUP 提供会话、轮次、监督与回放接口。
+这些 crate 提供任务执行接口；下文的 OUP 提供会话、轮次、监督与回放接口。
 
 ### 操作系统与处理器架构
 

@@ -77,8 +77,8 @@ pub struct Config {
     pub env_vars: std::collections::HashMap<String, String>,
 
     /// When true, [`Config::get_api_key`] skips the global `AuthStore` lookup so
-    /// an explicitly-supplied key (e.g. the `env_vars`-injected key the
-    /// `octos-ffi` embedding API passes) is authoritative and cannot be silently
+    /// an explicitly-supplied key (e.g. one injected via `env_vars` by an
+    /// embedding caller) is authoritative and cannot be silently
     /// shadowed by a host's `octos auth login` credentials for the same
     /// provider. Internal, not (de)serialized; default `false` preserves the
     /// CLI / gateway resolution order.
@@ -2135,7 +2135,7 @@ impl Config {
         // shared `octos auth login` credentials. We resolve the context with no
         // cli_data_dir because auth_home never depends on it.
         //
-        // `bypass_auth_store` opts out (used by octos-ffi): a caller that passed
+        // `bypass_auth_store` opts out: a caller that passed
         // an explicit key must have it win over any ambient login credential.
         if !self.bypass_auth_store {
             let auth_home = crate::config_context::resolve_config_context(None).auth_home;

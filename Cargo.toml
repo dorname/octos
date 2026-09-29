@@ -35,10 +35,7 @@ members = [
     "crates/octos-fleet",
     "crates/octos-fleet-worker",
     "crates/octos-embed-llama",
-    "crates/octos-ffi",
-    "crates/octos-uniffi",
     "crates/octos-wasm",
-    "crates/octos-pyo3",
 ]
 [workspace.package]
 version = "2.0.3-rc.11"

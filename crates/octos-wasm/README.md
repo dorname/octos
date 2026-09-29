@@ -5,8 +5,7 @@ Browser/JS client-side binding of octos's protocol + utility types
 model messages/tasks/IDs in a web frontend. The AGENT LOOP does NOT run
 in-browser — `redb` (filesystem), `tokio` threads, native TLS, and llama.cpp
 cannot target `wasm32-unknown-unknown`; run the agent via `octos serve`
-(native) and talk to it over the network. For native embedding use `octos-ffi`
-(C-ABI), `octos-uniffi` (Python/Swift/Kotlin), or `octos-pyo3` (Python wheel).
+(native) and talk to it over the network.
 
 ## Why only `octos-core`?
 
