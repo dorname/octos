@@ -1,0 +1,10 @@
+{
+  "name": "octos-docs-mermaid-check",
+  "private": true,
+  "type": "module",
+  "description": "logos 文档 mermaid 块语法校验的依赖声明（check-mermaid.mjs 专用）",
+  "dependencies": {
+    "mermaid": "^11.0.0",
+    "jsdom": "^24.0.0"
+  }
+}

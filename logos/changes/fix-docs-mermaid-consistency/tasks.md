@@ -9,4 +9,10 @@
 
 ## [code] 代码实现
 
-（本段在 plan 段留空：本提案包含少量非规格文件工作——新增 `scripts/check-mermaid.mjs` 文档 mermaid 语法校验脚本（防回归）、CLAUDE.md 顶部架构数字对齐——`[code]` 切片由 merge 后的 `slice-planner` 基于已合并规格统一规划。此处仅保留 `## [code]` 标题，勿提前填写切片项。）
+切片评分（slice-planner 六维）：影响范围 1（2 文件：scripts/check-mermaid.mjs + CLAUDE.md）+ 行为复杂度 0（单一路径扫描脚本 + 文档数字对齐）+ 契约 0 + 测试 0（无 UT/ST，纯文档修正变更）+ 风险 0（易回滚）+ 不确定性 0 = **1 分 → 单切片**。删后续自检：无后续切片可删。测试 ID：无 UT/ST（proposal「复用测试 ID」节已声明；脚本为文档校验工具，非业务代码）。
+
+### 切片 S1：mermaid 校验脚本 + CLAUDE.md 数字对齐（唯一切片，闭环）
+
+- [x] S1.1 `scripts/check-mermaid.mjs`（新增）— 扫描 logos/ 下所有 .md 的 mermaid 块，用 mermaid.parse 逐块校验语法（jsdom 环境），输出 文件:行号 + 失败原因；缺依赖时给出安装提示；退出码非零表示存在语法失败块
+- [x] S1.2 CLAUDE.md 顶部架构描述数字对齐 —「14 channels」→ 15 个 IM 通道（17 个通道实现含 api/cli）；「91 REST endpoints」→ 与 system-map 一致的核验口径
+- [x] S1.3 验证：全新克隆视角运行 `node scripts/check-mermaid.mjs`（按提示装依赖后）对 live 文档零失败

@@ -34,7 +34,7 @@ cargo install --path crates/octos-cli \
 
 ## Architecture
 
-octos is a Rust-native, API-first Agentic OS — multi-tenant AI agent platform. 8-crate workspace + bundled skills, layered:
+octos is a Rust-native, API-first Agentic OS — multi-tenant AI agent platform. 38-member workspace (23 platform crates + 15 skill crates), core layering:
 
 ```
 octos-cli  (CLI: clap commands, config loading, config watcher)
@@ -47,7 +47,7 @@ octos-memory   octos-llm  (hybrid search + memory store | LLM providers)
 ```
 
 Alongside octos-agent:
-- **octos-bus**: Message bus, 14 channels (Telegram/Discord/Slack/WhatsApp/Email/WeChat/...), sessions, coalescing, cron, heartbeat
+- **octos-bus**: Message bus, 15 IM channels (Telegram/Discord/Slack/WhatsApp/Email/WeChat/...; 17 channel impls incl. api/cli local), sessions, coalescing, cron, heartbeat
 - **octos-pipeline**: DOT-graph pipeline engine — per-node model selection, parallel fan-out, checkpoints, human gates
 - **octos-plugin**: Plugin SDK — manifest parsing, discovery, gating (binary/env/OS checks)
 
@@ -55,7 +55,7 @@ Bundled skills in `crates/app-skills/` (weather, time, news, deep-search, etc.) 
 
 Commands: chat, init, status, gateway, serve, clean, completions, cron, channels, auth (login/logout/status), skills (list/install/remove).
 
-Three runtime modes: `octos chat` (interactive CLI), `octos gateway` (multi-channel), `octos serve` (web dashboard + 91 REST endpoints).
+Three runtime modes: `octos chat` (interactive CLI), `octos gateway` (multi-channel), `octos serve` (web dashboard + REST API; 76 unique route paths as of 2026-09).
 
 Auth module (`octos-cli/src/auth/`): OAuth PKCE + device code for OpenAI, paste-token for others. Stored in `~/.octos/auth.json`. `config.rs` checks auth store before env vars.
 
