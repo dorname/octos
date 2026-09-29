@@ -43,8 +43,10 @@ sequenceDiagram
         WD->>ST: Step 8c: advance healthy cursors only
     end
     WD->>SRC: Step 16: next cycle re-read authoritative progress
-    WD->>ST: Step 17: progress resets retry; no progress increments or fuses
+    WD->>ST: Step 17: progress resets retry, no progress increments or fuses
 ```
+
+> 修复说明：原时序图 Step 17 消息文本中的 ASCII 分号 `;` 被 mermaid 解释为语句分隔符，导致整图解析失败（渲染为语法错误框）；改为逗号后通过 mermaid v10/v11 双版本解析校验（`scripts/check-mermaid.mjs`）。
 
 ## 步骤说明与接口推导
 
