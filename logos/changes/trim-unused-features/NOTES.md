@@ -115,3 +115,15 @@ Reporter：`logos/resources/verify/test-results.jsonl` TRIM-S2-*（6 条）；�
 - `cargo build --workspace --jobs 4`：0 error 0 warning
 - `cargo test -p octos-bus`（--skip cron_service_pg）：293 PASS / 0 failed；cron_service_pg ×4 = 环境伪失败（k8s PG 容器未映射宿主端口，PoolTimedOut，切片 1 已定性）
 - Reporter：TRIM-S3-mermaid-check / TRIM-S3-workspace-build / TRIM-S3-bus-regression
+
+## 验收记录（2026-09-30，用户授权 verify）
+
+- 首跑 Gate 3.6 FAIL：Uncovered=105（UT-S01×40 + UT-S16×65）。根因：`octos-cli` watchdog 测试的 reporter 初始化（`watchdog/tests.rs:32` `REPORT_INIT.call_once` → `fs::write(&path, b"")`）**无条件清空** test-results.jsonl 账本 —— 每次跑 `cargo test -p octos-cli` 都会把其他场景（S01/S16）的历史 reporter 抹掉，只留 S17 自身条目。这解释了 jsonl 全历史（29 次改动）均无 S16 行却曾在 9-29 出现 Uncovered=0：当时工作区账本恰为完整状态、verify 之后未提交即被下一次测试清空。
+- **预存机制缺陷（另行提案，本次不动）**：多场景共享账本下，任一带「清空式」reporter 的测试套件都会破坏其余场景的验收证据。修复方向：改为「不存在时创建」或按 scenario 分文件 + last-write-wins 合并。
+- 重建 reporter（全部经本次真实运行证据核对，非凭空补写）：
+  - `octos-bus` 集成 `deploy_directory_layout`（13 PASS）/ `pg_persistence_matrix`（10 PASS，静态断言不连 PG）→ UT-S16-01..22、26
+  - `octos-bus --features matrix --lib`（1 PASS）→ UT-S16-30（matrix 测试为 feature 门控）
+  - `octos-web` vitest 3 文件 8/8 PASS → UT-S16-23..25、33..35
+  - `octos-llm --lib` 719 PASS（--list 核对测试名）→ UT-S16-27..29 + UT-S01-10..17、35..40（oauth/registry 归属澄清：auth/oauth.rs 在 octos-cli，registry/openai.rs 在 octos-llm）
+  - `octos-cli --lib` 3919 PASS（--list 核对测试名）→ UT-S16-31..65 的 cli 侧 33 个 + UT-S01-01..09、18..34
+- 复跑 verify：**Gate 3.6 PASS** — Defined 139 / Executed 154 / Passed 153 / Failed 0 / Skipped 1（ST-S17-13）/ Uncovered 0 / **Coverage 100%**。报告：`logos/resources/verify/acceptance-report.md`。
