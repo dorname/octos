@@ -19,6 +19,21 @@ fn result_path() -> PathBuf {
         })
 }
 
+/// 确保 reporter 结果文件存在；目录不存在时创建，文件已存在时保留内容。
+/// 这是为了支持多场景共享同一个 test-results.jsonl 账本：octos-cli
+/// 的 watchdog 测试不应在初始化阶段清空其他场景的历史记录。
+fn ensure_result_file(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("创建 reporter 目录");
+    }
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .expect("创建或打开 reporter 结果文件");
+}
+
 fn report(id: &str, status: &str, error: Option<&str>, duration_ms: u128) {
     let path = result_path();
     let _guard = REPORT_LOCK
@@ -26,10 +41,7 @@ fn report(id: &str, status: &str, error: Option<&str>, duration_ms: u128) {
         .lock()
         .expect("reporter lock");
     REPORT_INIT.call_once(|| {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("创建 reporter 目录");
-        }
-        fs::write(&path, b"").expect("清空 reporter 结果");
+        ensure_result_file(&path);
     });
     let mut record = serde_json::json!({
         "id": id,
@@ -864,4 +876,27 @@ fn st_s17_14_authorization_boundary() {
         assert!(prompt.contains("不授权执行 merge/verify/deploy/smoke/archive/push"));
         assert!(prompt.contains("绝不放行 loop-exhausted"));
     });
+}
+
+
+#[test]
+fn reporter_does_not_truncate_existing_results() {
+    // 关键契约：ensure_result_file 只应创建/追加账本文件，绝不应清空已有记录。
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("results.jsonl");
+    let existing = r#"{"id":"UT-S01-01","status":"pass","duration_ms":0,"timestamp":"2026-09-30T00:00:00+00:00","scenario":"S01"}"#;
+    fs::write(&path, format!("{}\n", existing)).unwrap();
+
+    ensure_result_file(&path);
+
+    let content = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "ensure_result_file 必须保留现有记录，实际行数 {}：内容={}",
+        lines.len(),
+        content
+    );
+    assert!(lines[0].contains("UT-S01-01"), "应保留既有 S01 记录");
 }
