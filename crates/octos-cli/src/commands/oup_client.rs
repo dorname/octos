@@ -208,7 +208,7 @@ mod tests {
             .request("nonexistent/method", json!({}))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("-32004"), "{error}");
+        assert!(error.to_string().contains("-32601"), "{error}");
         tokio::time::timeout(std::time::Duration::from_secs(5), client.close())
             .await
             .expect("embedded dispatcher must terminate on EOF")
