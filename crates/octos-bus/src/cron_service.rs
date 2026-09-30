@@ -377,26 +377,27 @@ impl CronService {
         id: &str,
         enabled: bool,
     ) -> Result<Option<CronJob>> {
-        // LocalCronStore keeps memory == disk at every persist
-        // boundary, so a "reconcile from disk then toggle" reduces to
-        // "read latest + update_schedule". Read fresh, mutate
-        // enabled + next_run, write back. On persist failure the
-        // LocalCronStore rolls back the in-memory mutation.
+        // LocalCronStore keeps memory == disk at every persist boundary,
+        // but a long-lived CronService can hold stale memory across external
+        // writes (gateway child / CLI edits). Re-read the file under the
+        // store lock, apply the toggle, and persist — implementing the
+        // codex #1612 r2 "adopt before mutating" contract.
         let now_ms = Utc::now().timestamp_millis();
-        let Some(mut job) = self.store.get_schedule(&self.default_scope, id) else {
-            return Ok(None);
-        };
-        job.enabled = enabled;
-        if enabled {
-            job.compute_next_run(now_ms);
-        } else {
-            job.state.next_run_at_ms = None;
+        match self.store.with_reloaded_job(&self.default_scope, id, |job| {
+            job.enabled = enabled;
+            if enabled {
+                job.compute_next_run(now_ms);
+            } else {
+                job.state.next_run_at_ms = None;
+            }
+        }) {
+            Ok(None) => return Ok(None),
+            Ok(Some(job)) => {
+                self.arm_timer();
+                Ok(Some(job))
+            }
+            Err(e) => Err(eyre::Report::new(std::io::Error::other(e))),
         }
-        if let Err(e) = self.store.update_schedule(&self.default_scope, job.clone()) {
-            return Err(eyre::Report::new(std::io::Error::other(e)));
-        }
-        self.arm_timer();
-        Ok(Some(job))
     }
 
     /// Arm a timer for the earliest due job.

@@ -132,6 +132,37 @@ impl LocalCronStore {
         store.jobs.iter().find(|j| j.id == id).cloned()
     }
 
+    /// Re-read the store from disk, then apply `f` to the job with `id`
+    /// under the same store lock. This implements the reconciling toggle
+    /// contract from `cron_service.rs` codex #1612 r2: a long-lived
+    /// service must adopt writes from other owners before mutating.
+    ///
+    /// Returns `Ok(Some(job))` if the job existed after reload and `f` was
+    /// applied successfully, `Ok(None)` if the job was not present after
+    /// reload, or `Err(...)` if persistence failed (in-memory state is
+    /// rolled back to the reloaded snapshot).
+    pub fn with_reloaded_job<F>(&self, _scope: &Scope, id: &str, f: F) -> Result<Option<CronJob>, String>
+    where
+        F: FnOnce(&mut CronJob),
+    {
+        let mut store = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *store = load_store_or_quarantine(&self.store_path);
+        let Some(pos) = store
+            .jobs
+            .iter()
+            .position(|j| j.id == id)
+        else {
+            return Ok(None);
+        };
+        let prior = store.jobs[pos].clone();
+        f(&mut store.jobs[pos]);
+        if let Err(e) = persist_store_locked(&self.store_path, &store) {
+            store.jobs[pos] = prior;
+            return Err(e);
+        }
+        Ok(Some(store.jobs[pos].clone()))
+    }
+
     /// List every schedule (enabled + disabled) ordered by `next_run`
     /// then `id`. Mirrors `cron_service::list_all_jobs`.
     pub fn list_schedules(&self, _scope: &Scope) -> Vec<CronJob> {
