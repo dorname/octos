@@ -242,6 +242,46 @@ Progress is tracked server-side via:
 
 Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`.
 
+### 2.5 Stopping the Server
+
+- **Ctrl+C** — in the terminal running the foreground `octos serve`.
+- **Service manager** — for installed services:
+
+  ```bash
+  # Linux (systemd)
+  sudo systemctl stop octos-serve
+
+  # macOS (launchd)
+  sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+  ```
+
+- **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server. A host-managed serve (`octos serve --host-managed`, see `docs/HOST_MANAGED_SERVE.md`) never offers it: its host stops it by closing stdin.
+
+### 2.6 Giving an External Agent Session Access (Work Secrets)
+
+An external CLI or scripted agent should not hold your dashboard bearer token. A *work secret* is a short-lived credential that grants one agent access to exactly one session, over the session-ingress WebSocket route (`/v1/session_ingress/ws/{session_id}`):
+
+```bash
+# Operator notes go to stderr, the encoded secret to stdout
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+
+# List recorded grants (SHA-256 hash prefixes only; the token is never stored)
+octos auth list-work-secrets
+
+# Revoke before expiry
+octos auth revoke-work-secret '<secret>'
+```
+
+- `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`); re-issuing for the same session replaces the earlier grant.
+- The guest decodes the secret and connects with `Authorization: Bearer <token>`. The `?token=` query form still works for WebSocket clients that cannot set headers, but it is deprecated and logged by the server.
+- The grant is revalidated before every client request; a revoked, expired, or replaced grant closes the live socket with close code 1008. Only methods scoped to the granted session are accepted.
+
+Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
+
 ---
 
 ## 3. Setting Up LLM Providers
@@ -264,7 +304,7 @@ Octos supports 17 LLM provider families out of the box. Cloud providers require 
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
@@ -330,7 +370,7 @@ Octos supports 17 LLM provider families out of the box. Cloud providers require 
 4. Create a new API key
 5. Copy the key
 6. Set it: `export ZAI_API_KEY="your-key"`
-7. Note: Z.AI uses the Anthropic Messages API protocol (`api_type: "anthropic"`)
+7. Note: the `zai` (`api.z.ai/api/paas/v4`) and `zai-coding` (`api.z.ai/api/coding/paas/v4`) lanes speak OpenAI Chat Completions, the only Z.AI protocol that reports prompt-cache hits. A saved `base_url` of `https://api.z.ai/api/anthropic` is migrated to the lane's OpenAI-compatible root with a warning; set `api_type: "anthropic"` to keep the (uncached) Anthropic Messages protocol
 
 **Nvidia NIM:**
 1. Go to [Nvidia NIM](https://build.nvidia.com/)
@@ -429,7 +469,7 @@ The `api_type` field forces a specific API wire format:
 ```
 
 - `"openai"` — OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies like Z.AI)
+- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies). For `zai` / `zai-coding` without a `base_url` this targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`), which reports no prompt-cache hits
 
 ### 3.5 Auth Store (OAuth & Paste-Token)
 
@@ -532,7 +572,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -541,7 +581,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 }
 ```
 
-- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 30s)
+- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 10s)
 - **`error_rate_threshold`** — Providers with error rates above this are deprioritized (default: 30%)
 - **`probe_probability`** — Fraction of requests sent to non-primary providers as health probes (default: 10%)
 - **`probe_interval_secs`** — Minimum time between probes to the same provider (default: 60s)
@@ -1006,7 +1046,8 @@ Model switches are persisted to the profile JSON file. On gateway restart, the b
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation — creates a new session copying the last 10 messages |
+| `/new` | Clear the current session's history (same as `/clear`) |
+| `/new <name>` | Switch to — or create — a named session (`/new slides <name>` / `/new site <preset>` scaffold project sessions) |
 | `/config` | View and modify tool configuration (see [Section 6](#6-tool-configuration)) |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
 
@@ -1016,7 +1057,8 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking:** `/new` creates a branched conversation with parent_key tracking
+- **Named sessions:** `/new <name>` switches to — or creates — a named session; bare `/new` clears history like `/clear`. If a background seal was interrupted — the history sits in sealed segments with no active file — the session self-heals: opening it, or `/new <name>` on a gateway, rebuilds the active file from the sealed segments and resumes the history instead of starting empty.
+- **Internally-forked child sessions** (e.g. background spawns) carry a `parent_key` field linking them to their origin — user-created named sessions do not.
 - **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
 - **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first streamed event and carried on subsequent UI Protocol updates. Terminal events include `committed_seq` — the durable history sequence number of the final write — so a web client can replay deterministically after reconnect. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
 - **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.
@@ -2114,7 +2156,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2284,6 +2326,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Voice** | |
 | `ASR_API_URL` | Dedicated batch-ASR service base URL; overrides OMiniX for transcription |
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+| **Session storage** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
@@ -2407,7 +2452,7 @@ Keep them handy — you will paste them into two files below.
 
 #### 2. Create the Appservice Registration
 
-Create `appservices/octos-registration.yaml`:
+Create `appservices/octos-registration.yaml` (it carries both tokens in plaintext, so keep it owner-only: `chmod 600 appservices/octos-registration.yaml`):
 
 ```yaml
 # Matrix Appservice Registration — octos
@@ -2511,7 +2556,7 @@ Matrix channel fields:
 | `server_name` | The Matrix domain (must match `palpo.toml`). |
 | `sender_localpart` | Bot username (must match the registration). |
 | `user_prefix` | Prefix for bridged user IDs managed by this appservice. |
-| `port` | Port Octos listens on for appservice events from Palpo. |
+| `port` | Port Octos listens on for appservice events from Palpo. The listener binds `127.0.0.1` by default; cross-container deployments override the bind address with `OCTOS_MATRIX_APPSERVICE_BIND` (see the compose file below). |
 | `allowed_senders` | Matrix user IDs that may talk to the bot. Empty array = allow all. |
 | `mention_only` | Optional, default `true`. Outside a true 1:1 DM, a bot only replies when explicitly addressed (an `m.mentions` entry, an MXID pill/mention, or a client-supplied target). A true 1:1 DM — a single human plus a single managed bot in the room, counted from the appservice's own room map — always replies. Rooms with multiple managed bots require a mention even when only one human is present, so bots don't all answer every message. Set to `false` to make the bot reply to every message in every room (messages carrying `org.octos.explicit_room` are still gated). |
 
@@ -2561,11 +2606,17 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # Appservice listener (receives events from Palpo)
+      # 8009 is intentionally NOT published: Palpo reaches the appservice
+      # listener over the internal bridge (http://octos:8009), and the
+      # listener authenticates with the hs_token alone, so it should not be
+      # reachable from outside the compose network.
       - 8010:8080     # Octos dashboard / admin API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # The appservice listener binds loopback by default; cross-container
+      # homeserver pushes need an explicit opt-out.
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
@@ -2605,7 +2656,7 @@ The most common misconfiguration is a token mismatch. All three of these must ag
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Bot does not respond | Token mismatch between registration and profile | Verify the [token checklist](#164-token-matching-checklist) |
-| `Connection refused` in Palpo logs | Octos not running or wrong `url` in registration | Ensure Octos is up; use Docker service name (`http://octos:8009`), not `localhost` |
+| `Connection refused` in Palpo logs | Octos not running, wrong `url` in registration, or the listener not reachable from the Palpo container | Ensure Octos is up; use Docker service name (`http://octos:8009`), not `localhost`. Cross-container setups must set `OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009` — the listener binds loopback by default |
 | `User ID not in namespace` | `sender_localpart` doesn't match registration `namespaces.users` regex | Update the regex to include the bot's full user ID |
 | Messages from unauthorized users ignored | `allowed_senders` filtering | Add the user's Matrix ID to the array, or set it to `[]` to allow everyone |
 

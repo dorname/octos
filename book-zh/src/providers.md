@@ -18,7 +18,7 @@ Octos 开箱即用地支持 17 家 LLM 服务商。每个服务商需要一个�
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI 兼容 | -- |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI 兼容 | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI 兼容 | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | 自动（Anthropic/OpenAI） | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | -- |
@@ -54,6 +54,12 @@ octos chat --model gpt-4o  # 根据模型名自动检测服务商
 ```
 
 ### 凭证存储
+
+原生深度研究（native deep research）使用 Rust `search` 应用技能（包括 OctoScript 元搜索引擎）和 `deep_crawl` 进行渲染站点抓取。将 `deep-search` 与 `deep_crawl` 可执行文件部署在 `octos` 旁边，启动时即可安装这些捆绑工具。它不需要 DOT 图，也不需要 `run_pipeline`。宿主会把已保存的 `strong` 车道注入原生研究的综合阶段；没有该车道时则使用聊天服务商。搜索引擎与抓取不需要单独的 LLM 车道。`run_pipeline` 与 DOT 执行已从 CLI/服务器运行时中移除（包括子智能体）。磁盘上已有的图文件不会被加载或执行。
+
+原生研究的综合可以使用 `sub_providers` 中名为 `strong` 的条目。在服务器与网关中，将研究车道的 `api_key_env`、`base_url` 与 `api_type` 留空，即可复用 profile 聊天配置（主用或备用）中匹配的服务商。多条已保存路由使用同一服务商时，模型精确匹配优先。显式的车道覆盖仍然生效；不同的端点不会继承已保存路由的自定义凭证。未匹配到路由的服务商使用自身默认值，绝不会使用其他服务商的密钥。
+
+凭证仍保存在共享的 profile 环境/凭证存储中。因此当 profile 运行时重载后，更新已保存的服务商凭证会同时作用于聊天与研究。独立的模型车道保留各自的运行时状态；共享凭证不会切换当前聊天模型。被拒绝的凭证仍然需要更换：HTTP 401 是认证失败，既不是缺少研究工具，也不是反复重试同一密钥的理由。
 
 除了环境变量，你也可以通过 auth 命令行存储 API 密钥：
 
@@ -141,7 +147,7 @@ octos chat --model qwen-max         # -> dashscope
 ```
 
 - `"openai"` -- OpenAI Chat Completions 格式（大多数服务商的默认值）
-- `"anthropic"` -- Anthropic Messages 格式（用于 Anthropic 兼容代理）
+- `"anthropic"` -- Anthropic Messages 格式（用于 Anthropic 兼容代理）。`zai` / `zai-coding` 路由设置 `api_type: "anthropic"` 且未指定 `base_url` 时，使用 Z.AI 的 Anthropic 兼容根地址（`https://api.z.ai/api/anthropic`），该地址不报告提示缓存命中；默认的 OpenAI 兼容通道在长会话中更省钱
 
 ## 降级链
 

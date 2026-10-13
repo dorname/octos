@@ -1,14 +1,18 @@
 # Octos UI Protocol v1 Spec — 2026-04-24
 
-Status: draft spec for `M9.1`.
+Status: current shipped `octos-ui/v1alpha1` contract, audited 2026-10-07.
+The historical filename is retained for links; §14 describes canonical v2
+projection payloads within this protocol version.
 
 Sprint: `coding-green`
 
-This is the first protocol document for the M9 control-plane layer. It is intentionally narrower than the eventual end-state. The goal is to define one client/runtime boundary that both `octoscode` and future server work can target without baking unresolved M8 runtime defects into the contract.
+This document describes the shared client/runtime boundary used by Octos
+clients. Historical milestone notes remain for context; the current wire
+contract is defined by the sections below and their referenced amendments.
 
-Code sketch:
+Protocol types:
 
-- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- Rust types live in [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
 
 Related planning:
 
@@ -95,6 +99,35 @@ Stdio transport rules:
   then the server default profile. Clients should pass `profile_id` explicitly
   before `session/open`.
 
+Session-ingress transport rules:
+
+- `/v1/session_ingress/ws/{session_id}` is the second WebSocket route. It
+  speaks the same UI Protocol v1 JSON-RPC frames as `/api/ui-protocol/ws`,
+  but authenticates with a short-lived, session-scoped work secret instead
+  of the dashboard credential. The full walkthrough lives in
+  [OCTOS_WORK_SECRET_SESSION_INGRESS.md](../docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md).
+- Credentials: clients send `Authorization: Bearer {session_ingress_token}`.
+  WebSocket clients that cannot set headers may fall back to
+  `?token={session_ingress_token}`; the server logs that deprecated form
+  once the grant validates. The former `_token` and `session_ingress_token`
+  query aliases are removed; a request that presents only a removed alias
+  is rejected with a remediation message.
+- Grants: `octos auth issue-work-secret` writes a SHA-256 grant hash (the
+  token itself is never stored) and prints the encoded secret;
+  re-issuing for the same session replaces the earlier grant.
+  `octos auth revoke-work-secret` revokes one.
+- The server revalidates the grant before every client request and closes
+  the socket with close code `1008` whenever the grant no longer validates
+  (revoked, expired, or replaced).
+- The method surface is confined to the granted session: every
+  session-scoped method must carry the granted `session_id`, and
+  non-session global methods (for example `session/list`,
+  `system/status.get`, `content/*`, `memory/*`, `cron/*`) as well as raw
+  non-session-routed requests are refused with `invalid_request`.
+- The browser Origin gate that applies to `/api/ui-protocol/ws` upgrades
+  also applies to session-ingress upgrades; the work secret authenticates
+  and scopes the session independently and does not bypass that gate.
+
 ## 4. Versioning
 
 Protocol identifier:
@@ -155,7 +188,7 @@ Process:
 
 Executable contract gate:
 
-- [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
   contains literal golden tests for the v1 protocol identifier, schema
   versions, JSON-RPC version, command method set, notification method set, and
   representative wire payloads.
@@ -233,20 +266,11 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-011](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_011_TURN_STATE_GET.md),
   gated behind `state.turn_state_get.v1`. Returns `state: "unknown"`
   rather than an error for missing turns.
-- The additive `message/persisted` notification (durable-commit
-  confirmation per session row, fired AFTER `add_message_with_seq`'s
-  fsync) is governed by accepted
-  [UPCR-2026-012](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_012_MESSAGE_PERSISTED.md),
-  gated behind `event.message_persisted.v1`. Strict-ordered per session.
-- The additive M9-γ projection `Envelope` shape (canonical
-  `(thread_id, seq, client_message_id?, payload)` tuple consumed by the
-  deterministic web client projection) is governed by accepted
-  [UPCR-2026-014](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_014_PROJECTION_ENVELOPE.md),
-  gated behind `projection.envelope.v1`. The shape is documented in § 14
-  "M9-γ Envelope" of this spec; legacy `message/delta`,
-  `message/persisted`, `tool/*`, and `turn/completed` notifications
-  continue to flow on connections that do not negotiate this feature
-  until `M9-γ-3` deletes them.
+- `message/persisted` (UPCR-2026-012) and the original v1 projection
+  (UPCR-2026-014) are historical contracts. The shipped server delivers
+  canonical `projection/envelope` v2 on every connection, suppressing raw
+  source lifecycle notifications. See §14 for payloads, terminal semantics,
+  and the remaining v2 hydration capability.
 - The additive stdio AppUI transport is governed by accepted
   [UPCR-2026-016](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_016_STDIO_TRANSPORT.md).
   It changes only framing and process launch. Method names, params, results,
@@ -304,7 +328,7 @@ Current M9 sandbox-parity decision:
 - The additive manifest-declared skill action surface
   (`skill/action/list`, `skill/action/invoke`, and the `skill.actions.v1`
   capability feature) is governed by accepted
-  [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_SKILL_ACTIONS.md).
+  [UPCR-2026-044](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_044_SKILL_ACTIONS.md).
   It lets clients render and invoke skill-owned UI actions without gaining a
   generic AppUI tool-call primitive. Skill manifests own the action id, input
   schema, UI hints, bound backend tool, and any file-materialization mode.
@@ -312,10 +336,26 @@ Current M9 sandbox-parity decision:
   (`skill/action/job/list`, `skill/action/job/read`, the
   `skill/action/job/updated` notification, and the `skill.action_jobs.v1`
   capability feature) is governed by accepted
-  [UPCR-2026-027](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_027_SKILL_ACTION_JOBS.md).
+  [UPCR-2026-045](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_045_SKILL_ACTION_JOBS.md).
   It lets clients observe manifest-declared background actions through generic
   projections of persisted supervised tasks. It does not introduce
   notebook-specific routes or a generic client-selected tool-call primitive.
+- The optional `client_commands` param of `session/open` (its per-open
+  lifecycle, release on disconnect, and server-side name filtering) is
+  governed by accepted
+  [UPCR-2026-037](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_037_CLIENT_COMMANDS.md).
+  The param is ungated and the request records the contract as shipped; it
+  changes no wire shape.
+- The additive `accepted_client_commands` field on `SessionOpened`, which
+  echoes the `client_commands` names the server accepted, is governed by
+  accepted
+  [UPCR-2026-038](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_038_ACCEPTED_CLIENT_COMMANDS.md).
+  The field is ungated.
+- The additive `tool_call_id`, `tool_name` and `tool_calls` fields on
+  `session/hydrate` message rows (and on `session/rollback`'s trimmed thread),
+  which name a tool row's call and tool, are governed by accepted
+  [UPCR-2026-039](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_039_HYDRATED_TOOL_CALL_IDENTITY.md).
+  The fields are ungated.
 
 ## 5. Identity Model
 
@@ -342,26 +382,16 @@ These ids need to be stable and client-visible:
 - `event_cursor`
   A resumable position in the ordered protocol event stream.
 
-Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1).
+Current Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs).
 
 ### 5.1 M9-γ projection identity (UPCR-2026-014)
 
-Under the M9-γ deterministic projection model (§ 14), envelope identity
-collapses to the per-thread `seq`. Specifically:
-
-- The canonical projection key is `(thread_id, seq)` — see `Envelope`
-  in § 14.
-- `client_message_id` rides on user-message-rooted envelopes ONLY for
-  the optimistic `<GhostBubble>` overlay's match-and-unmount logic;
-  the projection itself MUST NOT consult it.
-- The legacy per-row `message_id` (carried, for example, on
-  `MessagePersistedEvent.message_id`) is **deprecated for projection
-  identity** as of UPCR-2026-014. It survives in
-  `Envelope.payload` (e.g. `assistant_persisted.meta.message_id`) for
-  audit/render display, but the projection uses `seq` as the sole key.
-  The field is retained — not deleted — so legacy
-  `appendCompletionBubble` / `message/persisted` consumers continue to
-  work until `M9-γ-3` removes them.
+Canonical projection identity is `(thread_id, seq)` within a routed session.
+`turn_id` correlates the foreground turn; a background child names its parent
+in the payload. `client_message_id` reconciles optimistic user messages.
+Durable `message_id` coalesces hydrated transcript rows with persisted
+assistant/background envelopes. The session ledger `cursor` is a separate
+resume position. See §14 for their exact shapes and lifetimes.
 
 ## 6. Envelope Model
 
@@ -369,12 +399,24 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
+The shared [frame codec](../crates/octos-core/src/app_ui_codec.rs) accepts
+one compact, single-line JSON object per frame, with `jsonrpc: "2.0"`.
+Batch arrays and embedded literal line breaks are not supported. Stdio strips
+one trailing LF or CRLF before applying the same validation. The text-frame
+limit is 1 MiB (`MAX_TEXT_FRAME_BYTES`).
+
+Request and success-response `id` values must be strings; numeric and null
+request ids are rejected. Notifications omit `id`. Error responses carry a
+string id, or null when no request id can be associated with the failure.
+The shipped codec reports JSON/framing/id/shape errors as `parse_error` and
+an absent or unsupported `jsonrpc` version as `invalid_request` (see §10).
+
 The logical command/event names below mirror the current wire inventory:
 
 - command source of truth:
   `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_COMMAND_METHODS`,
   `UI_PROTOCOL_FIRST_SERVER_METHODS`, and
-  `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`
+  `crates/octos-cli/src/api/ui_protocol_transport.rs::APPUI_EXTRA_METHODS`
 - notification source of truth:
   `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`
 - executable route inventory:
@@ -392,7 +434,14 @@ Session, turn, and approval core:
   re-projects the trimmed thread exactly like `session/hydrate`; #1516)
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
-- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
+  Manual and automatic compaction use the same session model selection: a
+  peer's configured model lane (also for its request-context sessions), otherwise
+  the profile primary provider. This selects the model, endpoint, credentials,
+  and context-window budget together; compaction has no separate provider
+  configuration. Missing or unbuildable peer lanes retain the turn path's
+  primary-provider fallback. Heuristic mode makes no model call, and manual
+  compaction remains deferred while a turn is active.
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
@@ -411,7 +460,14 @@ Session, turn, and approval core:
   registry lock; the agent loop drains them FIFO at its next iteration
   boundary — before the next LLM call — as plain `role: user` messages
   with no wrapper text, persisting each through the canonical session
-  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  path so the standard v2 `UserMessage` envelope announces the fold-in.
+  Pending input is checked before each serial tool admission and each new
+  batch: tools already running finish, while unstarted calls receive explicit
+  not-executed results so the model can reconsider them after reading the input.
+  Already-admitted parallel calls settle before the next model request.
+  New input wakes a pending streaming model request: emitted text and observed
+  usage are retained, unexecuted tool arguments are discarded, and sampling
+  resumes with the new input in the SAME turn (no terminal or second start);
   a steer landing after the model's final answer forces one more round
   in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
   `expected_turn_id` naming a different turn → `invalid_params`; a live
@@ -456,6 +512,10 @@ Router (Wave4-A):
 
 - `router/set_mode`, `router/get_metrics`
 
+Cross-project history (raw AppUI, advertised in `supported_methods`):
+
+- `session/history/list` (UPCR-2026-040 — authorized profile and known project stores)
+
 M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 
 - `session/list`, `session/snapshot`, `session/messages_page`,
@@ -489,7 +549,8 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `server/shutdown` (accepted `UPCR-2026-032`; stops the serving process
   through the same graceful path as SIGINT; advertised and callable only on a
   local `--solo` HTTP serve, never to session-scoped connections, otherwise
-  typed `server_shutdown_unavailable`)
+  typed `server_shutdown_unavailable`; never on `octos serve --host-managed`,
+  `UPCR-2026-036`)
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
@@ -500,6 +561,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/sub_providers/list`, `profile/sub_providers/upsert`,
   `profile/sub_providers/remove` (named provider lanes for per-node pipeline
   routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+  Research lanes with omitted `api_key_env`, `base_url`, or `api_type` inherit
+  those fields from the matching saved chat provider route. Explicit overrides
+  win; a different endpoint does not inherit a route's custom credential.
+  Without a matching route, the lane uses its own provider defaults.
 - `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
   the session workspace's pre-mutation undo points; restore rolls the
   workspace back — refused while a turn is in flight, itself undoable via
@@ -512,7 +577,158 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
-  scalar result fields mirror the first peer and `peers: [...]` carries all)
+  scalar result fields mirror the first peer and `peers: [...]` carries all;
+  optional positive `token_budget` sets a cumulative per-peer limit for every
+  staged member and is echoed in each result entry. The limit persists by peer
+  slug across session reconnects. Usage is charged after each turn, so one
+  turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
+- `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
+  fields; a server that lists `peer/context/open` honors them): optional
+  `model` names a configured `sub_provider` lane exactly like
+  `peer_handoff`'s `model` (unknown lane: `model_note`, primary model);
+  optional `memory_namespace` marks a host-owned app peer — requires
+  `session_id` (the owning system-agent session, persisted as originator),
+  exactly one name and no `worktree`; `cwd` is the app's host-owned
+  workspace, or, when omitted, a kernel-provisioned
+  `<data_dir>/app-workspaces/<namespace>` (for remote hosts); binds every session of the peer to that workspace and to
+  the namespace's memory stores (capture, retrieval, prompt injection;
+  never the profile's own memory); optional `resume: true` returns an
+  existing peer with the same originator, namespace and workspace
+  (`resumed: true`, requires `host_token`) instead of refusing the name.
+  Result entries add `model` (`{lane, provider?, model?}`, the effective
+  choice), `model_note`, `memory_namespace`, `resumed` and `host_token`
+  (minted once at creation; required for every later control call on the
+  peer). A binding whose namespace or workspace nests with another app
+  peer's is refused. A host-owned app peer's tool approvals are answered
+  only by the person through the host (`approval/respond`): the owning
+  system agent is not woken for them, `peer_list` does not offer them, and
+  `peer_respond` refuses them; it still answers the peer's questions.
+  Typed `data.kind`: `peer_originator_mismatch`,
+  `peer_host_token_mismatch`, `peer_binding_mismatch`,
+  `peer_binding_conflict`, `peer_closed`.
+- `peer/model/set` (accepted `UPCR-2026-034`: the peer's originator sets or
+  clears (`model: null`) its configured model lane; `{session_id, peer,
+  model}` → `{slug, profile_id, model, applies: "next_turn"}`; an unknown
+  lane is refused with `peer_model_unknown` and changes nothing; the profile
+  default is untouched)
+- `peer/context/open`, `peer/context/close` (accepted `UPCR-2026-034`: bound
+  request contexts of a host-owned app peer. `{session_id, peer,
+  context_id, cwd?}`; open returns the kernel-minted `session_id`
+  (`<originator base>#peerctx-<slug>.<context_id>`), `cwd` (inside the
+  peer's workspace, default `contexts/<context_id>`), the child
+  `memory_namespace` (`<peer ns>/ctx-<context_id>`), the peer's `model` and
+  `created`; idempotent while open. Optional `share_history {last_n?
+  (default 20, max 50), max_bytes? (default 16384, 1024..=65536)}`, from
+  the peer's host connection only (`share_history_host_only`), opens the
+  person's lane of the peer (amended 2026-09-29): it runs in parallel with
+  the peer's own session, each lane's turns are shown the other's recent
+  user/assistant text rows as a read-only prompt block that is never
+  persisted (including the other lane's running turn: its request, its
+  streamed text so far and a `[turn status]` line such as `waiting for
+  approval: <tool>`), its turns are labelled `person` by default, and each of its
+  turns publishes a round on the peer's blackboard (`origin:`, `context:`).
+  Fixed at creation (`peer_binding_mismatch` on a changed re-open). Close marks the binding closed and
+  interrupts the context's in-flight turn; a closed or never-opened
+  context session is refused at `session/open` and at every `turn/start`
+  (`session_binding_closed`), and its id is never reopened. Typed
+  `data.kind`: `peer_not_host_bound`, `peer_context_closed`,
+  `peer_context_not_found`, `peer_context_workspace_escape`)
+- `peer/tools/register` (accepted `UPCR-2026-035`: the host declares a
+  host-owned app peer's app tools and the generic kernel tools it may use;
+  without `peer`, the tools of the host SESSION `session_id` itself (e.g.
+  the system agent's conversation; credential: the host token of an app
+  peer that session prepared; only the registering connection's turns get
+  them, calls carry `caller.kind: "system"`, and the set lives as long as
+  that connection);
+  `{session_id, peer?, host_token, tools?, generic_tools?, if_version?,
+  call_timeout_ms?, approval_ttl_secs?, max_result_bytes?}` (`tools` are
+  the app bundle's `tools.json` entries: `name`, `description`,
+  `input_schema`, `output_schema?`, `risk`, `background?`, `outward?`,
+  `confirm?` `host`|`app`) →
+  `{slug, version, previous_version, tools, generic_tools, applies:
+  "next_turn"}`. Replaces the set atomically; from the next turn every
+  session of the peer and of its request contexts ADDS those app tools to
+  the peer's usual kernel tools (exactly `generic_tools` of them when the
+  host sets that list), but only for turns on the peer originator's base key
+  that are driven by the registering connection; any other turn on those
+  topics gets no tools (hosts must drive the peer's turns on that
+  connection). App tool calls are sent to the registering connection as the
+  server notification `peer/tool/call` `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller: {peer,
+  session_id, context_id}, args, risk, confirm_required, timeout_ms,
+  tools_version}` (`app` = the tool's owning app, which a cross-app tool
+  names in its declaration; `caller` = `{kind, peer, session_id,
+  context_id, turn_id}`, the calling peer, session and turn); `peer/tool/cancel`
+  `{call_id, reason}` stops one, after which the host must not execute it.
+  `generic_tools`, when given, is the peer's kernel tool set exactly (no
+  kernel-side exclusions; it never adds a tool the session lacks). Approvals of these calls, and `turn/steer` / `turn/interrupt` on
+  the peer's sessions, belong to the host connection: other connections do
+  not see those approvals and are refused (`peer_host_connection_only`). Kernel approvals of these calls are once-only: no
+  remembered scope answers them or is recorded from them. Destructive and outward tools need an `approval/requested` →
+  `approval/respond` on the calling session first (the host renders it),
+  except `confirm: app` tools, which the host hands to the owning app's own
+  sheet for callers of every kind (`confirm_required: true`). Typed `data.kind`:
+  `peer_not_host_bound`, `peer_tools_invalid`, `peer_tools_version_conflict`)
+- `peer/tool/result` (accepted `UPCR-2026-035`: the host answers one
+  `peer/tool/call`; `{session_id, peer?, host_token, call_id, ok?, data?,
+  error?, status?: "awaiting_confirmation"}` → `{call_id, accepted,
+  result_too_large?, awaiting_confirmation?}`; an acknowledgement extends a
+  gated call's wait to the approval TTL; an unanswered non-read call ends as
+  `outcome_unknown`; typed `data.kind` `peer_tool_call_not_found` for a
+  finished, timed-out or cancelled call, whose late result is audited)
+- `peer/purge` (accepted `UPCR-2026-034` amendment, #2604: the host erases
+  a host-owned app peer. `{session_id, peer, host_token, profile_id?}` →
+  `{session_id, profile_id, slug, name, purged, already_purged, purged_at,
+  was_open, contexts, contexts_closed, interrupted, host_calls_failed,
+  prompts_cancelled, erased, errors}`; closes an open peer first, fails its
+  in-flight host tool calls (`peer_purged`), stops its and its contexts'
+  running turns, then erases their transcripts, the memory namespace, the
+  blackboard and a kernel-provisioned workspace, and frees the (app,
+  account) binding; a failed erase entry finalizes nothing — the purge
+  fails `peer_purge_incomplete` with the entries in `data.errors`, the peer
+  stays closed and staged, and a retry runs the whole idempotent erase
+  again; a retry after completion answers `already_purged`;
+  host connection only; typed `data.kind` `peer_purge_not_owner`,
+  `peer_purge_busy`, `peer_purge_in_progress`, `peer_purge_incomplete`,
+  `peer_not_host_bound`)
+- `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
+  `peer/input`; `{session_id, peer, host_token, input_id, reason:
+  "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
+  rejected, reported_to: "call" | "system_session"}`; only from the connection
+  the input was sent to, once, before a `turn/start` with its `turn_id`; the
+  system agent's waiting `peer_send_input` fails with `peer_input_rejected:
+  <reason>`, or the refusal is reported on the system session's next turn;
+  the `turn_id` is released and a later `turn/start` with it is refused;
+  typed `data.kind` `peer_input_reject_invalid`, `peer_input_not_found`,
+  `peer_input_wrong_connection`, `peer_input_already_rejected`,
+  `peer_input_already_started`)
+- `session/tool_list/set` (accepted `UPCR-2026-035`, #2605: the host sets
+  the durable, exact kernel tool list of one of its own sessions;
+  `{session_id, host_token?, profile_id?, generic_tools: [string] | null,
+  if_version?}` → `{session_id, profile_id, version, previous_version,
+  generic_tools, applies: "next_turn"}`; `null` clears; it narrows every turn
+  on the session in the serve and gateway paths, survives reconnects and
+  restarts, never widens the profile policy, and an unreadable list keeps no
+  tools; never from an external client; the host's own connection (`serve --stdio`, or
+  a host-managed host-token connection), elsewhere the host token of an app peer the session prepared;
+  typed `data.kind` `session_tool_list_invalid`,
+  `session_tool_list_version_conflict`, `peer_host_token_mismatch`,
+  `external_method_denied`)
+- `session/tool_list/get` (accepted `UPCR-2026-035`, #2605: the host reads
+  that list back; `{session_id, host_token?, profile_id?}` → `{session_id,
+  profile_id, version, status: "none" | "set" | "cleared" | "unreadable",
+  generic_tools}`; same authorization)
+- `peer/tools/unregister` (accepted `UPCR-2026-035`: the host releases a
+  host-owned app peer it no longer serves while its connection stays open;
+  `{session_id, peer, host_token, profile_id?}` → `{slug, profile_id,
+  unregistered}`; drops the peer's route and ends its calls in flight
+  `host_gone`, so the system agent's later `peer_send_input` fails "not
+  connected"; idempotent; `peer/tools/register` restores the route; refused
+  to external clients)
+- `server/instance.get` (shared local server identity; returns no credential;
+  see [workspace teams ADR](../docs/adr/automatic-workspace-peer-teams.md)).
+- `peer/team/list`, `peer/team/leader/set`, `peer/team/message` (automatic
+  workspace teams; capability `peer.workspace_team.v1`; contract below).
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
@@ -523,9 +739,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
 - `skill/action/list`, `skill/action/invoke` (gate `skill.actions.v1`,
-  accepted `UPCR-2026-026`; manifest-declared skill actions only)
+  accepted `UPCR-2026-044`; manifest-declared skill actions only)
 - `skill/action/job/list`, `skill/action/job/read` (gate
-  `skill.action_jobs.v1`, accepted `UPCR-2026-027`; persisted background skill
+  `skill.action_jobs.v1`, accepted `UPCR-2026-045`; persisted background skill
   action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
@@ -560,14 +776,23 @@ Session (server-pushed open-state echo for reconnect/replay):
 - `session/open` (same method name as the §7 command; emitted as
   `UiNotification::SessionOpened` and replayed from the durable ledger)
 
-Turn, message, and tool lifecycle:
+Turn, message, and tool lifecycle (raw source records are projected as v2; §14):
 
 - `turn/started`, `turn/completed`, `turn/error`
+- `turn/steer_dropped` (accepted `UPCR-2026-033`) — returned unconsumed steer
+  inputs, emitted at turn end after the turn can no longer accept steers and
+  BEFORE its terminal frame. `params` carry the `session_id`, `turn_id`,
+  optional `topic`, the still-pending steer `inputs` in buffer order, and a
+  `reason` (`interrupted` | `turn_ended`), so the client can re-queue them
+  deterministically. Delivery is unfiltered; the negotiated
+  `event.turn_steer_dropped.v1` feature licenses a client to treat a
+  terminal without a preceding `turn/steer_dropped` naming its steer as
+  consumed by the server.
 - `message/delta`
 - `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
   `message/delta`; #1502)
-- `message/persisted` (accepted `UPCR-2026-012`)
-- `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
+- `message/persisted` (retired historical notification, `UPCR-2026-012`)
+- `turn/spawn_complete` (historical source for v2 `background/spawn_complete`)
 - `tool/started`, `tool/progress`, `tool/completed`
 
 Approval lifecycle:
@@ -580,7 +805,7 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 
 - `user_question/requested`
 
-Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-027`):
+Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-045`):
 
 - `skill/action/job/updated`
 
@@ -596,8 +821,8 @@ Task and progress:
 
 Projection and session bridging (accepted `UPCR-2026-014`):
 
-- `projection/envelope` — wire `params` carries the bare `Envelope`
-  fields FLATTENED with the routing keys `session_id` (bare base key) +
+- `projection/envelope` — wire `params` carries the bare `EnvelopeV2`
+  fields FLATTENED with the routing keys `session_id` (preserved session key) +
   optional `topic`, so a multi-session client can route each envelope
   (`feat(envelope-wire-routing)`); see § 14.1.
 - `file/attached`
@@ -611,17 +836,17 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   infographic) produced by a voice turn. Emitted on the same
   ledger-backed live path as `file/attached`, but kept distinct from it:
   `file/attached` stays a pure artifact-delivery signal while these carry
-  the placeholder lifecycle, so the split survives a future
-  `projection.envelope.v1` cutover. See § 8.
+  the placeholder lifecycle. Artifact delivery uses the canonical v2
+  `file_attached` payload. See § 8.
 
 Voice reply-audio streaming (gate `event.voice_audio.v1`; #1504):
 
 - `voice/audio_chunk` — streamed reply-audio frames (base64) for a voice turn.
   Delivery is gated by the `event.voice_audio.v1` capability: a client that did
   not negotiate it is filtered off the chunk stream and instead receives the
-  whole-file audio as a `file/attached` envelope, which is itself gated by
-  `event.file_attached.v1` (the reply audio has no other carrier — a client
-  that negotiated neither capability receives no playable reply audio).
+  whole-file audio as a canonical v2 `file_attached` payload when the
+  artifact is produced. That canonical payload does not require the
+  historical `event.file_attached.v1` token.
 
 Voice exit intent (ungated; accepted `UPCR-2026-025`):
 
@@ -641,15 +866,28 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 - `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
 - `session/goal/updated`, `session/goal/cleared`
-- `loop/updated`, `loop/fired`, `loop/completed`
+- `loop/updated`, `loop/fired`
 - `monitor/updated`, `monitor/fired`, `monitor/expired`
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+- `context/state_reported` (additionally gated on `context.state.v1`: live token estimate mid-turn)
+
+Session orchestration status (whole-job indicator; ungated; accepted
+`UPCR-2026-033`):
+
+- `session/orchestration` — per-connection indicator snapshot for each open
+  session: `active:true` with `running_agents`, `pending_continuations`, and
+  an optional coarse `phase` while a turn, a non-terminal sub-agent, or a
+  queued master continuation is in flight, then one final `active:false`
+  when the session drops out. Emissions are deduped to changes, so a session
+  stays active across the sub-agent-complete → master-re-entry gap.
 
 Peer staging (#1801 v3, ungated):
 
+- `peer/team/updated` — ephemeral complete team snapshot for a connection
+  that called `peer/team/list` or `peer/team/leader/set`; re-list after reconnect.
 - `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
   tool staged a sovereign peer session server-side (durable brief + optional
   fenced worktree), and the client auto-opens the staged session (topic
@@ -664,6 +902,30 @@ Peer staging (#1801 v3, ungated):
   `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
   `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
   clients dedup by the already-closed peer for the topic.
+
+Host-registered peer tools (UPCR-2026-035; sent only to the connection that
+registered a host-owned app peer's tools with `peer/tools/register`):
+
+- `peer/tool/call` — run one app tool: `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller, args,
+  risk, confirm_required, timeout_ms, tools_version}`. Approvals of these
+  calls carry `approval_kind: "host_tool"` and `typed_details.host_tool`
+  `{app, tool, args, risk, outward, calling_peer?, calling_session_id,
+  context_id?, tool_call_id?, outcome_unknown_before}` for the host's own
+  sheet. The host answers with `peer/tool/result`.
+  Ephemeral: never replayed; a host that is gone fails the call.
+- `peer/tool/cancel` — the kernel stopped waiting for `call_id`
+  (`reason`: `timeout` | `cancelled`).
+- `peer/input` — the system agent's `peer_send_input` to a host-owned peer:
+  `{peer, session_id, input_id, turn_id, text}`. The host starts the peer's
+  turn itself (`turn/start` on `session_id` with `turn_id` and the text, on
+  the same connection), or refuses it with `peer/input/reject`. Never run as
+  a kernel-internal turn; with no host connected `peer_send_input` fails and
+  nothing is queued. Ephemeral. The kernel labels that turn `system_agent`
+  (a different `turn/start` `origin` is refused). The person's own turns
+  run in parallel in a request context opened with `share_history`
+  (UPCR-2026-034, amended 2026-09-29), each lane shown the other's recent
+  turns read-only.
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 
@@ -699,6 +961,17 @@ Minimum params:
   `session.workspace_cwd.v1`. The server must canonicalize and approve it
   against runtime filesystem roots before binding cwd-scoped tools.
 - optional `after`
+- optional `client_commands`
+  Slash commands the client handles itself, from accepted `UPCR-2026-037`
+  (leading `/` optional). The server lists the accepted names in the session's
+  system prompt. The declaration is per-open, not sticky: every `session/open`
+  replaces the session's previous one, omitting the field declares none, and
+  the server clears it when the declaring connection closes. Across concurrent
+  connections the last open wins. Names are filtered server-side: at most 32
+  characters of ASCII alphanumerics, `-` and `_`, deduplicated, first 64 kept,
+  and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
+  `/reset`) dropped. The names that survive are echoed in the result's
+  `accepted_client_commands`.
 
 Expected result:
 
@@ -753,6 +1026,42 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   from the same canonical profile/session store used by `turn/start` and
   `session/hydrate`.
 
+Optional result fields from accepted `UPCR-2026-038`:
+
+- `accepted_client_commands`
+  The names the server accepted from this open's `client_commands`, each as
+  `/name`, in declaration order. Present whenever the request carried
+  `client_commands` and the server applied it, including as `[]` when every
+  name was dropped. Absent when the request omitted `client_commands`.
+  Ungated.
+
+### `session/history/list`
+
+This raw AppUI method is advertised in `supported_methods`. Params are
+`{ workspaces?: string[], profile_id?: string, offset?: number, limit?: number }`.
+It lists profile stores and known project stores, respecting the connection's
+frozen profile scope. Admin/unscoped connections may list all profiles;
+session-ingress credentials cannot call it. Up to 128 workspace hints are
+accepted; paths pass the same canonicalization and workspace gate as `session/list`.
+Internal child transcripts and host-bound app peer/context history are excluded.
+
+The result is `{ sessions, total, next_offset, workspaces,
+unavailable_workspaces, coverage: "profile_and_known_workspaces" }`.
+`limit` is 1..200, default 100. Rows carry the usual session metadata plus full
+`id`, `profile_id`, and `workspace_root` (null for a profile store). Clients key
+rows by all three fields and reopen with that exact profile/workspace, using a
+fresh history/replay authority when one wire id occurs in different stores.
+
+Project addresses are remembered under the owning profile's data directory
+when a project session opens. A validated hint naming an existing session
+store is also remembered. This index survives server restarts and is shared by
+local terminal/server processes using that profile; it holds no transcripts
+and grants no permission. Each saved path is revalidated before listing.
+Missing projects are reported in `unavailable_workspaces`, never recreated.
+The catalog does not recursively scan the filesystem. Older projects can be
+included by adding their workspace once. Runtime startup does not register
+app-owned or ephemeral stores as project history.
+
 ### `session/hydrate`
 
 Purpose:
@@ -780,6 +1089,21 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   Typed model-visible context state for the hydrated session. This state must
   be read from the same canonical profile/session store used by `turn/start`,
   not reconstructed by the client from hydrated chat rows.
+
+Optional `messages` row fields from accepted `UPCR-2026-039` (ungated; the
+rows of `session/rollback`'s `thread` carry them too):
+
+- `tool_call_id`
+  On a tool-result row (`role: "tool"`), the id of the assistant tool call it
+  answers.
+- `tool_name`
+  On a tool-result row, the name of the tool that call ran (the `tool_name` of
+  `tool/started`), from the nearest earlier row whose `tool_calls` hold the
+  id, looked up in the whole transcript whatever `after` is. Absent when the
+  transcript lacks that call.
+- `tool_calls`
+  On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
+  in call order, without the arguments. Omitted when the row made no call.
 
 ### `turn/state/get`
 
@@ -823,11 +1147,30 @@ Minimum params:
 - `turn_id`
 - `input`
 
+Optional params (among others):
+
+- `origin` `{kind: "person" | "system_agent" | "app", label?}` — who speaks
+  in this turn of a host-owned app peer's shared conversation
+  (UPCR-2026-034, amended 2026-09-28). Only on the peer's own session
+  `<originator base>#peer-<slug>` or on a request context opened with
+  `share_history` (amended 2026-09-29: there `person` is the default and
+  only `person` or `app` are accepted), only from the peer's host
+  connection, and never `system_agent` (the kernel labels a turn started
+  from its `peer/input` itself). The kernel prefixes the prompt with a stable marker
+  (`[from the person]`, `[from the system agent: …]`) and records
+  `origin:` in the peer's `result.md`. Typed `data.kind`:
+  `turn_origin_not_allowed`, `turn_origin_host_only`,
+  `turn_origin_mismatch`.
+
 Behavior:
 
 - server emits `turn/started`
-- server may emit zero or more `message/delta`, `tool/*`, `task/updated`, `warning`
-- server finishes with `turn/completed` or `turn/error`
+- server emits canonical `projection/envelope` v2 payloads for assistant/tool
+  output, alongside applicable `task/updated`, `warning`, and control events
+- server finishes the foreground projection with `turn_terminal`; its outcome
+  distinguishes completion, error, interruption, and rate limiting (§14)
+- one turn per session: a start while a turn runs is refused with
+  `data.kind: "turn_in_progress"`; the kernel does not queue
 
 ### `review/start`
 
@@ -1210,8 +1553,9 @@ Clients must use that method list to enable or disable slash commands.
 - servers that support server-owned permission inspection advertise
   `permission.profile.v1`; servers that expose the extended runtime policy
   stamp advertise `runtime.policy_stamp.v1`
-- unauthenticated stdio servers must omit `auth/me`, `content/list`, and
-  `content/delete` from `supported_methods` and list them under
+- unauthenticated stdio servers must omit `auth/me`, `auth/logout`,
+  `content/list`, `content/delete`, `content/bulk_delete`, `memory/*`,
+  `cron/*`, and `smart_home/*` from `supported_methods` and list them under
   `unsupported` with a reason; direct calls to those methods still return the
   typed `auth_unavailable` error with code `-32120`
 
@@ -1657,10 +2001,23 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/sessions`
-- Params type: `SessionListParams` (empty object).
+- Params type: `SessionListParams` — `{}` for the legacy per-profile/global
+  listing. With `session.workspace_cwd.v1` negotiated, an optional `cwd`
+  scopes the listing to that project's `<cwd>/.octos/<profile>` store, and
+  an optional `profile_id` names the profile whose store to read, under the
+  same scope rules as `session/open`: a user connection may only restate
+  its own profile (anything else is an `auth_scope_violation`), an
+  admin/token connection uses it to name the profile it opens sessions
+  under, and an unregistered profile is `cwd_runtime_unavailable`.
 - Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
   `sessions` field forwards the JSON body of the legacy REST handler
-  verbatim (one `SessionInfo` per entry).
+  verbatim (one `SessionInfo` per entry). When — and only when — the
+  server actually scoped the listing to a project store, the result also
+  carries `workspace_root` (the canonical root) and `profile_id` (whose
+  `<workspace_root>/.octos/<profile_id>` store was read). A `{cwd}` request
+  to a server with `appui.sessions_in_cwd` off, or one that predates it,
+  returns the legacy global listing without them; a client must not place
+  rows under a workspace unless the result attests that scope.
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
@@ -1991,6 +2348,13 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 ## 8. Event Semantics
 
+The lifecycle source names below also describe retained ledger records.
+Current WebSocket/stdio output projects `message/delta`,
+`message/reasoning_delta`, `tool/*`, `file/attached`, `turn/completed`,
+`turn/error`, and `turn/spawn_complete` into canonical v2 (§14); it does not
+send these raw records alongside the projection. `turn/started`, approvals,
+questions, task/progress, and other control notifications remain separate.
+
 ### `turn/started`
 
 Marks the start of one client-visible turn. This creates the turn lifecycle boundary for the UI.
@@ -2005,6 +2369,10 @@ from accepted `UPCR-2026-007` (see § 7).
 When `context.lifecycle.v1` is available for the connection, the notification
 payload may also include `context` and `context_state` with the same semantics
 as the `session/open` result.
+
+The payload carries `accepted_client_commands` (accepted `UPCR-2026-038`) with
+the value of the open that produced it. A replayed notification reports that
+earlier open's declaration, not the session's current one.
 
 Optional pane fields from accepted `UPCR-2026-002`:
 
@@ -2060,13 +2428,14 @@ Optional typed fields from accepted `UPCR-2026-001`:
 
 - `approval_kind`
   String registry with initial values `command`, `diff`, `filesystem`,
-  `network`, and `sandbox_escalation`.
+  `network`, and `sandbox_escalation`; `host_tool` (UPCR-2026-035) for a
+  host-routed app tool's call, with `typed_details.host_tool`.
 - `risk`
   Display/audit risk label.
 - `typed_details`
   Tagged object whose `kind` should match `approval_kind` when both are present.
   Known detail groups are `command`, `sandbox`, `diff`, `filesystem`,
-  `network`, and `sandbox_escalation`.
+  `network`, `sandbox_escalation`, and `host_tool`.
 - `render_hints`
   Optional display hints such as labels, default decision, danger state, and
   monospace fields.
@@ -2171,6 +2540,14 @@ Optional fields from accepted `UPCR-2026-014` (M9-α-9):
   `session_result` frame so a WS client can stamp authoritative seq
   onto an optimistic bubble without an extra REST roundtrip. Absent
   when the turn ended without a final assistant row.
+- `token_usage`
+  Exact measured usage for this turn as `EnvelopeTokenUsage` counters
+  (input, output, reasoning, cache-read, cache-write), the same shape
+  `turn/error` carries. Additive and optional: omitted when the producer
+  has no typed total, and never session-cumulative. The v2
+  `projection/envelope` `turn_terminal` with `outcome: "completed"` carries
+  these counters verbatim; without it the projection keeps deriving
+  input/output from `tokens_in` / `tokens_out`.
 
 ### `turn/started`
 
@@ -2283,16 +2660,16 @@ the originating user prompt's `client_message_id` under
 bubble under the correct user prompt without splice-merging into the existing
 spawn-acknowledgement bubble.
 
-Capability gate: `event.spawn_complete.v1`. When the capability is not
-negotiated, the same durable row appears as `message/persisted` instead — the
-ledger commit is unchanged, only the wire kind flips.
+Historical source feature: `event.spawn_complete.v1`. Current delivery uses
+`background/spawn_complete` on a canonical v2 child stream for all connections;
+there is no `message/persisted` fallback.
 
 Required fields: `session_id`, `task_id`, `seq`, `message_id`, `source`,
 `cursor`, `persisted_at`, `content`. Optional fields: `topic`, `turn_id`,
 `thread_id`, `tool_call_id`, `response_to_client_message_id`, `media`.
 
 Full field set and semantics are documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/auto_resolved`
 
@@ -2302,7 +2679,7 @@ a previously recorded scope policy entry, instead of surfacing a fresh
 
 Required fields: `session_id`, `approval_id`, `turn_id`, `tool_name`,
 `scope`, `scope_match`, `decision`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/decided`
 
@@ -2315,7 +2692,7 @@ intentionally omitted for compliance / PII reasons.
 Required fields: `session_id`, `approval_id`, `turn_id`, `decision`,
 `decided_at`, `decided_by`, `auto_resolved`. Optional fields: `scope`,
 `policy_id`, `client_note`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/cancelled`
 
@@ -2327,7 +2704,7 @@ new entries as future drains land (e.g. `session_closed`). Initial values:
 
 Required fields: `session_id`, `approval_id`, `turn_id`, `reason`. Full
 field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `progress/updated`
 
@@ -2340,7 +2717,7 @@ Required fields: `session_id`, `metadata`. Optional field: `turn_id`. The
 `metadata.kind` field is an open registry; initial values include `status`,
 `retry_backoff`, `file_mutation`, and `token_cost_update`. Full field set,
 typed sub-objects, and forward-compat `extra` map documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 `progress/updated` is a durable ledger event. Each frame is committed to
 the per-session append-only ledger before the wire frame is enqueued, so
@@ -2364,7 +2741,7 @@ Capability gate: `context.lifecycle.v1`.
 Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `context/compaction_started`
 
@@ -2386,6 +2763,34 @@ Required fields: `session_id`, `context_state`, `trigger`,
 `threshold_tokens`. Documented by
 [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
+### `context/state_reported`
+
+Gate: `context.lifecycle.v1` **and** `context.state.v1` (both requested by the
+client; never implied by a missing feature header, because legacy clients cannot
+decode this notification kind).
+
+Pushed by the in-loop prompt bridge as a turn's prompt grows between
+compactions, so a client's context gauge follows the real estimate instead of
+the value from `session/open` or the last compaction. Emitted at most once per
+agent-loop iteration and only when `token_estimate` moved by at least 2% of
+`threshold_tokens` (minimum 1024 tokens).
+
+```json
+{
+  "session_id": "local:abc",
+  "context_state": { "…": "UiContextState" },
+  "threshold_tokens": 800000,
+  "iteration": 57
+}
+```
+
+- `context_state` — the same `UiContextState` shape carried by the compaction
+  events; `token_estimate` is the live estimate.
+- `threshold_tokens` — the token count at which the server will compact this
+  session (context-window derived), the honest denominator for a fullness
+  fraction.
+- `iteration` — agent-loop iteration within the current turn (0 = turn start).
+
 ### `context/normalization_reported`
 
 Notification that a prompt-normalization pass ran ahead of an LLM call.
@@ -2396,7 +2801,7 @@ Capability gate: `context.lifecycle.v1`.
 
 Required fields: `session_id`, `context_state`, `normalization`. Full field
 set and the `UiContextNormalizationReport` shape documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `protocol/replay_lossy`
 
@@ -2417,7 +2822,7 @@ rules.
 
 Required fields: `session_id`, `dropped_count`. Optional field:
 `last_durable_cursor`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ## 9. Reconnect and Cursor Rules
 
@@ -2445,7 +2850,7 @@ reports a *backlog* condition (durable frames dropped from the live socket)
 rather than its own durability, so reconnecting clients observe the signal
 on replay alongside the surrounding durable events. The full wire contract
 for the signal is documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### 9.1 Ledger Durability Contract (M9-FIX-05 / #643)
 
@@ -2486,6 +2891,100 @@ Rules:
   must fail with JSON-RPC `INVALID_PARAMS` and
   `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
   stamp for that profile or silently fall back to a default profile
+
+Numeric error codes are pinned in this section. `rpc_error_codes` in
+`crates/octos-core/src/ui_protocol.rs` mirrors them as Rust constants, and a
+parity test (`crates/octos-core/src/ui_protocol_tests.rs`) fails when either
+side gains a code the other lacks. The WS/stdio dispatcher applies them at
+its supported-table and capability gates in
+`crates/octos-cli/src/api/ui_protocol_transport.rs`.
+
+JSON-RPC reserved range:
+
+- `-32700` (`parse_error`) — raised by the shared frame codec before method
+  dispatch for invalid JSON, unsupported framing, invalid ids, and envelope
+  shape errors (including batch arrays or conflicting `method`/`result`/`error`
+  fields). This describes the shipped codec's broader use of the reserved code.
+- `-32600` (`invalid_request`) — the codec uses this for an absent, non-string,
+  or unsupported `jsonrpc` version. Handlers also use it for requests that are
+  invalid in the addressed runtime context, such as steering a non-steerable turn.
+- `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
+  `UiCommand` parser when the method falls outside the protocol's method
+  table. The serve dispatcher answers unknown methods with `-32004`
+  instead (below), so this code is not observed on the AppUI wire today.
+- `-32602` (`invalid_params`) — JSON-RPC reserved: params failed schema
+  validation, including the per-method caps and validation rules listed
+  with each method.
+- `-32603` (`internal_error`) — JSON-RPC reserved: internal server error.
+
+Server-defined range:
+
+- `-32004` (`method_not_supported`) — legacy server slot for "this server
+  will not run the method": a method outside the supported-method table, or
+  a capability-gated method called without negotiating the feature (see the
+  M12 Phase D section). The message echoes the requested method name and
+  `data` carries a typed `UnsupportedCapabilityReport`, giving clients one
+  machine-readable signal that the server will not run the method on this
+  slice.
+- `-32011` (`approval_not_pending`) — `respond` against an approval that is
+  no longer pending; the already-recorded decision rides in `error.data`.
+- `-32100` (`unknown_session`) — `session_id` not known to the runtime;
+  `data` carries `session_id`.
+- `-32101` (`unknown_turn`) — `turn_id` not known for the addressed session.
+- `-32102` (`unknown_approval_id`) — `approval_id` not known to the runtime
+  (`unknown_approval` in the minimum categories above).
+- `-32103` (`unknown_preview_id`) — `preview_id` unknown (expired or never
+  issued).
+- `-32104` (`unknown_task_id`) — `task_id` not in the runtime task table.
+- `-32105` (`approval_cancelled`) — `respond` against an administratively
+  cancelled approval.
+- `-32106` (`user_question_unknown`) — `user_question/respond` against a
+  `question_id` not pending for the caller's session; mirrors
+  `unknown_approval_id` for the structured-question surface.
+- `-32107` (`user_question_stale`) — `user_question/respond` against a
+  question that was already answered or cancelled.
+- `-32108` (`user_question_invalid`) — `user_question/respond` carried
+  answers that do not match the stored request (wrong answer count, a
+  `selected_labels` value not in that question's options, more than one
+  label on a non-`multi_select` question, or free text where the question
+  disallows it). The server rejects the call without resolving the blocked
+  tool.
+- `-32110` (`cursor_out_of_range`) — stale or future cursor relative to the
+  session ledger; retry with a fresh cursor.
+- `-32111` (`cursor_invalid`) — cursor malformed or belonging to a different
+  stream; rehandshake instead of retrying.
+- `-32120` (`permission_denied`) — sandbox, approval-scope, or profile
+  policy refusal. The same numeric code carries `auth_unavailable` (with
+  `data.kind = "auth_unavailable"`) on content and auth methods called
+  without a usable identity; clients disambiguate by `data.kind`.
+- `-32130` (`unsupported_capability`) — typed slot for the
+  capability-unavailable condition. New emitters should prefer it over the
+  legacy `-32004` slot. Like `-32601`, it is not emitted on the AppUI wire
+  today; the dispatcher's capability gate still answers `-32004` (see the
+  migration status below).
+- `-32140` (`runtime_not_ready`) — transient runtime unavailability
+  (`runtime_unavailable` in the minimum categories above); autonomy loop
+  runtime failures answer with it.
+- `-32150` (`malformed_result`) — a server-side result failed its own
+  schema; the result-side counterpart to `invalid_params`.
+- `-32160` (`rate_limited`) — backpressure signal; `data` may carry an
+  optional `retry_after_ms` hint (the `RpcError::rate_limited` constructor),
+  which current emitters do not set.
+- `-32170` (`resource_not_found`) — not-found for non-session-scoped
+  resources (content catalog rows, profile records); `data` carries
+  `resource_type` and `identifier`. Distinct from `unknown_session`
+  (`-32100`), which is reserved for session-scoped 404s.
+
+`-32004` → `-32130` migration status:
+
+- Current: the dispatcher's capability gate answers with `-32004`;
+  `-32130` has no emitter on the AppUI wire today.
+- Target: `-32130` becomes the canonical answer for the
+  capability-unavailable condition.
+- Switch trigger: none scheduled. Repointing the gate is a client-visible
+  wire change and requires an accepted protocol change request (§4.1);
+  until then `-32004` is the only capability-gate answer a client can
+  observe.
 
 ## 11. Relationship to REST
 
@@ -2530,11 +3029,10 @@ Original migration-era split (historical):
 - protocol: turn lifecycle, approvals, diff preview, task output, live
   progress, resumable event flow
 
-## 12. M8 Gate
+## 12. Historical M8 Gate
 
-This spec should not freeze over known M8 runtime defects.
-
-Before productionizing protocol features that depend on runtime truth, the following M8 areas need to be repaired:
+The original rollout depended on repairing the following M8 runtime areas.
+This historical checklist is not a statement that these defects remain open:
 
 - `ToolContext` propagation
 - resume sanitizer correctness
@@ -2545,374 +3043,235 @@ Before productionizing protocol features that depend on runtime truth, the follo
 
 See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md).
 
-## 13. Immediate Next Steps
+## 13. Validation
 
-1. Keep the shared Rust types in `octos-core` aligned with this doc.
-2. Build the mock `octoscode` scaffold against these draft types.
-3. When M8 fixes land, start server-side `M9.1` transport wiring against the same shapes.
+The wire inventory and §6 catalog guards check registered method coverage.
+Rust protocol tests pin error codes and serialization. Server API tests exercise
+capability gates, transport dispatch, session scope, replay, and lifecycle
+semantics. The §14 JSON examples are shared executable fixtures for Rust and
+the in-repo TypeScript bridge; changes must keep both consumers passing.
 
-## 14. M9-γ Envelope
+## 14. Canonical v2 Projection Envelope
 
-Status: **additive**, governed by accepted `UPCR-2026-014`. Capability-gated
-behind `projection.envelope.v1`. Legacy `message/delta`, `tool/*`, and
-`turn/completed` notifications continue to flow on connections
-that do not negotiate this feature, until `M9-γ-3` deletes them. The
-`message/persisted` notification has since been **retired** (see the v2
-note at the end of this section): the ledger skips replaying its records
-and `projection/envelope` is its sole successor.
+Status: shipped. `projection/envelope` carries `EnvelopeV2` / `PayloadV2`
+from [octos-core](../crates/octos-core/src/ui_protocol.rs). The outer protocol
+identifier remains `octos-ui/v1alpha1`; envelope v2 is a payload format, not
+another transport version. This section supersedes the historical v1
+projection description in UPCR-2026-014.
 
-ADR: [`docs/M9-GAMMA-SERVER-PROJECTION-ADR.md`](../docs/M9-GAMMA-SERVER-PROJECTION-ADR.md).
-
-This section defines the canonical envelope shape that the M9-γ
-deterministic projection consumes. The web client maintains an
-append-only `Vec<Envelope>` indexed by `(thread_id, seq)` and the
-projection function `(committed_log) → ChatViewModel` is pure,
-deterministic, and side-effect free. Identity collapses to `seq`;
-`client_message_id` lives ONLY on `user_message` envelopes (see
-§ 14.2) for the optimistic `<GhostBubble>` overlay's match-and-unmount
-path (the projection MUST NOT consult it).
-
-**Turn shape** (locked by § 14.2): every chat turn begins with exactly
-one `user_message` envelope (server-mirrored from the client's send),
-followed by zero or more `assistant_delta` / `tool_*` / `file_attached`
-/ `assistant_persisted` envelopes, terminated by exactly one
-`turn_completed` envelope. A refresh-only projection reconstructs the
-`UserView` for the chat exclusively from `user_message` envelopes —
-`assistant_delta` and `assistant_persisted` alone are insufficient.
+Every connection receives canonical v2 live and replay notifications, including
+connections that send no feature token. Raw `message/delta`,
+`message/reasoning_delta`, `tool/started`, `tool/progress`, `tool/completed`,
+`file/attached`, `turn/completed`, `turn/error`, and `turn/spawn_complete`
+records are internal/legacy source records: their canonical projections are
+sent instead. `message/persisted` is retired. These names remain in the
+historical catalog and ledger decoder; their presence is not a promise of a
+second live stream. `turn/started` and unrelated control notifications retain
+their own contracts.
 
 ### 14.1 Envelope
 
-Wire shape (JSON):
+The JSON-RPC notification method is `projection/envelope`. Its `params` is
+flattened as below; the durable ledger wrapper remains nested as
+`{session_id, topic?, envelope}`.
 
 ```json
 {
+  "session_id": "dev:local:demo#coding",
+  "topic": "coding",
   "thread_id": "thread-1",
-  "seq": 18,
-  "client_message_id": "01900000-0000-7000-8000-000000000001",
-  "payload": { "type": "...", "data": { ... } },
-  "session_id": "local:demo",
-  "topic": "planning"
+  "turn_id": "01900000-0000-7000-8000-000000000001",
+  "seq": 1,
+  "cursor": { "stream": "dev:local:demo#coding", "seq": 18 },
+  "client_message_id": "prompt-1",
+  "payload": { "type": "user_message", "data": { "text": "Hello" } }
 }
 ```
 
-The `projection/envelope` notification's JSON-RPC `params` is the bare
-`Envelope` fields (`thread_id`, `seq`, `client_message_id?`, `payload`)
-FLATTENED with the routing keys `session_id` and optional `topic`. The
-routing keys let a multi-session client (e.g. the TUI, which holds
-several sessions on one connection) route each envelope to the correct
-session and topic-scoped pane. The bare `Envelope` keys remain at the
-top level, so a client that reads `thread_id`/`seq`/`payload` top-level
-and ignores unknown keys decodes the frame unchanged — the routing
-addition is backward-compatible. A decoder that receives an OLD frame
-lacking `session_id`/`topic` defaults `session_id` to the empty key and
-`topic` to absent, and falls back to its ambient connection context for
-routing.
+- `thread_id` and `turn_id` are required strings. A foreground projection
+  thread is one turn's stream, not a reusable multi-turn conversation. A
+  background result uses its own child stream; its payload names the parent.
+- `seq` is the positive, increasing per-thread sequence. Projection identity
+  is `(thread_id, seq)` within the routed session. Do not confuse it with a
+  transcript row's sequence or `cursor.seq`.
+- `cursor` is the durable session-ledger position `{stream, seq}`. Current
+  server emissions stamp it; decoders permit it to be absent for old fixtures.
+  Resume with this cursor, not the per-thread sequence.
+- `client_message_id` is optional and belongs only on `user_message`. Use it
+  to reconcile an optimistic user message with its server reflection.
+- `session_id` and optional `topic` route the notification. Preserve the
+  emitted session key, including any topic suffix; do not assume it is a bare
+  key. Old cursor/routing-less fixtures may omit routing; only those require
+  the connection's ambient session context.
+- `payload` uses the tagged union below. Unknown additive fields are ignored.
 
-**v2 form (audit 2026-08-21):** the same `projection/envelope` method name
-also carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
-`thread_id`, `seq`, `cursor?`, `turn_id`, `client_message_id?`, `payload`
-with the same routing keys (`session_id`, `topic?`). Key differences from
-v1: an explicit `turn_id` on every envelope (for background child streams
-this is the child stream identity and the payload carries `parent_turn_id`),
-and an optional `cursor` (`UiCursor`).
+### 14.2 Payload
 
-Delivery semantics:
-
-- canonical v2 envelopes on the live stream are delivered **regardless of
-  negotiation** — the server never capability-filters canonical v2 frames
-- the `projection.envelope.v2` capability primarily controls projection of
-  **historical** (ledger-replayed) records into v2 form
-- a connection that negotiated v2 has the corresponding v1/source events
-  (`message/delta`, `tool/*`, `turn/completed`, legacy `message/persisted`)
-  **filtered out** on that connection — v2 clients do NOT decode both forms
-- `message/persisted` (UPCR-2026-012) is retired as a live notification:
-  the ledger explicitly skips replaying old `message/persisted` records, and
-  `projection/envelope` (v1 or v2 per connection negotiation) is its sole
-  successor
-
-> History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
-> BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
-> only on the durable ledger's on-disk record. That left a multi-session
-> consumer with an unroutable empty `session_id`. The wire is now
-> un-stripped (`feat(envelope-wire-routing)`); the **disk** record shape
-> — a NESTED `{ session_id, topic, envelope }` object via the
-> `EnvelopeNotification` derive — is UNCHANGED, so post-restart
-> topic-scoped replay still routes (BLOCKER 4's actual invariant holds).
-
-Field contract:
-
-- `thread_id` (`string`, required) — Multi-turn cluster identity. All
-  envelopes for one logical conversation share a `thread_id`.
-- `seq` (`u64`, required) — Server-assigned strict total order WITHIN
-  this `thread_id`. Strictly monotonic; gaps are an error and trigger
-  rehydration. Identity for the projection.
-- `client_message_id` (`string`, optional) — Populated ONLY on
-  `user_message` envelopes (the optimistic `<GhostBubble>` overlay
-  matches its server reflection here). Absent on every other variant
-  (`assistant_delta`, `assistant_persisted`, `tool_*`, `file_attached`,
-  `turn_completed`). The projection MUST NOT consult this field. A
-  server emitting `client_message_id` on a non-`user_message` envelope
-  is a wire contract violation.
-- `payload` (object, required) — Sealed tagged union; see § 14.2.
-- `session_id` (`string`, optional on the wire for backward-compat,
-  always emitted by current servers) — The bare base session key for
-  client-side routing. A multi-session client routes the envelope to
-  this session; the projection itself does not consult it.
-- `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
-  Omitted when the envelope is not topic-scoped.
-
-Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
-in `octos-core::ui_protocol`. TS source: `Envelope` in
-[`crates/octos-web/src/runtime/ui-protocol-types.ts`](/Users/yuechen/home/octos/crates/octos-web/src/runtime/ui-protocol-types.ts:1).
-
-### 14.2 Payload (sealed tagged union)
-
-Wire form: JSON with `"type"` discriminator and content under `"data"`
-(matches Rust `serde(tag = "type", content = "data", rename_all = "snake_case")`).
-Variants:
+The JSON examples in this section are exercised against Rust serialization
+and the TypeScript bridge. All ten current payload tags are represented.
+Optional fields are omitted unless otherwise stated; nullable optional fields
+also accept JSON null on input.
 
 #### `user_message`
-User-message turn root — server-mirrored from the client's send. Every
-chat turn begins with exactly one `user_message` envelope. The
-projection's `UserView` is reconstructed from these envelopes alone —
-a refresh-only projection cannot recover user bubbles from
-`assistant_delta` / `assistant_persisted`. The carrying envelope's
-`client_message_id` is populated here (and ONLY here) so the
-optimistic `<GhostBubble>` overlay can match its server reflection.
+
+The user-message root of a foreground turn. `files` defaults to an empty
+array and is omitted when empty. Background child streams have no user root.
 
 ```json
-{ "type": "user_message",
-  "data": {
-    "text": "<user prompt>",
-    "files": [
-      { "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
-    ]
-  } }
+{ "type": "user_message", "data": { "text": "Read this", "files": [{ "path": "/tmp/input.txt", "mime": "text/plain", "size_bytes": 12 }] } }
 ```
 
-`files` is an array of [`FileRef`](#145-fileref) entries; omitted on
-the wire when empty.
-
 #### `assistant_delta`
-One streamed assistant text fragment. Multiple `assistant_delta`
-envelopes for the same `thread_id` accumulate (concatenate by `seq`
-order) into the live assistant bubble.
 
-**Reconciliation rule** — `assistant_delta.text` events APPEND
-(concatenate by ascending `seq`). When an `assistant_persisted`
-envelope arrives for the same `thread_id`, its `text` field REPLACES
-the accumulated streamed text (the persisted form is canonical). This
-avoids double-rendering the final body when both delta and persisted
-events project into the same view.
+Append `text` to the specified `assistant_segment_id`. A turn can contain
+multiple assistant iterations, each with a distinct segment id.
 
 ```json
-{ "type": "assistant_delta", "data": { "text": "<fragment>" } }
+{ "type": "assistant_delta", "data": { "text": "Working", "assistant_segment_id": "turn-1:assistant:1" } }
+```
+
+#### `reasoning_delta`
+
+A reasoning fragment for the carrying turn, separate from visible answer text.
+
+```json
+{ "type": "reasoning_delta", "data": { "text": "Checking the input" } }
 ```
 
 #### `assistant_persisted`
-Final assistant text persisted to the ledger after streaming completes.
-Carries durable [`MessageMeta`](#143-messagemeta) so the projection can
-finalize the bubble's identity and surface attachments. Per the
-`assistant_delta` reconciliation rule above, `text` REPLACES the
-concatenated streamed deltas for the same thread (canonical final
-form).
+
+The canonical persisted text replaces streamed text for the SAME segment,
+not every assistant segment in the thread. `meta.message_id` also matches
+that row's hydrated identity, enabling transcript/replay deduplication.
 
 ```json
-{ "type": "assistant_persisted",
-  "data": {
-    "text": "<full text>",
-    "meta": {
-      "message_id": "01900000-0000-7000-8000-000000000018",
-      "persisted_at": "2026-05-09T18:30:01Z",
-      "media": ["report.md"]
-    }
-  } }
+{ "type": "assistant_persisted", "data": { "text": "Done", "assistant_segment_id": "turn-1:assistant:1", "meta": { "message_id": "message-1", "persisted_at": "2026-10-07T00:00:00Z", "media": ["report.md"] } } }
 ```
 
 #### `tool_start`
-Tool invocation begun. The projection opens a tool-call card keyed on
-`tool_call_id`. `arguments_preview` (optional) is a compact
-`key: value` echo of the call arguments, server-bounded to 700 chars
-(UTF-8-safe) — display fidelity for the card, not a replayable
-argument record. Omitted for argument-less calls and for envelopes
-persisted before the field existed.
+
+Open the tool card identified by `tool_call_id`. Optional
+`arguments_preview` is bounded to 700 characters and is not replayable input.
 
 ```json
-{ "type": "tool_start",
-  "data": { "tool_call_id": "tc-1", "name": "shell",
-            "arguments_preview": "command: \"cargo test\"" } }
+{ "type": "tool_start", "data": { "tool_call_id": "tc-1", "name": "read_file", "arguments_preview": "path: input.txt" } }
 ```
 
 #### `tool_progress`
-Tool emitted a progress message. Idempotent per `(tool_call_id, seq)`;
-the projection appends in `seq` order.
+
+Append progress for the identified tool call in sequence order.
 
 ```json
-{ "type": "tool_progress",
-  "data": { "tool_call_id": "tc-1", "message": "running…" } }
+{ "type": "tool_progress", "data": { "tool_call_id": "tc-1", "message": "Reading" } }
 ```
 
 #### `tool_end`
-Tool invocation finished. `error` is set iff `status === "error"`;
-omitted on the wire when null. `reason` is an optional human-readable
-detail field, primarily populated for `skipped` and `aborted` outcomes
-(see below); omitted on the wire when null. `output_preview` (optional)
-carries the first lines of the tool result, server-bounded to
-2048 chars (UTF-8-safe) — the result excerpt under the tool card; the
-`error` field is bounded the same way. `duration_ms` (optional) is the
-call's wall-clock duration. Both are omitted for envelopes persisted
-before the fields existed.
+
+`status` is `complete`, `error`, `skipped`, or `aborted`. Optional `error`
+and `reason` describe failures or non-execution; `output_preview` and `error`
+are bounded to 2048 characters. Optional `duration_ms` is elapsed time.
 
 ```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-1", "status": "complete",
-            "output_preview": "test result: ok. 815 passed",
-            "duration_ms": 4321 } }
+{ "type": "tool_end", "data": { "tool_call_id": "tc-1", "status": "complete", "output_preview": "Read 12 bytes", "duration_ms": 10 } }
 ```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-2", "status": "error", "error": "…" } }
-```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-3", "status": "skipped",
-            "reason": "deadline elapsed before tool started" } }
-```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-4", "status": "aborted",
-            "reason": "user issued turn/interrupt" } }
-```
-
-`status` is a closed snake_case enum:
-
-- `complete` — tool ran to natural completion.
-- `error` — tool surfaced a failure (`error` carries the message).
-- `skipped` — tool was intentionally not run (deadline-skip,
-  pre-condition unmet). `reason` explains why.
-- `aborted` — tool execution was interrupted by an external signal
-  (user `turn/interrupt`, system cancellation). `reason` carries
-  detail.
-
-Future values require a follow-up UPCR.
 
 #### `file_attached`
-File attached to the current thread (e.g. `.md` report from
-`deep_search` or `.mp3` from `fm_tts`). The projection adds the
-attachment to the most-recent assistant bubble in `thread_id`.
+
+Carries the file plus a required `attachment_owner` object with optional
+`assistant_segment_id` and `tool_call_id`. Use the explicit owner rather than
+attaching to whichever bubble arrived most recently. An empty owner object is
+valid when neither identity could be recovered.
 
 ```json
-{ "type": "file_attached",
-  "data": { "path": "/tmp/report.md",
-            "mime": "text/markdown",
-            "size_bytes": 4096 } }
+{ "type": "file_attached", "data": { "path": "/tmp/report.md", "mime": "text/markdown", "size_bytes": 42, "attachment_owner": { "assistant_segment_id": "turn-1:assistant:1", "tool_call_id": "tc-1" } } }
 ```
 
-#### `turn_completed`
-**Hard barrier** — terminal payload for a turn within `thread_id`. Per
-the M9-γ ADR and § 14.6 below, any envelope arriving on the same
-`thread_id` AFTER this one is DROPPED by the projection (and counted
-in `octos_projection_post_completion_drop_total`). Threads are NOT
-reused — a new turn must use a NEW `thread_id`. Carries
-[`EnvelopeTokenUsage`](#144-envelopetokenusage); zero-valued fields are
-omitted on the wire.
+#### `turn_terminal`
+
+The foreground terminal payload. Required `outcome` is `completed`,
+`errored`, `interrupted`, or `rate_limited`; it replaces v1 `turn_completed`.
+Optional `error` is `{code, message, data?}`. Optional `token_usage` contains
+exact turn usage, not cumulative session usage. An absent total is unknown.
+For output truncation, `error.data.partial_result.session_result` preserves
+an actual fragment's identity; explicit null means no final fragment, while
+an absent `partial_result` means legacy/unknown identity (UPCR-2026-030).
 
 ```json
-{ "type": "turn_completed",
-  "data": { "token_usage": { "input_tokens": 100, "output_tokens": 250 } } }
+{ "type": "turn_terminal", "data": { "outcome": "errored", "error": { "code": "output_truncated", "message": "Output limit reached", "data": { "partial_result": { "session_result": null } } }, "token_usage": { "input_tokens": 100, "output_tokens": 250 } } }
+```
+
+#### `background/spawn_complete`
+
+A late task result closes its own child stream, leaving the foreground's
+terminal intact. The envelope's `turn_id` is the child identity;
+`parent_turn_id` links the result to the initiating foreground turn.
+`response_to_client_message_id`, `tool_call_id`, and `media` are optional;
+empty `media` is omitted. `message_id` is the durable transcript identity.
+
+```json
+{ "type": "background/spawn_complete", "data": { "parent_turn_id": "turn-1", "response_to_client_message_id": "prompt-1", "task_id": "task-1", "content": "Research finished", "tool_call_id": "tc-2", "message_id": "message-2", "source": "background", "persisted_at": "2026-10-07T00:00:01Z", "media": ["research.md"] } }
 ```
 
 ### 14.3 `MessageMeta`
 
-```json
-{
-  "message_id": "01900000-0000-7000-8000-000000000018",
-  "persisted_at": "2026-05-09T18:30:01Z",
-  "media": ["report.md"]
-}
-```
-
-- `message_id` (`string`, required) — Server-assigned UUID of the
-  durable row. Stable across replays. Mirrors
-  `MessagePersistedEvent.message_id`. **Note**: `message_id` is retained
-  here for audit/render display only; the projection uses `seq` as the
-  sole identity key (see § 5.1).
-- `persisted_at` (RFC 3339, required) — Wall-clock commit time.
-- `media` (`string[]`, optional) — File attachments persisted with the
-  message. Empty for assistant rows that carry only text. Omitted on
-  the wire when empty.
+Required `message_id` is an opaque stable row identifier, not necessarily a
+UUID. Required `persisted_at` is RFC 3339. Optional `media` defaults to an
+empty string array and is omitted when empty. The row identifier coalesces
+hydrated messages with canonical projection records; it does not replace
+per-thread envelope sequence identity.
 
 ### 14.4 `EnvelopeTokenUsage`
 
-```json
-{ "input_tokens": 100, "output_tokens": 250 }
-```
-
-Open object — all five fields default to zero and are omitted on the
-wire when zero (Rust `serde(skip_serializing_if = "is_zero_u64")`):
-
-- `input_tokens` (`u64`)
-- `output_tokens` (`u64`)
-- `reasoning_tokens` (`u64`)
-- `cache_read_tokens` (`u64`)
-- `cache_write_tokens` (`u64`)
-
-Future fields require a follow-up UPCR.
+All five unsigned integer counters default to zero and are omitted when zero:
+`input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens`, and
+`cache_write_tokens`. A missing terminal `token_usage` object means the total
+is unknown; it is distinct from an explicitly empty object (known zero).
 
 ### 14.5 `FileRef`
 
-```json
-{ "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
-```
-
-Wire-form file reference carried on `user_message` envelopes (and
-reused as the canonical attachment shape elsewhere — `file_attached`
-embeds the same triple inline). All three fields are required:
-
-- `path` (`string`) — Absolute path the server resolved for the file.
-- `mime` (`string`) — IANA media type (e.g. `image/png`,
-  `text/markdown`).
-- `size_bytes` (`u64`) — Byte size at upload/persist time.
+A user-message file has required `path` (string), `mime` (string), and
+`size_bytes` (unsigned integer). A v2 `file_attached` payload adds its required
+`attachment_owner` object to these fields.
 
 ### 14.6 Hard barrier semantics
 
-Per the M9-γ ADR and the `Envelope` Rust doc-comment, the server MUST
-emit at most one `turn_completed` envelope per `(thread_id, turn)`.
-After that envelope, the projection enforces the barrier with a single
-deterministic rule:
+A `turn_terminal` closes the carrying foreground thread, for EVERY outcome.
+A `background/spawn_complete` closes its own child thread. Further envelopes
+on a closed thread are duplicates or invalid post-terminal output, and must
+not create more assistant/tool content. A new foreground turn uses a new
+thread id. A late task result belongs to its separate child thread, never
+reopens the parent's thread, and does not require another `turn_terminal`.
 
-> After `turn_completed` for `thread_id` T, any subsequent envelope
-> with the same `thread_id` is **DROPPED** by the projection. The
-> projection records the drop in the
-> `octos_projection_post_completion_drop_total` metric. Threads are
-> **NOT reused** — a new turn MUST use a NEW `thread_id`.
+Within an open thread, a missing or non-monotonic sequence is a recovery
+signal. Recover via `session/hydrate` / ledger cursor; a cursor sequence and a
+per-thread sequence are not interchangeable. Retained hydrate replay may be
+compacted; use its `projection_thread_sequences` checkpoints as documented
+below instead of treating a compacted prefix as a fresh complete stream.
 
-This is the canonical wire-level enforcement of the "phantom bubble"
-elimination that motivated M9-γ. The drop is silent at the projection
-layer (the metric is the operational signal); clients do NOT
-rehydrate, restart, or treat the situation as a desync. The same
-behaviour is implemented by the M9-γ-2 projection
-([`octos-web` PR #93](https://github.com/octos-org/octos-web/pull/93)).
+### 14.7 Capability negotiation and hydration
 
-A server that needs to emit a follow-up assistant or tool event
-belonging to a logically separate turn MUST mint a new `thread_id` for
-that turn — the projection treats the new `thread_id` as a brand-new
-chat thread and projects it independently.
+`projection.envelope.v1` is retired. Live and `session/open` replay delivery
+of canonical v2 does not require a projection feature token. Negotiating
+`projection.envelope.v2` still requests the richer `session/hydrate`
+projection fields when its `messages` section is included:
 
-### 14.7 Capability negotiation
+- `replayed_envelopes`: retained background-child envelopes.
+- `replayed_tool_envelopes`: retained tool-card projection envelopes.
+- `replayed_projection_envelopes`: bounded canonical replay through the
+  result cursor. Complete retained threads keep their sequence; compacted
+  threads retain terminals and reconstruct visible content from messages and
+  tool replay.
+- `projection_thread_sequences`: highest included sequence per thread in the
+  atomic ledger snapshot, used to resume live delivery after reconstruction.
+- hydrated message `message_id` / `source`: identity and background provenance
+  derived from retained projection evidence where available.
 
-Clients request `projection.envelope.v1` via the `X-Octos-Ui-Features`
-header at `session/open` time. Servers advertise it through
-`UiProtocolCapabilities.supported_features` (UPCR-2026-007) when they
-emit canonical envelopes; pre-existing connections (TUI, octos-app
-legacy) continue to receive only the legacy notification surface they
-negotiated.
-
-The capability schema version remains `2`; this is an additive feature
-flag and does not bump the schema version.
+These replay arrays contain bare `EnvelopeV2` objects (the result's
+`session_id` supplies routing), not JSON-RPC notifications. The same record
+may occur in multiple arrays; coalesce by `(thread_id, seq)` rather than
+appending duplicate cards. Omitting `messages` or the v2 token omits these
+optional replay fields. Hydrate is bounded by retention and frame limits,
+not an unlimited copy of the event ledger. Capability schema version stays 2.
 
 ## 15. Wave4-A — Adaptive Router + Queue Surface
 
@@ -3116,13 +3475,61 @@ Loop notifications:
 - `loop/fired`: params are `{ "session_id": SessionKey,
   "profile_id"?: string, "loop_id": string, "loop"?: Loop,
   "fire"?: LoopFire, "ok"?: boolean, "status"?: string }`.
-- `loop/completed`: params are `{ "session_id": SessionKey,
-  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
-  "status"?: string, "completed_at_ms"?: number, "result"?: object,
-  "error"?: string }`.
 
 `Agent`, `Goal`, and `Loop` shapes match UPCR-2026-021. String status
 fields are open registries; clients must preserve unknown values. The
 `LoopFire` object mirrors the `loop/fire_now` result object (`queued`,
 optional `duplicate`, `continuation_id`, `dedupe_key`, `reason`,
 `priority`, and `message`).
+
+
+## Automatic workspace peer teams (`peer.workspace_team.v1`)
+
+These methods extend the existing peer execution and durable continuation
+machinery. Team identity is the authenticated profile plus the canonical
+server workspace established by `session/open`. Clients cannot supply a team
+storage path or sender identity. Hosted/staged peer sessions retain their
+existing lifecycle and are not automatically admitted to workspace teams.
+
+All three requests require `session_id`; `profile_id` is optional and follows
+the existing connection/session profile validation. A successful session open
+joins idempotently. A new coding launch chooses a fresh session ID; attaching
+or resuming the same ID creates no additional member.
+
+| Method | Additional request fields | Result |
+| --- | --- | --- |
+| `peer/team/list` | none | Team snapshot; subscribes this connection to updates |
+| `peer/team/leader/set` | `agent_id`, `expected_revision` (integer) | Updated snapshot; stale revisions fail with invalid request |
+| `peer/team/message` | `agent_id` **or** `broadcast:true`, `message`, `occurrence_id` | `{session_id, receipts:[{agent_id,status,error?}]}` |
+
+Snapshot: `{session_id, workspace, revision, leader, members}`. Each member:
+`{agent_id, session_id, role, attached, status, result_turn_id}`. `role` is
+`coordinator` or `member`; `status` is `running` or `idle`; `attached` indicates
+UI presence, not whether background execution is available. Result turn IDs
+are nullable. Clients tolerate additional fields. `peer/team/updated` carries
+the same full snapshot, coalesced on the two-second housekeeping tick.
+Membership/leadership are persisted; presence is process-local. Revision changes
+on membership or leader change. Disconnecting never replaces the coordinator.
+
+Messages are 1–65536 bytes, nonblank. Occurrence IDs are 1–256 bytes. A caller
+must reuse the occurrence ID when retrying an uncertain delivery. Each target
+gets `queued`, `already_queued`, or `failed` (with an error); a queue receipt is
+not a completed task. Broadcast excludes the caller. Targets must be in the
+same team and have opened their workspace in this server incarnation. New
+messages to a member currently opened in another workspace are rejected.
+Queued messages remain scoped to the original workspace and wait for it to
+reopen after restart. No automatic resend of user turns occurs.
+
+Model tools use `peer_list`, `peer_send_input`, and `peer_gather`; coordinator
+turns additionally receive `peer_assign`, which checks the persisted leadership
+epoch at admission. Assignments already admitted can finish after a transfer.
+Messages are attributed synthetic input, never direct human authorization.
+The existing scheduler serializes delivery against active turns and approvals.
+
+`server/instance.get` requires normal authenticated OUP access and is available
+only on `serve --shared --solo --host 127.0.0.1`. It returns
+`{version:1, instance_id, data_dir, cwd, protocol:"peer.workspace_team.v1"}`.
+The corresponding owner-private `shared-instance.json` adds `pid`, `endpoint`
+and `auth_token`. Clients validate the local endpoint and runtime path before
+sending the token, then compare the authenticated returned identity. The
+process-lifetime local credential is separate from dashboard admin rotation.

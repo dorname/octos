@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
- ██████╗  ██████╗████████╗ ██████╗ ███████╗
-██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
-██║   ██║██║        ██║   ██║   ██║███████╗
-██║   ██║██║        ██║   ██║   ██║╚════██║
-╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
- ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-</pre>
+<img src="images/octos-logo.svg" alt="Octos logo" width="128" height="128">
 
 </div>
 
@@ -72,8 +65,12 @@ The Rust workspace lets you compose the parts your application needs:
 | [`octos-memory`](crates/octos-memory) | Persistent memory, episodes, and retrieval |
 | [`octos-llm`](crates/octos-llm) | Provider interfaces, model routing, retries, and failover |
 | [`octos-plugin`](crates/octos-plugin) | Skill and plugin integration |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | Workflow graphs, parallel workers, validation, and result aggregation |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | Native workflow definitions, parallel workers, validation, and result aggregation |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
+
+The CLI/server uses native `search` and `deep_crawl` for research. `run_pipeline`
+and the DOT engine are retired from the runtime; the `octos-pipeline` source
+remains a standalone development crate and is not a runtime dependency.
 
 From a checkout, build the native agent library or a library for a non-Rust host:
 
@@ -384,6 +381,8 @@ The host implements the coordination policy. Octos supplies the execution,
 state, and control primitives that make that policy observable through OUP.
 
 ## Developer documentation
+
+Follow one Calendar request through admission, Tokio tasks, a host tool and its answer in the [OctoSense integration code walkthrough](docs/octosense-integration-walkthrough.md). It also explains app peers, human and system conversations, storage boundaries, and which source revision to read for OctoSense. Contributor guidance is in [AGENTS.md](AGENTS.md).
 
 - [OUP specification](api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md)
 - [OUP types and codecs](crates/octos-core/src/ui_protocol.rs)

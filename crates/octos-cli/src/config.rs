@@ -230,7 +230,8 @@ pub struct Config {
     #[serde(default)]
     pub base_domain: Option<String>,
 
-    /// frps server address for cloud/tenant mode (e.g. "163.192.33.32").
+    /// frps relay server address for cloud/tenant mode (e.g. "relay.example.com").
+    /// No default: tenant setup scripts are refused until this is set.
     /// Also read from FRPS_SERVER env var.
     #[serde(default)]
     pub frps_server: Option<String>,
@@ -633,7 +634,8 @@ pub struct SubProviderConfig {
     #[serde(default)]
     pub model: Option<String>,
     /// Environment variable name holding the API key for this sub-provider.
-    /// If not set, falls back to the default for the provider (e.g. OPENAI_API_KEY).
+    /// Research lanes inherit the matching chat provider's credential reference
+    /// when omitted, then fall back to the provider default (e.g. OPENAI_API_KEY).
     #[serde(default)]
     pub api_key_env: Option<String>,
     /// Custom base URL for this sub-provider.
@@ -1349,6 +1351,67 @@ fn monitor_default_max_restart() -> u32 {
 }
 
 impl Config {
+    /// Resolve a research/subagent lane against the profile's saved chat routes.
+    /// Explicit lane fields win. Otherwise reuse the matching provider's route
+    /// and credential reference, never an unrelated primary provider's key.
+    pub(crate) fn for_sub_provider(&self, lane: &SubProviderConfig) -> Self {
+        let matches_route = |provider: &str, base_url: Option<&str>| {
+            let same_provider = provider.eq_ignore_ascii_case(&lane.provider)
+                || matches!(
+                    (octos_llm::registry::lookup(provider), octos_llm::registry::lookup(&lane.provider)),
+                    (Some(a), Some(b)) if a.name == b.name
+                );
+            same_provider
+                && lane.base_url.as_deref().is_none_or(|requested| {
+                    // An explicitly different endpoint is a separate route: do not
+                    // send a chat route's custom credential to that endpoint.
+                    base_url
+                        .or_else(|| {
+                            octos_llm::registry::lookup(provider).and_then(|p| p.default_base_url)
+                        })
+                        .is_some_and(|saved| {
+                            saved.trim_end_matches('/') == requested.trim_end_matches('/')
+                        })
+                })
+        };
+        let primary_matches = self
+            .provider
+            .as_deref()
+            .is_some_and(|provider| matches_route(provider, self.base_url.as_deref()));
+        let exact_fallback = self.fallback_models.iter().find(|fb| {
+            matches_route(&fb.provider, fb.base_url.as_deref())
+                && lane.model.is_some()
+                && fb.model == lane.model
+        });
+        let (key_env, base_url, api_type) =
+            if primary_matches && (self.model == lane.model || exact_fallback.is_none()) {
+                (
+                    self.api_key_env.clone(),
+                    self.base_url.clone(),
+                    self.api_type.clone(),
+                )
+            } else if let Some(fb) = exact_fallback.or_else(|| {
+                self.fallback_models
+                    .iter()
+                    .find(|fb| matches_route(&fb.provider, fb.base_url.as_deref()))
+            }) {
+                (
+                    fb.api_key_env.clone(),
+                    fb.base_url.clone(),
+                    fb.api_type.clone(),
+                )
+            } else {
+                (None, None, None)
+            };
+        let mut resolved = self.clone();
+        resolved.api_key_env = lane.api_key_env.clone().or(key_env);
+        resolved.provider = Some(lane.provider.clone());
+        resolved.model = lane.model.clone();
+        resolved.base_url = lane.base_url.clone().or(base_url);
+        resolved.api_type = lane.api_type.clone().or(api_type);
+        resolved
+    }
+
     /// Directories to scan for plugins and skill packages with tools.
     ///
     /// Scans deployment-scoped dirs under `project_dir` (typically `octos_home`)
@@ -1740,8 +1803,9 @@ pub fn resolve_config_file_path(
         return home;
     }
     if ctx.is_default {
-        if let Some(home_dir) = dirs::home_dir() {
-            let legacy = home_dir.join(".octos").join("config.json");
+        // Same legacy root as `load_resolved` — one definition (#2722).
+        if let Some(legacy_root) = crate::config_context::legacy_data_dir() {
+            let legacy = legacy_root.join("config.json");
             if legacy != home && legacy.exists() {
                 return legacy;
             }
@@ -1819,17 +1883,15 @@ impl Config {
         //    legacy path differs from config_home (so we don't double-check the
         //    same file). Explicit/tenant contexts never reach here.
         if is_default {
-            // Prefer an explicit `HOME` before the OS profile dir so the legacy
-            // `~/.octos` lookup is testable and user-overridable on Windows,
-            // where `dirs::home_dir()` reads FOLDERID_Profile and ignores
-            // `HOME`/`USERPROFILE`. On Unix `dirs::home_dir()` already consults
-            // `HOME`, so this is behaviour-preserving there.
-            let legacy_home = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .or_else(dirs::home_dir);
-            if let Some(home) = legacy_home {
-                let legacy_config = home.join(".octos").join("config.json");
+            // The legacy root must be the SAME path the resolver's default
+            // `data_dir` and `run_migrations`' `legacy_root` use — otherwise,
+            // on a Windows machine where `$HOME` points somewhere other than
+            // the profile dir, load and migrate would disagree about where
+            // legacy state lives (#2722). `legacy_data_dir()` is that one
+            // definition; on Unix it still consults `$HOME`, so this is
+            // behaviour-preserving there.
+            if let Some(legacy_root) = crate::config_context::legacy_data_dir() {
+                let legacy_config = legacy_root.join("config.json");
                 if legacy_config != home_config && legacy_config.exists() {
                     tracing::info!(
                         path = %legacy_config.display(),
@@ -2255,6 +2317,81 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    fn research_lane_config() -> Config {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider": "openai", "model": "chat-model",
+            "api_key_env": "CHAT_OPENAI_KEY", "base_url": "https://chat.example/v1",
+            "api_type": "responses",
+            "env_vars": {"CHAT_OPENAI_KEY":"chat-key", "SHARED_DEEPSEEK_KEY":"research-key", "LANE_KEY":"lane-key"},
+            "fallback_models": [{
+                "provider":"deepseek", "model":"deepseek-v4-flash",
+                "api_key_env":"SHARED_DEEPSEEK_KEY", "base_url":"https://deepseek.example/v1", "api_type":"openai"
+            }]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        config
+    }
+
+    fn research_lane(provider: &str) -> SubProviderConfig {
+        serde_json::from_value(
+            serde_json::json!({"key":"cheap", "provider":provider, "model":"deepseek-v4-flash"}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn research_lane_inherits_matching_chat_fallback_credentials_and_route() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("deepseek"));
+        assert_eq!(lane.get_api_key("deepseek").unwrap(), "research-key");
+        assert_eq!(
+            lane.base_url.as_deref(),
+            Some("https://deepseek.example/v1")
+        );
+        assert_eq!(lane.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn research_lane_inherits_same_provider_primary_route() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("openai"));
+        assert_eq!(lane.get_api_key("openai").unwrap(), "chat-key");
+        assert_eq!(lane.base_url, config.base_url);
+        assert_eq!(lane.api_type, config.api_type);
+    }
+
+    #[test]
+    fn research_lane_never_borrows_an_unrelated_primary_key() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("gemini"));
+        assert_eq!(lane.api_key_env, None);
+        assert_eq!(lane.base_url, None);
+        assert_eq!(lane.api_type, None);
+    }
+
+    #[test]
+    fn research_lane_explicit_overrides_remain_authoritative() {
+        let config = research_lane_config();
+        let mut lane = research_lane("deepseek");
+        lane.api_key_env = Some("LANE_KEY".into());
+        lane.base_url = Some("https://other.example/v1".into());
+        lane.api_type = Some("anthropic".into());
+        let resolved = config.for_sub_provider(&lane);
+        assert_eq!(resolved.get_api_key("deepseek").unwrap(), "lane-key");
+        assert_eq!(resolved.base_url, lane.base_url);
+        assert_eq!(resolved.api_type, lane.api_type);
+    }
+
+    #[test]
+    fn research_lane_changed_endpoint_does_not_inherit_a_custom_chat_key() {
+        let config = research_lane_config();
+        let mut lane = research_lane("deepseek");
+        lane.base_url = Some("https://other.example/v1".into());
+        let resolved = config.for_sub_provider(&lane);
+        assert_eq!(resolved.api_key_env, None);
+        assert_eq!(resolved.api_type, None);
+    }
+
     /// `QueueMode::Latest` was renamed from `steer` (the word collides with
     /// `turn/steer`, which injects rather than discards). Existing configs
     /// and `/queue steer` must keep working; new ones use `latest`.
@@ -2727,6 +2864,12 @@ mod tests {
 
     /// Gate 2 (back-compat): default install where config_home (XDG) has NO
     /// config but the legacy ~/.octos/config.json does → legacy loads.
+    ///
+    /// Unix-only: the converged legacy root resolves through the OS home
+    /// (`dirs::home_dir()`), which on Windows reads `{FOLDERID_Profile}` and
+    /// ignores `$HOME` — seeding a fake legacy tree under a pivoted `HOME`
+    /// can't redirect the lookup there without writing the real profile.
+    #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
     fn load_default_falls_back_to_legacy_home_octos() {
@@ -2761,6 +2904,12 @@ mod tests {
     }
 
     /// Gate 2 (defaults): default install, neither XDG nor legacy → defaults.
+    ///
+    /// Unix-only: the converged legacy root resolves through the OS home, so
+    /// on Windows the no-config-anywhere assertion would consult the runner's
+    /// real-profile `~/.octos` instead of the pivoted temp dir — an
+    /// environment-dependent outcome (see the sibling back-compat gate).
+    #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
     fn load_default_uses_defaults_when_no_config_anywhere() {
@@ -2786,6 +2935,92 @@ mod tests {
         let (config, path) = result.unwrap();
         assert!(config.provider.is_none());
         assert!(path.is_none());
+    }
+
+    /// #2722 convergence: the legacy root is the shared `legacy_data_dir()`,
+    /// which on Windows resolves the OS profile known-folder and must NOT
+    /// follow an injected `$HOME` — the same definition the resolver's default
+    /// `data_dir` and `run_migrations`' `legacy_root` use. Runs on the Windows
+    /// lane.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn legacy_data_dir_ignores_injected_home_env_on_windows() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pivot = tmp.path();
+        assert_ne!(
+            dirs::home_dir().as_deref(),
+            Some(pivot),
+            "precondition: the real profile dir differs from the pivot target"
+        );
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", pivot) };
+
+        let resolved = crate::config_context::legacy_data_dir();
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_ne!(
+            resolved.as_deref(),
+            Some(pivot),
+            "legacy root must NOT follow the injected $HOME on Windows"
+        );
+        assert_eq!(
+            resolved,
+            dirs::home_dir().map(|home| home.join(".octos")),
+            "legacy root must be the OS profile dir + \".octos\" — the same \
+             definition the resolver and run_migrations use"
+        );
+    }
+
+    /// `resolve_config_file_path` mirrors `load_resolved`'s precedence, so its
+    /// legacy branch must surface the same seeded file the loader would load.
+    ///
+    /// Unix-only, same rationale as the loader gates above.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_config_file_path_finds_seeded_legacy_config() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cwd = fake_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let legacy = fake_home.join(".octos").join("config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"provider":"gemini"}"#).unwrap();
+
+        let ctx = crate::config_context::ConfigContext {
+            config_home: fake_home.join("empty-xdg"),
+            auth_home: fake_home.join("empty-auth"),
+            data_dir: fake_home.join("empty-data"),
+            is_default: true,
+        };
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let resolved = resolve_config_file_path(&cwd, &ctx, None);
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(
+            resolved, legacy,
+            "resolve_config_file_path must target the legacy file the loader reads"
+        );
     }
 
     /// Gate 3 (tenant isolation): explicit context (is_default == false) with

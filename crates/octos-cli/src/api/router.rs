@@ -21,6 +21,7 @@ use super::bilibili;
 use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
+use super::host_managed;
 use super::metrics;
 use super::pairing;
 use super::private_asr;
@@ -117,6 +118,16 @@ pub(crate) fn browser_origin_allowlist(
         .chain(appui_allowed_origins.iter().cloned())
         .filter(|origin| seen.insert(origin.clone()))
         .collect()
+}
+
+/// The browser-origin allowlist for this server. A host-managed server
+/// trusts ONLY the origins its host configured: no legacy/base-domain
+/// entries, no Vite development origins and no per-tenant subdomains.
+pub(crate) fn state_browser_origin_allowlist(state: &AppState) -> Vec<String> {
+    if state.host_managed.is_some() {
+        return state.appui_allowed_origins.clone();
+    }
+    browser_origin_allowlist(state.base_domain.as_deref(), &state.appui_allowed_origins)
 }
 
 /// Validate and normalize one exact browser origin.
@@ -246,10 +257,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // composition is used by both WebSocket gates. CORS intentionally does
     // not call `allow_credentials`: bearer/work-secret auth is an independent
     // layer and must not become ambient browser authority.
-    let allowed_origins: Arc<Vec<String>> = Arc::new(browser_origin_allowlist(
-        state.base_domain.as_deref(),
-        &state.appui_allowed_origins,
-    ));
+    let allowed_origins: Arc<Vec<String>> = Arc::new(state_browser_origin_allowlist(&state));
     let cors = {
         let allowed = allowed_origins.clone();
         CorsLayer::new()
@@ -605,6 +613,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(admin::wechat_qr_poll),
         )
         .route("/api/admin/test-provider", post(admin::test_provider))
+        // `octos serve --host-managed`: the host enables a one-time pairing
+        // code for the EXTERNAL token while its pairing UI is open.
+        .route(
+            "/api/admin/host/pairing",
+            post(host_managed::enable_pairing).delete(host_managed::disable_pairing),
+        )
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
         // First-run setup wizard
@@ -970,6 +984,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(strip_untrusted_profile_id_middleware))
         .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span))
         .layer(cors)
+        // Outermost: a host-managed server answers only requests that name
+        // its loopback listener in `Host` (DNS rebinding). No-op otherwise.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            host_managed::host_header_guard,
+        ))
         .with_state(state)
 }
 
@@ -1140,22 +1160,19 @@ async fn strip_untrusted_profile_id_middleware(
     next.run(req).await
 }
 
-/// Constant-time byte comparison to prevent timing attacks on auth tokens (no length leak).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
-}
+/// Constant-time byte comparison for auth tokens (no length leak) — the
+/// canonical helper lives in octos-core (#2736); re-exported here for the
+/// router's auth callers.
+pub(crate) use octos_core::constant_time_eq;
 
 /// Extract bearer token from request headers or query params.
 ///
 /// Header path: `Authorization: Bearer <token>` — taken byte-for-byte
 /// (HTTP header values are NOT percent-encoded).
+///
+/// Subprotocol path: `Sec-WebSocket-Protocol: octos-ui, octos.bearer.<token>`
+/// — how a browser WebSocket sends a bearer without putting it in the URL.
+/// Preferred over the query path.
 ///
 /// Query path: `?token=<value>` or `?_token=<value>` — used by SSE,
 /// `EventSource`, `<img src>`, and WebSocket clients that cannot set
@@ -1179,6 +1196,15 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
         .and_then(|v: &HeaderValue| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
+    if !header_token.is_empty() {
+        return header_token.to_string();
+    }
+
+    // Then a browser WebSocket's bearer subprotocol, which keeps the token
+    // out of the URL (see [`bearer_subprotocol_token`]).
+    if let Some(token) = bearer_subprotocol_token(req.headers()) {
+        return token.to_string();
+    }
 
     // Fall back to ?token= or ?_token= query param (for SSE / EventSource / img tags)
     let query_token = req
@@ -1192,18 +1218,38 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
         })
         .unwrap_or("");
 
-    if !header_token.is_empty() {
-        header_token.to_string()
-    } else {
-        // RFC 3986 percent-decode (NOT form-decode — `+` stays literal).
-        // `decode_utf8_lossy` substitutes U+FFFD for invalid UTF-8
-        // sequences, which keeps the function infallible; downstream
-        // constant-time comparison against stored ASCII tokens still
-        // fails on garbage input.
-        percent_encoding::percent_decode_str(query_token)
-            .decode_utf8_lossy()
-            .into_owned()
-    }
+    // RFC 3986 percent-decode (NOT form-decode — `+` stays literal).
+    // `decode_utf8_lossy` substitutes U+FFFD for invalid UTF-8
+    // sequences, which keeps the function infallible; downstream
+    // constant-time comparison against stored ASCII tokens still
+    // fails on garbage input.
+    percent_encoding::percent_decode_str(query_token)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// The UI Protocol WebSocket subprotocol a browser offers beside its bearer
+/// entry. The server selects it, so the token entry is never echoed.
+pub const UI_WS_SUBPROTOCOL: &str = "octos-ui";
+
+/// Prefix of the bearer entry in `Sec-WebSocket-Protocol`.
+pub const BEARER_SUBPROTOCOL_PREFIX: &str = "octos.bearer.";
+
+/// Token from `Sec-WebSocket-Protocol: octos-ui, octos.bearer.<token>`.
+///
+/// Browsers cannot set `Authorization` on a WebSocket, and `?token=` puts
+/// the credential in the URL (history, proxies, logs). A subprotocol entry is
+/// a header. The client must also offer [`UI_WS_SUBPROTOCOL`]: the server
+/// selects that one, and a browser fails a handshake whose server picks none
+/// of the offered protocols.
+pub(crate) fn bearer_subprotocol_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get_all(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|entry| entry.trim().strip_prefix(BEARER_SUBPROTOCOL_PREFIX))
+        .filter(|token| !token.is_empty())
 }
 
 /// Crate-public wrapper around [`resolve_identity`].
@@ -1221,8 +1267,25 @@ pub(crate) async fn resolve_identity_public(state: &AppState, token: &str) -> Op
 
 /// Resolve token to an AuthIdentity.
 async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity> {
+    // A host-managed server knows exactly two credentials (see
+    // `host_managed`): no admin-token store, test token or user sessions.
+    if let Some(host_managed) = &state.host_managed {
+        return host_managed.resolve(token);
+    }
     if token.is_empty() {
         return None;
+    }
+
+    // A --shared solo listener is bound to loopback and publishes this
+    // process-lifetime credential only in its owner-private discovery file.
+    // It is independent of the dashboard's rotated admin credential.
+    if state
+        .ui_protocol
+        .shared_instance_token
+        .get()
+        .is_some_and(|expected| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+    {
+        return Some(AuthIdentity::Admin);
     }
 
     // 1. Check hashed admin-token store. When the file is present, it is
@@ -1312,8 +1375,24 @@ async fn user_auth_middleware(
 
     // 1. Try token-based auth (admin token or OTP session)
     if let Some(identity) = resolve_identity(&state, &token).await {
+        // Host-managed: the external token opens the UI Protocol socket and
+        // nothing else (no uploads, files, profile or task REST routes).
+        if state.host_managed.is_some()
+            && host_managed::is_external(&state, Some(&identity))
+            && uri.path() != host_managed::EXTERNAL_ROUTE
+        {
+            log_user_auth_rejection(&method, request_log_path(&req), &token);
+            return Err(StatusCode::FORBIDDEN);
+        }
         req.extensions_mut().insert(identity);
         return Ok(next.run(req).await);
+    }
+
+    // Host-managed: no trusted-proxy profile header. Any local process can
+    // reach loopback, so a loopback hop proves nothing here.
+    if state.host_managed.is_some() {
+        log_user_auth_rejection(&method, request_log_path(&req), &token);
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
@@ -1513,41 +1592,50 @@ mod tests {
             // registered by a no-subscriber sibling test first (the JustOne
             // rebuilder only asks the current thread's default), leaving a
             // stale NEVER in the interest cache. Force a rebuild so the
-            // victim's DEBUG span is re-asked under this subscriber.
-            tracing_core::callsite::rebuild_interest_cache();
-            runtime.block_on(async {
-                for uri in [
-                    "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
-                    "/api/preview-signed/synthetic-preview-marker/assets/index.html",
-                    "/api/register/setup-script/test-user/synthetic-setup-marker",
-                    "/v1/session_ingress/ws/synthetic-session?token=synthetic-ingress-marker",
-                ] {
+            // victim's DEBUG span is re-asked under this subscriber. A sibling
+            // that is mid-registration while we rebuild can still store NEVER
+            // after us, so re-ask and replay (bounded) until the span shows;
+            // the no-credential assertions below cover every attempt's logs.
+            for _attempt in 0..3 {
+                tracing_core::callsite::rebuild_interest_cache();
+                runtime.block_on(async {
+                    for uri in [
+                        "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
+                        "/api/preview-signed/synthetic-preview-marker/assets/index.html",
+                        "/api/register/setup-script/test-user/synthetic-setup-marker",
+                        "/v1/session_ingress/ws/synthetic-session?token=synthetic-ingress-marker",
+                    ] {
+                        let response = app
+                            .clone()
+                            .oneshot(
+                                Request::builder()
+                                    .method(Method::GET)
+                                    .uri(uri)
+                                    .body(axum::body::Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    }
+
                     let response = app
                         .clone()
                         .oneshot(
                             Request::builder()
                                 .method(Method::GET)
-                                .uri(uri)
+                                .uri("/synthetic-unmatched-marker")
                                 .body(axum::body::Body::empty())
                                 .unwrap(),
                         )
                         .await
                         .unwrap();
-                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                });
+                if captured.as_string().contains("path=/api/ui-protocol/ws") {
+                    break;
                 }
-
-                let response = app
-                    .oneshot(
-                        Request::builder()
-                            .method(Method::GET)
-                            .uri("/synthetic-unmatched-marker")
-                            .body(axum::body::Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            });
+            }
         });
 
         let logs = captured.as_string();
@@ -1562,31 +1650,6 @@ mod tests {
         assert!(!logs.contains("synthetic-ingress-marker"));
         assert!(!logs.contains("synthetic-session"));
         assert!(!logs.contains("synthetic-unmatched-marker"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_equal() {
-        assert!(constant_time_eq(b"secret-token", b"secret-token"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_not_equal() {
-        assert!(!constant_time_eq(b"secret-token", b"wrong-token!"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_lengths() {
-        assert!(!constant_time_eq(b"short", b"longer-string"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_empty() {
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn test_constant_time_eq_single_bit_diff() {
-        assert!(!constant_time_eq(b"\x00", b"\x01"));
     }
 
     #[test]
@@ -1806,6 +1869,27 @@ mod tests {
         ));
         // Bootstrap token must NOT work once rotated.
         assert!(resolve_identity(&state, "boot").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_local_credential_survives_admin_rotation_without_restoring_bootstrap() {
+        use crate::admin_token_store::{AdminTokenRecord, AdminTokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        AdminTokenStore::new(dir.path())
+            .save(&AdminTokenRecord::from_plaintext("rotated"))
+            .unwrap();
+        let state = identity_state(dir.path(), Some("boot"));
+        state
+            .ui_protocol
+            .shared_instance_token
+            .set("local-only".into())
+            .unwrap();
+        assert!(matches!(
+            resolve_identity(&state, "local-only").await,
+            Some(AuthIdentity::Admin)
+        ));
+        assert!(resolve_identity(&state, "boot").await.is_none());
+        assert!(resolve_identity(&state, "wrong").await.is_none());
     }
 
     #[tokio::test]

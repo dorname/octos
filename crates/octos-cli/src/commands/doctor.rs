@@ -39,10 +39,10 @@
 //! - `Skills` / `MCP` / `Channels`: discovered skill manifests, MCP stdio
 //!   command PATH-resolution, configured gateway channels.
 //! - `Sessions` (Stage 4): a CONTENT-FREE inventory per store — counts,
-//!   total size, newest/oldest age, transcripts near octos-bus's 10 MiB
-//!   write cap, and transcripts whose final line no longer parses (the
-//!   crash-mid-write signature that breaks resume). The tail probe parses
-//!   and immediately discards; no transcript content reaches the report.
+//!   total size, newest/oldest age, and transcripts whose final line no
+//!   longer parses (the crash-mid-write signature that breaks resume). The
+//!   tail probe parses and immediately discards; no transcript content
+//!   reaches the report.
 //!
 //! Stage-3 contract: octos state is never created, migrated, or modified, and
 //! no secret value reaches the report or the JSON bundle (env var NAMES only;
@@ -96,9 +96,6 @@ const DISK_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Hard cap on filesystem entries visited by the disk-usage walk so a
 /// pathological tree cannot stall doctor.
 const DISK_WALK_MAX_ENTRIES: usize = 100_000;
-/// Sessions at ≥80% of `octos-bus`'s `MAX_SESSION_FILE_SIZE` (10 MiB) get
-/// flagged before writes start failing at the cap.
-const SESSION_NEAR_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Bytes read from a transcript's TAIL for the content-free integrity probe
 /// (parse the final line, discard it). Bounds I/O per session file.
 const SESSION_TAIL_PROBE_BYTES: u64 = 64 * 1024;
@@ -242,6 +239,14 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
     report.push(shadow_check(&located, &method, &spec));
 
+    // --- Embedded web UI bundles --------------------------------------------
+    // What this binary can actually serve at /app, /admin, and /swarm. The
+    // SPAs are embedded from gitignored static/ trees, so a source-clone
+    // build without the scripts/build-*.sh step 503s at every UI route
+    // (#2384) — surface that before the first serve.
+    #[cfg(feature = "api")]
+    report.push(ui_bundles_check());
+
     // --- Installations (every octos + octoscode copy, with versions) --------
     // Parity with `octoscode doctor`'s Installations section: enumerate BOTH
     // binaries across PATH + the known install dirs so duplicate / mismatched
@@ -330,10 +335,79 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
             .iter()
             .copied()
             .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
-            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
+            // `context.state.v1` is the same kind of strict opt-in: it adds
+            // a notification legacy clients cannot decode, so the baseline
+            // never claims it.
+            .filter(|feature| {
+                *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            }),
     ));
 
     Ok(report)
+}
+
+/// What this binary can serve at the embedded UI routes (#2384): pass with
+/// the available bundles, warn naming the missing ones' build scripts.
+#[cfg(feature = "api")]
+fn ui_bundles_check() -> Check {
+    ui_bundles_check_from(
+        &crate::api::static_files::embedded_ui_bundles(),
+        cfg!(debug_assertions),
+    )
+}
+
+#[cfg(feature = "api")]
+fn ui_bundles_check_from(
+    bundles: &[crate::api::static_files::UiBundleStatus],
+    reads_static_from_disk: bool,
+) -> Check {
+    let missing: Vec<&crate::api::static_files::UiBundleStatus> =
+        bundles.iter().filter(|bundle| !bundle.embedded).collect();
+    if missing.is_empty() {
+        let present: Vec<&str> = bundles
+            .iter()
+            .filter(|bundle| bundle.embedded)
+            .map(|bundle| bundle.label)
+            .collect();
+        return Check::pass(CAT_BINARY, "web UI bundles", present.join(", "))
+            .with_value(embed_mode_value(reads_static_from_disk));
+    }
+    let scripts = missing
+        .iter()
+        .map(|bundle| bundle.build_script)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rebuild = if reads_static_from_disk {
+        // A debug binary reads `static/` from disk at serve time — the
+        // scripts' output is picked up without recompiling.
+        " (debug build reads static/ from disk; no rebuild needed)"
+    } else {
+        ", then rebuild octos-cli"
+    };
+    Check::warn(
+        CAT_BINARY,
+        "web UI bundles",
+        format!(
+            "not available: {} — those UI routes serve 503",
+            missing
+                .iter()
+                .map(|bundle| bundle.label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("run {scripts}{rebuild}"),
+    )
+    .with_value(embed_mode_value(reads_static_from_disk))
+}
+
+#[cfg(feature = "api")]
+fn embed_mode_value(reads_static_from_disk: bool) -> &'static str {
+    if reads_static_from_disk {
+        "debug build: static/ read from disk at runtime"
+    } else {
+        "release build: bundles compiled in"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,9 +1491,6 @@ struct SessionInventory {
     bytes: u64,
     newest_age_secs: Option<u64>,
     oldest_age_secs: Option<u64>,
-    /// Session keys (file stems) whose size is ≥ [`SESSION_NEAR_CAP_BYTES`]
-    /// — writes fail outright at octos-bus's 10 MiB cap.
-    near_cap: Vec<String>,
     /// Session keys whose final line does not parse as JSON (a truncated /
     /// corrupt tail — the usual crash-mid-write signature).
     corrupt_tail: Vec<String>,
@@ -1488,9 +1559,8 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
         // Skip SIDECARS (`<key>.tasks.jsonl` task ledgers, and any future
         // dotted suffix): session keys are fully percent-encoded
         // (`encode_path_component` encodes `.` as %2E), so a literal dot in
-        // the stem can only be a sidecar — not a transcript, not governed by
-        // the 10 MiB session cap, and it must not consume the scan budget or
-        // trigger resume/fork advice (codex r2).
+        // the stem can only be a sidecar — not a transcript, and it must not
+        // consume the scan budget or trigger resume advice (codex r2).
         if path
             .file_stem()
             .is_some_and(|stem| stem.to_string_lossy().contains('.'))
@@ -1529,9 +1599,6 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if meta.len() >= SESSION_NEAR_CAP_BYTES {
-            inventory.near_cap.push(stem.clone());
-        }
         if meta.len() > 0 && session_tail_parses(&path, meta.len()) == Some(false) {
             inventory.corrupt_tail.push(stem);
         }
@@ -1622,8 +1689,8 @@ fn humanize_age(secs: u64) -> String {
 /// One inventory row per session store: the serve-level store at the data-dir
 /// root plus each profile's store (same roots the disk-usage walk covers;
 /// per-project `sessions_in_cwd` stores live in unknown project dirs and stay
-/// out of scope). Rows are informational; unparseable tails and near-cap
-/// transcripts WARN with the offending session keys (bounded).
+/// out of scope). Rows are informational; unparseable tails WARN with the
+/// offending session keys (bounded).
 fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut stores: Vec<(String, PathBuf)> = vec![("server".to_string(), data_dir.to_path_buf())];
@@ -1681,7 +1748,7 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
             inventory.files,
             human_bytes(inventory.bytes)
         );
-        if inventory.corrupt_tail.is_empty() && inventory.near_cap.is_empty() {
+        if inventory.corrupt_tail.is_empty() {
             checks.push(Check::pass(
                 CAT_SESSIONS,
                 format!("sessions ({label})"),
@@ -1701,13 +1768,6 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
                     names.join(", ")
                 ));
                 fixes.push("unparseable tails break resume — back up + remove those files");
-            }
-            if !inventory.near_cap.is_empty() {
-                problems.push(format!(
-                    "{} near the 10 MiB session cap",
-                    inventory.near_cap.len()
-                ));
-                fixes.push("fork near-cap sessions (`/new`) before writes start failing");
             }
             checks.push(Check::warn(
                 CAT_SESSIONS,
@@ -2143,6 +2203,17 @@ mod tests {
         assert_eq!(skew.status, octos_diagnostics::CheckStatus::Pass);
         // Glyphs are present in the rendered output.
         assert!(text.contains("[✓]"));
+        // The #2384 bundle check is wired into the report — asserted for
+        // presence only, since the status depends on the checkout's
+        // (gitignored) static/ tree. The wiring is `#[cfg(feature = "api")]`
+        // (a no-api binary serves no UI routes), so the presence guarantee
+        // only holds in api builds; the oup-minimal lane runs this suite
+        // with --no-default-features.
+        #[cfg(feature = "api")]
+        assert!(
+            report.checks.iter().any(|c| c.name == "web UI bundles"),
+            "embedded web UI bundle check must be part of the report"
+        );
     }
 
     // ---- Stage 3 ----
@@ -2561,7 +2632,9 @@ mod tests {
     }
 
     #[test]
-    fn should_flag_sessions_near_the_write_cap() {
+    fn should_not_flag_a_large_session_now_that_files_roll_into_segments() {
+        // Session files used to hit a hard 10 MiB cap; they now roll into
+        // segments, so size alone is not a problem worth a warning.
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().to_path_buf();
         let dir = data_dir.join("sessions");
@@ -2581,12 +2654,8 @@ mod tests {
 
         let checks = session_checks(&data_dir, &[]);
         let row = &checks[0];
-        assert_eq!(row.status, CheckStatus::Warn);
-        assert!(
-            row.detail.contains("1 near the 10 MiB session cap"),
-            "{}",
-            row.detail
-        );
+        assert_eq!(row.status, CheckStatus::Pass, "{}", row.detail);
+        assert!(!row.detail.contains("cap"), "{}", row.detail);
     }
 
     #[test]
@@ -2679,7 +2748,7 @@ mod tests {
     #[test]
     fn should_skip_task_ledger_sidecars() {
         // `<key>.tasks.jsonl` sidecars are task ledgers, not transcripts —
-        // they must not count, consume budget, or trigger resume/fork advice
+        // they must not count, consume budget, or trigger resume advice
         // (session keys are percent-encoded, so a dotted stem = sidecar).
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("sessions");
@@ -3002,5 +3071,110 @@ mod tests {
         assert!(is_local_server_family("vllm"));
         assert!(!is_local_server_family("anthropic"));
         assert!(!is_local_server_family("openai"));
+    }
+
+    #[cfg(feature = "api")]
+    fn ui_bundle(
+        label: &'static str,
+        script: &'static str,
+        embedded: bool,
+    ) -> crate::api::static_files::UiBundleStatus {
+        crate::api::static_files::UiBundleStatus {
+            label,
+            build_script: script,
+            embedded,
+        }
+    }
+
+    /// #2384: a fresh-clone build has none of the gitignored SPA bundles;
+    /// the check must warn and hand out every missing bundle's build script.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_with_build_scripts_when_no_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.name, "web UI bundles");
+        assert!(check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("build-web-app.sh"), "{fix}");
+        assert!(fix.contains("build-dashboard.sh"), "{fix}");
+        assert!(fix.contains("build-swarm-app.sh"), "{fix}");
+        assert!(fix.contains(", then rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("release build: bundles compiled in")
+        );
+    }
+
+    /// A build that ran some (not all) bundle scripts warns only about the
+    /// missing ones — the available bundles must not be reported as absent.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_only_for_missing_bundles_when_partially_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(!check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("run ./scripts/build-swarm-app.sh, then rebuild octos-cli")
+        );
+    }
+
+    /// A fully bundled binary passes with the embedded routes and no fix line.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_pass_when_every_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", true),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "web (/app), admin (/admin), swarm (/swarm)");
+        assert!(check.fix.is_none());
+    }
+
+    /// A debug binary reads `static/` from disk at serve time, so the fix
+    /// line must not send the operator through a rebuild — and the report
+    /// must disclose which embed mode produced the verdict.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_skip_rebuild_in_fix_and_disclose_mode_for_debug_builds() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            true,
+        );
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("no rebuild needed"), "{fix}");
+        assert!(!fix.contains("rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("debug build: static/ read from disk at runtime")
+        );
     }
 }

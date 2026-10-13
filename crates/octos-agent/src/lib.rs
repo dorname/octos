@@ -18,7 +18,6 @@ pub mod bootstrap;
 pub mod bridge;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
-pub mod bundled_pipelines;
 pub mod compaction;
 pub mod compaction_tiered;
 pub mod cost_ledger;
@@ -59,6 +58,7 @@ pub mod subagent_output;
 pub mod subagent_summary;
 mod subprocess_env;
 pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_env};
+pub(crate) mod private_git;
 pub mod summarizer;
 pub mod swarm;
 pub mod task_supervisor;
@@ -88,8 +88,8 @@ pub use abi_schema::{
 pub use agent::{
     Agent, AgentConfig, AssistantSegmentProvenance, ConversationResponse,
     DEFAULT_SESSION_TIMEOUT_SECS, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT,
-    IncompleteResponseError, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage, PromptSegmentProvider,
-    RealtimeController, TASK_REPORTER, TokenTracker,
+    FailedConversationProgress, IncompleteResponseError, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage,
+    PromptSegmentProvider, RealtimeController, TASK_REPORTER, TokenTracker,
     loop_state::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
@@ -173,7 +173,7 @@ pub use role_template::{
     ROLE_TEST_WORKER, RoleTemplate, RoleTemplateSummary, SANDBOX_AUTO, SANDBOX_NONE,
     UnknownModelPreference,
 };
-pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, SandboxReadOnlyView, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
@@ -210,16 +210,19 @@ pub use tools::{
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
     DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
-    GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool,
-    McpAgentBackend, McpAgentBackendConfig, MemoryLoadTool, MemoryNoteTool, MemorySearchTool,
-    MessageTool, MofaDescribeContentTypeTool, MofaMakeTool, PeerCloseCallback, PeerCloseTool,
+    GlobTool, GrepTool, HostRoutedTool, HostToolAudit, HostToolCall, HostToolCallOutcome,
+    HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, HttpMcpAgent,
+    ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool, McpAgentBackend,
+    McpAgentBackendConfig, MemoryLoadTool, MemoryNoteTool, MemorySearchTool, MessageTool,
+    MofaDescribeContentTypeTool, MofaMakeTool, OccurrenceClaim, PeerCloseCallback, PeerCloseTool,
     PeerGatherCallback, PeerGatherTool, PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged,
     PeerHandoffTool, PeerListCallback, PeerListTool, PeerRespondAnswer, PeerRespondCallback,
-    PeerRespondRequest, PeerRespondTool, PeerSendInputCallback, PeerSendInputRequest,
-    PeerSendInputTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool, RecallMemoryTool,
-    RecordMemoryUseTool, RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool,
-    SharedBackend, ShellTool, SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool,
-    ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy,
+    PeerRespondRequest, PeerRespondTool, PeerSendInputAnswerCallback, PeerSendInputCallback,
+    PeerSendInputDelivery, PeerSendInputRefusal, PeerSendInputRequest, PeerSendInputTool,
+    PolicyDecision, ReadFileTool, ReadTaskOutputTool, RecallMemoryTool, RecordMemoryUseTool,
+    RobotToolRegistry, SaveMemoryTool, SendAppCardTool, SendFileTool, SharedBackend, ShellTool,
+    SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolOrigin, ToolPolicy,
     ToolRegistry, ToolResult, TurnAttachmentContext, UserQuestionOutcome, UserQuestionRequest,
     UserQuestionRequester, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},

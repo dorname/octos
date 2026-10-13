@@ -13,9 +13,7 @@ use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::budget::BudgetStop;
-use super::convergence::{
-    CheckpointReason, ConvergenceController, active_tokens, is_checkpoint_context,
-};
+use super::convergence::{CheckpointReason, ConvergenceController, active_tokens};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
@@ -43,6 +41,11 @@ const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the t
 /// nothing usable (#2174). Unlike the truncation-continuation prompt, there is
 /// nothing to "continue from", so this asks for a single concise next action.
 const MAX_TOKENS_EMPTY_RECOVERY_PROMPT: &str = "Your previous response reached the output token limit without producing any text or tool call. Respond concisely: take your single next action now — call one tool or give a brief answer. Do not repeat yourself.";
+/// Marker `build_result` prefixes when the provider hit max_output_tokens
+/// mid-answer. The budget-grace path re-applies it too: its forced-terminal
+/// stop reason would otherwise hide the truncation from `build_result`.
+const PARTIAL_OUTPUT_MARKER: &str =
+    "[partial output: max_output_tokens reached before a final answer]";
 /// Terminal message when empty-`MaxTokens` recovery is exhausted. Surfaced
 /// instead of an empty success so the turn never silently dead-ends (#2174).
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
@@ -77,6 +80,31 @@ impl TurnOutputLog {
             self.push(message);
         }
     }
+}
+
+fn attach_conversation_progress(
+    error: eyre::Report,
+    turn: &LoopTurnState,
+    log: &TurnOutputLog,
+) -> eyre::Report {
+    let message = error.to_string();
+    let partial = ConversationResponse {
+        content: String::new(),
+        reasoning_content: None,
+        provider_metadata: None,
+        token_usage: turn.total_usage().clone(),
+        estimated_spend_usd: turn.priced_spend(),
+        files_modified: Vec::new(),
+        files_to_send: Vec::new(),
+        streamed: false,
+        messages: log.messages.clone(),
+        assistant_segments: log.provenance.clone(),
+        tool_results: Vec::new(),
+        synthesized_from_spawn_only: false,
+        pending_approval: None,
+    };
+    attach_partial_usage(error, turn.total_usage().clone())
+        .wrap_err(super::FailedConversationProgress { partial, message })
 }
 
 /// Prepended to the user content on a live video-call turn so the model treats
@@ -761,7 +789,18 @@ impl Agent {
     /// Build a `ChatConfig` with optional `chat_max_tokens` / `chat_temperature`
     /// overrides from `AgentConfig`. Delegates to [`build_chat_config`].
     fn chat_config(&self) -> ChatConfig {
-        build_chat_config(&self.config, self.is_local_provider())
+        let mut config = build_chat_config(&self.config, self.is_local_provider());
+        // #2480: media paths a tool validated are re-checked when the request
+        // is built, so the providers need the same workspace root the file
+        // tools enforced their symlink-ancestor walk against. Host-scope
+        // reads skipped that walk at tool time and must skip it here too.
+        if !self.tools.filesystem_scope().is_host() {
+            config.media_scope_root = self
+                .tools
+                .workspace_root()
+                .map(std::path::Path::to_path_buf);
+        }
+        config
     }
 
     /// True when the active LLM provider is the built-in local/self-hosted
@@ -844,11 +883,16 @@ impl Agent {
         }
     }
 
-    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
-    /// `turn.rs:304-318`). Read in the EndTurn arm so
-    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
-    /// landing after the model's final answer forces one more round.
-    fn steer_input_pending(&self) -> bool {
+    /// Wake a pending model request when new user input arrives.
+    pub(super) async fn wait_for_steer_input(&self) {
+        match self.steer_buffer.as_ref() {
+            Some(buffer) => buffer.wait_for_input().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Whether user input needs another model round or should defer tool admission.
+    pub(super) fn steer_input_pending(&self) -> bool {
         self.steer_buffer
             .as_ref()
             .is_some_and(|buffer| !buffer.is_empty())
@@ -1225,26 +1269,23 @@ impl Agent {
                     // Codex-parity steer drain (turn.rs:225-233): fold any
                     // mid-turn injected user inputs into the conversation at
                     // the TOP of each iteration, BEFORE the next LLM call,
-                    // in FIFO order. Steering never interrupts an in-flight
-                    // round — inputs buffered while the model streams are
-                    // picked up here, after the previous round's tool
-                    // results are recorded.
+                    // in FIFO order. New input wakes sampling and defers
+                    // unstarted tools; already-running tools settle first.
+                    // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
-                    // The previous checkpoint summary is transient working
-                    // memory, not durable conversation history. Remove it
-                    // before prompt repair/compaction and re-inject only the
-                    // controller's latest summary below.
-                    messages.retain(|message| {
-                        !(message.role == MessageRole::User
-                            && is_checkpoint_context(&message.content))
-                    });
+                    // Reflections stay at their original chronological position.
+                    // Re-appending an old checkpoint as the newest row makes
+                    // completed work look pending and invalidates prefix reuse.
                     // #1691 grace: when the budget stop is converted into one
                     // FINAL action call, that call must be the model's, not a
                     // convergence reflection (which would `continue` straight
                     // back into the exhausted budget and end the turn without
                     // the deliverable the grace exists for).
                     let mut grace_iteration = false;
+                    // #2359: the canned message, kept as the final answer of
+                    // last resort when the grace call returns no text at all.
+                    let mut grace_stop_message = String::new();
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -1274,12 +1315,18 @@ impl Agent {
                         // the FINAL iteration. Tell the model to deliver now
                         // rather than start new work, so a grace call is not
                         // wasted on more exploration (the mini4 failure mode).
+                        // #2359: the call also runs tools-disabled — a tool
+                        // result here could never be summarized, because the
+                        // budget is exhausted and the next response would be
+                        // the canned budget-stop message.
                         messages.push(Message::user(
                             "[budget notice] This is your FINAL iteration — the run stops \
-                             immediately after it. Do NOT start new exploration; write your \
-                             deliverable (write_file / edit_file) or give your final answer \
-                             in THIS response.",
+                             immediately after it, and tools are disabled in this response. \
+                             Do NOT start new work; give your final answer NOW: what you \
+                             completed and validated, which files you changed, and what \
+                             remains.",
                         ));
+                        grace_stop_message = stop.message();
                         grace_iteration = true;
                     }
 
@@ -1311,14 +1358,21 @@ impl Agent {
                     // #1969: a heartbeat interrupt/stall is an error EXIT too —
                     // carry the turn's accumulated usage out with it.
                     if let Err(e) = self.beat_heartbeat(iteration) {
-                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                     }
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
                     // RFC-0 (#1289): LRU tool deferral removed — every enabled
                     // tool is emitted every turn (full schema).
-                    let tools_spec = self.tools.specs();
+                    let mut tools_spec = self.tools.specs();
+                    // #2359: the grace iteration is the turn's terminal
+                    // response, so it runs tools-disabled. A provider that
+                    // ignores the empty slice gets its calls dropped below
+                    // (the same convention as the reflection round above).
+                    if grace_iteration {
+                        tools_spec.clear();
+                    }
                     // Harness M6.3: run preflight compaction before the first
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
@@ -1374,7 +1428,7 @@ impl Agent {
                     // content"): a System row here would rewrite the stable
                     // prefix at every checkpoint (Anthropic hoists all System
                     // rows into `system`; exact-prefix caches key on it).
-                    if let Some(context) = convergence.context_message() {
+                    if let Some(context) = convergence.take_context_message() {
                         messages.push(Message::user(context));
                     }
                     let total_usage = turn.total_usage().clone();
@@ -1560,7 +1614,7 @@ impl Agent {
                                 if let Some(sink) = &self.voice_failure_sink {
                                     let _ = sink.send(crate::TurnFailure::EmptyResponse);
                                 }
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
@@ -1586,7 +1640,7 @@ impl Agent {
                                 Ok(r) => r,
                                 Err(e) => {
                                     if self.failfast_llm_bail(&e) {
-                                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                                     }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -1595,7 +1649,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             }
@@ -1674,7 +1728,7 @@ impl Agent {
                                 ));
                             }
                             if self.failfast_llm_bail(&e) {
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
@@ -1683,11 +1737,27 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                             }
                         }
                     };
                     Self::normalize_inline_invokes(&mut response);
+                    // #2359: the grace call cannot continue the loop — the
+                    // budget is exhausted, so executing tool calls here would
+                    // only buy another canned budget-stop message. Whatever
+                    // text the model produced IS the final answer; calls a
+                    // provider emitted despite the empty tool slice are
+                    // dropped, exactly like the reflection round above.
+                    if grace_iteration {
+                        response.stop_reason = StopReason::EndTurn;
+                        if response
+                            .content
+                            .as_deref()
+                            .is_none_or(|content| content.trim().is_empty())
+                        {
+                            response.content = Some(std::mem::take(&mut grace_stop_message));
+                        }
+                    }
                     self.reporter().report(ProgressEvent::Response {
                         content: response.content.clone().unwrap_or_default(),
                         iteration,
@@ -1742,19 +1812,6 @@ impl Agent {
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
                             let content = response.content.clone().unwrap_or_default();
-                            if !self
-                                .verifier_allows_termination(
-                                    &mut messages,
-                                    turn_ledger.as_mut(),
-                                    &content,
-                                    iteration,
-                                    &mut turn,
-                                    tracker,
-                                )
-                                .await?
-                            {
-                                continue;
-                            }
                             // Codex-parity follow-up gate (turn.rs:304-318):
                             // `needs_follow_up = model_needs_follow_up ||
                             // has_pending_input`. The model produced its
@@ -1778,6 +1835,25 @@ impl Agent {
                                      instead of terminating the turn"
                                 );
                                 continue 'agent_loop;
+                            }
+                            // #2359: the grace call is exempt — a veto here
+                            // would only convert the synthesis into the canned
+                            // budget-stop message, with no budget left to act
+                            // on the verdict (same reasoning as the
+                            // convergence-checkpoint exemption above).
+                            if !grace_iteration
+                                && !self
+                                    .verifier_allows_termination(
+                                        &mut messages,
+                                        turn_ledger.as_mut(),
+                                        &content,
+                                        iteration,
+                                        &mut turn,
+                                        tracker,
+                                    )
+                                    .await?
+                            {
+                                continue;
                             }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
@@ -2105,7 +2181,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             };
@@ -2189,7 +2265,7 @@ impl Agent {
                                     &mut messages,
                                 ) {
                                     LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                    LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                 }
                             }
 
@@ -2611,6 +2687,16 @@ impl Agent {
             let config = self.chat_config();
 
             loop {
+                // #1691 grace: the same conversion the conversation loop does —
+                // one FINAL call past the budget, which #2359 keeps
+                // tools-disabled so its result can always be summarized.
+                let mut grace_iteration = false;
+                // #2359: the canned output, kept as the final answer of last
+                // resort when the grace call returns no text at all.
+                let mut grace_stop_message = String::new();
+                // Set when the provider truncated the grace answer; the
+                // forced-terminal stop reason below would otherwise hide it.
+                let mut grace_truncated = false;
                 if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                     let stop_iteration = turn.iteration();
                     if !self.try_budget_grace_call(
@@ -2648,6 +2734,18 @@ impl Agent {
                             token_usage: turn.total_usage().clone(),
                         });
                     }
+                    // #1691/#2359: grace was granted — this is the FINAL
+                    // iteration, and it runs tools-disabled (see the
+                    // conversation loop). Tell the model what the call is for.
+                    messages.push(Message::user(
+                        "[budget notice] This is your FINAL iteration — the run stops \
+                         immediately after it, and tools are disabled in this response. \
+                         Do NOT start new work; give your final answer NOW: what you \
+                         completed and validated, which files you changed, and what \
+                         remains.",
+                    ));
+                    grace_stop_message = stop.message();
+                    grace_iteration = true;
                 }
 
                 let iteration = turn.advance_iteration();
@@ -2663,7 +2761,12 @@ impl Agent {
 
                 // RFC-0 (#1289): LRU tool deferral removed — every enabled
                 // tool is emitted every turn (full schema).
-                let tools_spec = self.tools.specs();
+                let mut tools_spec = self.tools.specs();
+                // #2359: the grace iteration is the task's terminal response,
+                // so it runs tools-disabled, like the conversation loop.
+                if grace_iteration {
+                    tools_spec.clear();
+                }
                 // M8.5 tier 1: also runs in task mode so background workers
                 // benefit from the same cheap shrinkage before their LLM call.
                 let protected_ids = collect_protected_tool_call_ids(&messages);
@@ -2714,6 +2817,38 @@ impl Agent {
                     }
                 };
                 Self::normalize_inline_invokes(&mut response);
+                // #2359: the grace call cannot continue the loop — the budget
+                // is exhausted, so executing tool calls here would only buy
+                // another canned budget-stop output. The model's text IS the
+                // deliverable; calls emitted despite the empty tool slice are
+                // dropped, as in the conversation loop.
+                if grace_iteration {
+                    // `build_result` keys the truncation marker on a MaxTokens
+                    // stop; the forced terminal below would hide a real
+                    // provider truncation, so re-apply the marker here.
+                    grace_truncated = response.stop_reason == StopReason::MaxTokens;
+                    response.stop_reason = StopReason::EndTurn;
+                    if grace_truncated {
+                        response.content = Some(match response.content.take() {
+                            Some(text) if !text.trim().is_empty() => {
+                                format!("{PARTIAL_OUTPUT_MARKER}\n\n{text}")
+                            }
+                            _ => {
+                                if grace_stop_message.is_empty() {
+                                    PARTIAL_OUTPUT_MARKER.to_string()
+                                } else {
+                                    format!("{PARTIAL_OUTPUT_MARKER}\n\n{grace_stop_message}")
+                                }
+                            }
+                        });
+                    } else if response
+                        .content
+                        .as_deref()
+                        .is_none_or(|content| content.trim().is_empty())
+                    {
+                        response.content = Some(std::mem::take(&mut grace_stop_message));
+                    }
+                }
                 turn.record_llm_usage(
                     &response.usage,
                     tracker,
@@ -2759,16 +2894,21 @@ impl Agent {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
                         let proposed = final_response.content.clone().unwrap_or_default();
-                        if !self
-                            .verifier_allows_termination(
-                                &mut messages,
-                                turn_ledger.as_mut(),
-                                &proposed,
-                                iteration,
-                                &mut turn,
-                                None,
-                            )
-                            .await?
+                        // #2359: the grace call is exempt — a veto here would
+                        // only convert the synthesis into the canned
+                        // budget-stop output, with no budget left to act on
+                        // the verdict.
+                        if !grace_iteration
+                            && !self
+                                .verifier_allows_termination(
+                                    &mut messages,
+                                    turn_ledger.as_mut(),
+                                    &proposed,
+                                    iteration,
+                                    &mut turn,
+                                    None,
+                                )
+                                .await?
                         {
                             continue;
                         }
@@ -2897,6 +3037,13 @@ impl Agent {
                             files_modified,
                             files_to_send,
                         );
+                        // #2359: the forced-terminal grace hides a provider
+                        // truncation from `build_result`'s stop-reason check —
+                        // the partial-output verdict is re-applied here (the
+                        // marker itself is already prefixed to the output).
+                        if grace_truncated {
+                            result.success = false;
+                        }
                         if let Some(failure_msg) = contract_failures {
                             warn!(
                                 workspace_root = %task.context.working_dir.display(),
@@ -3042,11 +3189,10 @@ impl Agent {
         let success = !truncated;
         let mut output = response.content.clone().unwrap_or_default();
         if truncated {
-            let marker = "[partial output: max_output_tokens reached before a final answer]";
             output = if output.trim().is_empty() {
-                marker.to_string()
+                PARTIAL_OUTPUT_MARKER.to_string()
             } else {
-                format!("{marker}\n\n{output}")
+                format!("{PARTIAL_OUTPUT_MARKER}\n\n{output}")
             };
         }
         TaskResult {

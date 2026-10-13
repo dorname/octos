@@ -78,16 +78,19 @@ pub struct PoolConfig {
     /// on this profile's model/sandbox while its wake returns to the other
     /// profile. Read back via [`FleetWorkerPool::keeper_profile_id`].
     pub keeper_profile_id: String,
-    /// Whether the resolved sandbox backend supports FULL-FS write for a
+    /// Whether the resolved sandbox backend can run the worktree flow for a
     /// `FsGrant::Host` worker — the third gate condition for the worktree flow
     /// (§5). Computed at serve boot from the base sandbox's
-    /// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
-    /// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
-    /// sandbox. When `false`, EVERY task takes the SCRATCH fallback even on a git
-    /// controller root with a Host grant (running the worktree flow on a backend
-    /// that can't grant `.git` read+write would lose the deliverable — the worker
-    /// couldn't commit, then the checkout is removed with no branch update). This
-    /// is the surviving kernel of the parked `honors_write_allow_paths` gate.
+    /// `supports_repo_git_write()` AND `runs_posix_sh()` (#2707): `true` for
+    /// bwrap and unrestricted-read macOS, `false` for docker, restricted-read
+    /// macOS, Landlock, AppContainer, and no sandbox. When `false`, EVERY task
+    /// takes the SCRATCH fallback even on a git controller root with a Host
+    /// grant (running the worktree flow on a backend that can't grant `.git`
+    /// read+write would lose the deliverable — the worker couldn't commit, then
+    /// the checkout is removed with no branch update; one that can't run the
+    /// flow's POSIX sh strings would degrade every attempt into empty-branch
+    /// rejections). This is the surviving kernel of the parked
+    /// `honors_write_allow_paths` gate.
     pub repo_git_write_supported: bool,
 }
 
@@ -277,7 +280,9 @@ impl FleetWorkerPool {
         //      DEFERRED follow-up; for v1 a worktree = a full-permission worker.
         //   2. the fleet is on a git repo (`controller_workspace_root` Some AND
         //      `probe_git_repo` Ok(true));
-        //   3. the backend supports repo `.git` write (`repo_git_write_supported`).
+        //   3. the backend can run the flow (`repo_git_write_supported`:
+        //      repo `.git` write AND the POSIX sh the worker-side commands
+        //      are written in — #2707).
         // Any false → the scratch cwd fallback (cwd-confined, no `repo_git_write`).
         let full_trust =
             task_view.grant.fs.is_host() && task_view.grant.network.allows_raw_egress();
@@ -898,7 +903,13 @@ mod tests {
         create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
 
         let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
+        // GatedProvider pins the attempt mid-flight: an instantly-finishing
+        // provider let the first attempt settle between the two dispatches
+        // (child terminal → the launch CAS answers RejectedNotReady), which
+        // flaked this test in CI. wait_for_status below then asserts that
+        // in-flight premise explicitly.
+        let (provider, release) = GatedProvider::new();
+        let (_md, factory) = factory_for(Arc::new(provider)).await;
         let pool = FleetWorkerPool::new(
             store.clone(),
             Arc::new(factory),
@@ -914,7 +925,10 @@ mod tests {
         );
 
         // The child is now in flight with a live attempt: a second dispatch
-        // of the same task is a double-launch and spawns NO work.
+        // of the same task is a double-launch and spawns NO work. Asserting
+        // the status first keeps any gate bypass a loud timeout here instead
+        // of a re-flake below.
+        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
         let second = pool.dispatch("f1", "a").await.unwrap();
         assert_eq!(second.launch, LaunchOutcome::RejectedDoubleLaunch);
         assert!(
@@ -923,9 +937,15 @@ mod tests {
         );
 
         // Let the first attempt finish cleanly.
+        release.notify_one();
         let outcome = first.handle.unwrap().await.unwrap();
         assert!(
-            matches!(outcome, AttemptOutcome::Completed { .. }),
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Accepted { .. }
+                }
+            ),
             "got {outcome:?}",
         );
     }
@@ -1301,6 +1321,9 @@ mod tests {
 
     // ---- PR C: worktree workers on the operator's FsGrant::Host ----
 
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_runs_worker_in_git_worktree_and_keeps_branch() {
         // A `FsGrant::Host` task on a git controller root: the pool runs the
@@ -1373,6 +1396,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_reconciles_preexisting_worktree_on_relaunch() {
         // A dead attempt left the branch + checkout behind (task-stable). A
@@ -1537,6 +1563,12 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: interrupting a RUNNING attempt needs the attempt to
+    // start, but the attempt-time gate terminates a worktree attempt whose
+    // sandbox cannot run POSIX sh before the agent does — and on Windows
+    // `MarkerSandbox` honestly reports `!cfg!(windows)`. That terminated path
+    // is covered by `worktree_terminated_when_backend_cannot_run_posix_sh`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interrupted_worktree_attempt_removes_checkout_keeps_branch() {
         // An interrupted worktree attempt: the LaunchGuard settles it terminal
@@ -1597,6 +1629,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_deliverable_autocommitted_even_without_worker_commit() {
         // A worker WRITES a file but does NOT commit. After completion the BRANCH
@@ -1654,6 +1689,12 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the empty-branch downgrade needs the attempt to run,
+    // but the attempt-time gate terminates a worktree attempt whose sandbox
+    // cannot run POSIX sh before the agent does — and on Windows
+    // `MarkerSandbox` honestly reports `!cfg!(windows)`. That terminated path
+    // is covered by `worktree_terminated_when_backend_cannot_run_posix_sh`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_empty_branch_is_not_marked_succeeded() {
         // A worktree task whose worker produced NOTHING must not be recorded
@@ -1793,6 +1834,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_dispatch_of_one_task_does_not_corrupt_the_worktree() {
         // Two concurrent dispatches of the SAME task must be serialized by the
@@ -1856,6 +1900,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escalation_to_host_upgrades_next_attempt_to_a_worktree_worker() {
         // §6 (PR B interaction): the worktree decision is a pure per-attempt
@@ -2058,6 +2105,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn worktree_terminated_when_backend_cannot_run_posix_sh() {
+        // #2707: full-FS write alone is not enough — the worktree flow feeds the
+        // worker POSIX sh strings (`worktree_populate_command` /
+        // `deliverable_commit_command`) that `cmd /C` cannot run, so a full-FS
+        // backend wrapping the Windows shell would previously RUN the attempt and
+        // silently degrade it into empty-branch rejections (the commit string
+        // fails to parse; `require_success = false` ignores the exit code). The
+        // attempt-time gate must TERMINATE instead, mirroring codex fix #2b.
+        let (_sd, store) = fresh_store().await;
+        let repo = TempDir::new().unwrap();
+        if !git_init_repo(repo.path()) {
+            return;
+        }
+        create_fleet_with_root(
+            store.clone(),
+            "f1",
+            Some(repo.path().to_string_lossy().into_owned()),
+            vec![task_spec_granted("a", &[], vec![], host_grant())],
+        )
+        .await;
+
+        let work = TempDir::new().unwrap();
+        // NoPosixShSandbox: supports_repo_git_write() == true (so a worktree is
+        // allocated) but runs_posix_sh() == false (the #2707 combination).
+        let (_md, factory) =
+            factory_for_with(Arc::new(SuccessProvider), no_posix_sh_sandbox_factory()).await;
+        let pool = FleetWorkerPool::new(
+            store.clone(),
+            Arc::new(factory),
+            pool_config(&work, 4, 4),
+            fixed_clock(),
+        );
+
+        let d = pool.dispatch("f1", "a").await.unwrap();
+        assert!(
+            matches!(d.launch, LaunchOutcome::Launched { .. }),
+            "the worktree is allocated (boot said supported), got {:?}",
+            d.launch,
+        );
+        let outcome = d.handle.unwrap().await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Terminated { .. }
+                }
+            ),
+            "a worktree attempt under a no-POSIX-sh backend must terminate, got {outcome:?}",
+        );
+        assert_eq!(
+            store.get_child("f1", "a").await.unwrap().unwrap().status,
+            ChildStatus::Failed,
+        );
+    }
+
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hung_deliverable_commit_is_killed_at_deadline() {
         // codex fix #4: the sandboxed deliverable commit is BOUNDED. A worker

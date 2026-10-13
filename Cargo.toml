@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/octos-core",
     "crates/octos-diagnostics",
+    "crates/octos-research",
     "crates/octos-memory",
     "crates/octos-llm",
     "crates/octos-agent",
@@ -41,7 +42,7 @@ members = [
     "crates/octos-pyo3",
 ]
 [workspace.package]
-version = "2.0.3-rc.11"
+version = "2.0.3"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
@@ -55,6 +56,7 @@ rpassword = "7"
 # Internal crates
 octos-core = { path = "crates/octos-core" }
 octos-diagnostics = { path = "crates/octos-diagnostics" }
+octos-research = { path = "crates/octos-research" }
 octos-memory = { path = "crates/octos-memory" }
 octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }
@@ -104,6 +106,7 @@ clap_complete = "4"
 colored = "2"
 dirs = "5"
 rustyline = "15"
+semver = "1"
 open = "5"
 # Keychain (platform-native secure credential storage)
 keyring = { version = "3", default-features = false }
@@ -115,7 +118,9 @@ html5ever = "0.35"
 markup5ever_rcdom = "0.35"
 # Database (pure Rust)
 redb = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Keep the fleet ledger's checked u64/usize conversions on the 0.40 bindings.
+# This dependency requires Rust 1.88 or newer; the workspace MSRV is still stale.
+rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 bincode = "1"
 # Vector search
 hnsw_rs = "0.3"
@@ -214,3 +219,13 @@ tag-message = "Release {{version}}"
 pre-release-commit-message = "chore: release {{version}}"
 pre-release-hook = ["git-cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
 publish = false
+
+# -- Build profiles -----------------------------------------------------------
+# Keep dev builds small: line tables are enough for backtraces, dependencies
+# get no debug info, and incremental caches are disabled (they grow unbounded).
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false

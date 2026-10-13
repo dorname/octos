@@ -6,6 +6,9 @@
 //! ring buffer in memory; the cold/durable path is a per-session
 //! append-only JSON-Lines log under
 //! `<data_dir>/ui-protocol/<safe_session_id>/ledger-<epoch_micros>.log`.
+//! Short identities keep their legacy hex directory. Longer identities use a
+//! bounded SHA-256 directory plus a private, atomically published full identity
+//! record, verified before recovery/read/write. Logical session keys are unchanged.
 //!
 //! Live notification flow:
 //!
@@ -61,11 +64,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiNotification,
     UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -243,6 +247,12 @@ pub(crate) struct LedgeredUiProtocolEvent {
     /// skip these to avoid double delivery; forwarders on other
     /// connections deliver normally.
     pub(crate) from_connection: Option<ConnectionId>,
+    /// UPCR-2026-036 (#2625): an approval or question event of a prompt
+    /// raised by an external client's turn under `serve --host-managed`.
+    /// Durable (see [`LedgerDiskRecord::external_prompt`]), so the prompt
+    /// stays hidden from the host after a restart or once the transport's
+    /// in-memory owner table has forgotten it.
+    pub(crate) external_prompt: bool,
 }
 
 // ---------- On-disk record ----------
@@ -255,6 +265,20 @@ struct LedgerDiskRecord {
     v: u32,
     seq: u64,
     event: UiProtocolLedgerEvent,
+    /// UPCR-2026-036 (#2625): set on the approval and question events
+    /// (`approval/requested`, `approval/decided`, `approval/cancelled`,
+    /// `approval/auto_resolved`, `user_question/requested`) of a prompt
+    /// raised by an external client's turn under `serve --host-managed`.
+    /// Replay, hydrate and live fan-out show such a record only to the live
+    /// connection that owns the prompt, so after a restart to nobody.
+    ///
+    /// Additive, so [`LEDGER_DISK_VERSION`] and `SESSION_SNAPSHOT_VERSION`
+    /// stay at 1: it is written only when `true` and after `event` (the
+    /// `{"v","seq","event"}` prefix `cheap_record_seq` reads is unchanged),
+    /// a record without it reads as `false` (behaviour as before), and an
+    /// older reader ignores it (the record is not `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    external_prompt: bool,
 }
 
 const LEDGER_DISK_VERSION: u32 = 1;
@@ -398,6 +422,7 @@ impl From<LegacyLedgerDiskRecord> for LedgerDiskRecord {
             v: legacy.v,
             seq: legacy.seq,
             event: legacy.event.into(),
+            external_prompt: false,
         }
     }
 }
@@ -463,6 +488,8 @@ fn is_missing_record_kind_tag(err: &serde_json::Error) -> bool {
 struct LedgerEntry {
     seq: u64,
     event: UiProtocolLedgerEvent,
+    /// See [`LedgerDiskRecord::external_prompt`].
+    external_prompt: bool,
     /// Approximate bytes for the in-memory representation. Used for
     /// `ledger.bytes.in_memory` accounting; not fsync-precise.
     bytes: usize,
@@ -476,6 +503,10 @@ struct DiskSessionSnapshot {
     head_seq: u64,
     retained_entries: VecDeque<LedgerEntry>,
     replay_entries: Vec<LedgeredUiProtocolEvent>,
+    /// The session's unresolved external approvals (see
+    /// [`SessionLedger::external_prompts`]), rebuilt from EVERY marked
+    /// record of the retained logs and snapshot, not just the ring.
+    external_prompts: std::collections::HashSet<String>,
     /// Total records skipped across all scanned log files (unknown
     /// version + genuinely-malformed). Surfaced so callers/tests can
     /// assert the aggregation deterministically without depending on the
@@ -496,6 +527,23 @@ struct SessionLedger {
     /// Cached size of the active log file in bytes (so we don't `metadata`
     /// on every append).
     active_log_bytes: u64,
+    /// Ids of this session's unresolved external approvals (UPCR-2026-036,
+    /// #2625): added by a marked `approval/requested`, removed by its marked
+    /// `decided` / `cancelled` / `auto_resolved`. A later event of such an
+    /// approval is marked even if the transport's bounded owner table has
+    /// evicted the id meanwhile. Rebuilt on reload from every marked record
+    /// in the retained logs and snapshot (not only the ring), so a
+    /// `requested` that left the ring still counts.
+    ///
+    /// Bounded without a cap: an id leaves at its terminal event, so the set
+    /// holds only approvals still pending in this process plus those left
+    /// pending by an earlier process (orphans, at most one per external
+    /// approval pending at a shutdown, and only while their records are in
+    /// the retained logs). No cap, because evicting a pending id could let
+    /// its terminal event be written unmarked (fail open). Questions are
+    /// not tracked: `user_question/requested` is the only ledger event of
+    /// a question, so nothing later needs the marker.
+    external_prompts: std::collections::HashSet<String>,
 }
 
 impl SessionLedger {
@@ -507,6 +555,7 @@ impl SessionLedger {
             in_memory_bytes: 0,
             active_log_path: None,
             active_log_bytes: 0,
+            external_prompts: std::collections::HashSet::new(),
         }
     }
 }
@@ -713,6 +762,7 @@ struct AppendLockedOutcome {
     cursor: UiCursor,
     stamped: UiProtocolLedgerEvent,
     on_disk_delta: i64,
+    external_prompt: bool,
 }
 
 impl LedgerInner {
@@ -814,7 +864,7 @@ impl UiProtocolLedger {
     /// The STORAGE identity for a wire session id: the id itself, or
     /// `<id>\u{0}~cwd-<scope>` when a per-project scope is registered.
     /// Storage identities key the in-memory ring, the LRU, the on-disk
-    /// `ui-protocol/<hex>` dir, thread watermarks/seq state, and replay
+    /// `ui-protocol/<safe_session_id>` dir, thread watermarks/seq state, and replay
     /// cursors' `stream` — everything EXCEPT wire event payloads and the
     /// live-subscriber map, which stay on the plain wire id.
     ///
@@ -823,7 +873,7 @@ impl UiProtocolLedger {
     /// could be *equalled* by a hostile client naming its session
     /// `<victim>~cwd-<hash>` and thereby sharing the victim project's dir
     /// (codex v2 P2). A NUL pushes that collision outside anything a
-    /// legitimate client id contains; the byte is opaque to the hex dir
+    /// legitimate client id contains; the byte is opaque to the stable dir
     /// encoding, the HashMap keys, and JSON cursor `stream` strings.
     fn storage_session_id(&self, session_id: &SessionKey) -> SessionKey {
         let scopes = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
@@ -884,7 +934,7 @@ impl UiProtocolLedger {
             let Some(safe_name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(session_key) = decode_session_dir_name(safe_name) else {
+            let Some(session_key) = decode_session_directory(&path, safe_name) else {
                 continue;
             };
             ledger
@@ -1211,6 +1261,11 @@ impl UiProtocolLedger {
         // never by the bare seq value.
         from_beginning_hydrate: bool,
     ) -> std::io::Result<Option<DiskSessionSnapshot>> {
+        match validate_session_directory(session_dir, session_id) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
         let mut log_files = match list_log_files(session_dir) {
             Ok(log_files) => log_files,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1235,6 +1290,7 @@ impl UiProtocolLedger {
         let mut oldest_seq = None;
         let mut head_seq = 0u64;
         let mut retained_entries = VecDeque::new();
+        let mut external_prompts = std::collections::HashSet::new();
         let mut replay_entries = Vec::new();
         let mut skipped_records = 0u64;
         let cap = self.config.retained_per_session;
@@ -1304,6 +1360,14 @@ impl UiProtocolLedger {
                 // and snapshot_seeded_floor/oldest stay 0.
                 for record in snapshot.entries {
                     oldest_seq.get_or_insert(record.seq);
+                    // Seed the external-prompt set in seq order; the log
+                    // scan below re-applies the same records (and any whose
+                    // log file rotated away stay covered by this).
+                    track_external_prompt(
+                        &mut external_prompts,
+                        &record.event,
+                        record.external_prompt,
+                    );
                     // ymote P1: only the SHORTCUT path materialises the
                     // snapshot (retained ring + replay_entries). When the
                     // shortcut is disabled the FULL state (retained ring
@@ -1319,6 +1383,7 @@ impl UiProtocolLedger {
                                 },
                                 event: record.event.clone(),
                                 from_connection: None,
+                                external_prompt: record.external_prompt,
                             });
                         }
                         let bytes = approx_event_bytes(&record.event);
@@ -1326,6 +1391,7 @@ impl UiProtocolLedger {
                             seq: record.seq,
                             event: record.event,
                             bytes,
+                            external_prompt: record.external_prompt,
                         });
                         while retained_entries.len() > cap {
                             retained_entries.pop_front();
@@ -1407,6 +1473,20 @@ impl UiProtocolLedger {
                         if seq <= skip_through_seq {
                             oldest_seq.get_or_insert(seq);
                             head_seq = head_seq.max(seq);
+                            // #2625: a marked record below the snapshot head
+                            // still feeds the external-prompt set, even if
+                            // the snapshot's ring no longer holds it. Only
+                            // marked lines (rare) pay the full parse.
+                            if line.contains(EXTERNAL_PROMPT_MARKER_JSON)
+                                && let Ok(ParsedLedgerDiskRecord::Record(record)) =
+                                    parse_ledger_disk_record(line)
+                            {
+                                track_external_prompt(
+                                    &mut external_prompts,
+                                    &record.event,
+                                    record.external_prompt,
+                                );
+                            }
                             continue;
                         }
                     }
@@ -1486,6 +1566,7 @@ impl UiProtocolLedger {
 
                 oldest_seq.get_or_insert(record.seq);
                 head_seq = head_seq.max(record.seq);
+                track_external_prompt(&mut external_prompts, &record.event, record.external_prompt);
 
                 if record.seq <= skip_through_seq {
                     // Already materialised from the projection snapshot
@@ -1503,6 +1584,7 @@ impl UiProtocolLedger {
                         },
                         event: record.event.clone(),
                         from_connection: None,
+                        external_prompt: record.external_prompt,
                     });
                 }
 
@@ -1511,6 +1593,7 @@ impl UiProtocolLedger {
                     seq: record.seq,
                     event: record.event,
                     bytes,
+                    external_prompt: record.external_prompt,
                 });
                 while retained_entries.len() > cap {
                     retained_entries.pop_front();
@@ -1541,6 +1624,7 @@ impl UiProtocolLedger {
             head_seq,
             retained_entries,
             replay_entries,
+            external_prompts,
             skipped_records,
         }))
     }
@@ -1688,6 +1772,7 @@ impl UiProtocolLedger {
                 cursor: cursor.clone(),
                 event: stamped.clone(),
                 from_connection: None,
+                external_prompt: append_outcome.external_prompt,
             };
 
             if on_disk_delta >= 0 {
@@ -2177,11 +2262,13 @@ impl UiProtocolLedger {
         let Some(data_dir) = &self.config.data_dir else {
             return;
         };
-        let dir = data_dir
+        let session_dir = data_dir
             .join("ui-protocol")
-            .join(encode_session_dir_name(session_id))
-            .join("threads");
-        if let Err(error) = fs::create_dir_all(&dir) {
+            .join(encode_session_dir_name(session_id));
+        let dir = session_dir.join("threads");
+        if let Err(error) = ensure_session_directory(&session_dir, session_id)
+            .and_then(|_| fs::create_dir_all(&dir))
+        {
             warn!(
                 target = "octos::ledger",
                 ?error,
@@ -2245,9 +2332,11 @@ impl UiProtocolLedger {
     ) -> Option<ThreadSeqState> {
         let data_dir = self.config.data_dir.as_ref()?;
         let safe_name = encode_thread_file_name(thread_id);
-        let path = data_dir
+        let session_dir = data_dir
             .join("ui-protocol")
-            .join(encode_session_dir_name(session_id))
+            .join(encode_session_dir_name(session_id));
+        validate_session_directory(&session_dir, session_id).ok()?;
+        let path = session_dir
             .join("threads")
             .join(format!("{safe_name}.json"));
         let bytes = match fs::read(&path) {
@@ -2321,6 +2410,7 @@ impl UiProtocolLedger {
         let cursor;
         let stamped;
         let on_disk_delta;
+        let external_prompt;
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let outcome =
@@ -2328,6 +2418,7 @@ impl UiProtocolLedger {
             cursor = outcome.cursor;
             stamped = outcome.stamped;
             on_disk_delta = outcome.on_disk_delta;
+            external_prompt = outcome.external_prompt;
             if on_disk_delta >= 0 {
                 inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(on_disk_delta as u64);
             } else {
@@ -2340,6 +2431,7 @@ impl UiProtocolLedger {
             cursor,
             event: stamped,
             from_connection,
+            external_prompt,
         };
         self.publish_live(&session_id, &ledgered);
         ledgered
@@ -2425,12 +2517,21 @@ impl UiProtocolLedger {
             seq: session.next_seq,
         };
         let stamped = event.with_cursor(cursor.clone());
+        // UPCR-2026-036 (#2625): durably mark an external client's prompt
+        // events. The transport registers the owner before the prompt's
+        // first event reaches the ledger; the session's own set covers a
+        // later event of the same prompt once that table has evicted it.
+        let external_prompt = ledger_event_prompt_id(&stamped).is_some_and(|prompt_id| {
+            session.external_prompts.contains(&prompt_id)
+                || super::host_managed::external_prompt_owner(&prompt_id).is_some()
+        });
+        track_external_prompt(&mut session.external_prompts, &stamped, external_prompt);
 
         // Write-ahead to disk before signaling the wire — happens
         // inside the lock so two appends to the same session never
         // interleave bytes in the file.
         let on_disk_delta: i64 = if self.config.data_dir.is_some() {
-            match self.write_record_locked(session_id, session, &stamped) {
+            match self.write_record_locked(session_id, session, &stamped, external_prompt) {
                 Ok((written, reclaimed)) => (written as i64) - (reclaimed as i64),
                 Err(error) => {
                     warn!(
@@ -2452,6 +2553,7 @@ impl UiProtocolLedger {
         session.entries.push_back(LedgerEntry {
             seq: cursor.seq,
             event: stamped.clone(),
+            external_prompt,
             bytes,
         });
         // Cap the in-memory ring; older entries remain on disk for
@@ -2490,6 +2592,7 @@ impl UiProtocolLedger {
             cursor,
             stamped,
             on_disk_delta,
+            external_prompt,
         }
     }
 
@@ -2613,6 +2716,7 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         session: &mut SessionLedger,
         event: &UiProtocolLedgerEvent,
+        external_prompt: bool,
     ) -> std::io::Result<(u64, u64)> {
         let Some(dir) = &self.config.data_dir else {
             return Ok((0, 0));
@@ -2621,9 +2725,9 @@ impl UiProtocolLedger {
         let session_dir = dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
+        ensure_session_directory(&session_dir, session_id)?;
         let mut reclaimed: u64 = 0;
         if session.active_log_path.is_none() {
-            fs::create_dir_all(&session_dir)?;
             let path = session_dir.join(new_log_file_name());
             session.active_log_path = Some(path);
             session.active_log_bytes = 0;
@@ -2639,6 +2743,7 @@ impl UiProtocolLedger {
             v: LEDGER_DISK_VERSION,
             seq: 0, // filled in by appender below
             event: event.clone(),
+            external_prompt,
         };
         let cursor_seq = match event {
             UiProtocolLedgerEvent::Notification(notification) => {
@@ -2652,6 +2757,7 @@ impl UiProtocolLedger {
             v: record.v,
             seq: cursor_seq,
             event: record.event,
+            external_prompt: record.external_prompt,
         };
         let line = serde_json::to_string(&to_write).map_err(std::io::Error::other)?;
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -2681,7 +2787,7 @@ impl UiProtocolLedger {
         let session_dir = dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        fs::create_dir_all(&session_dir)?;
+        ensure_session_directory(&session_dir, session_id)?;
         let snapshot = SessionSnapshotFile {
             version: SESSION_SNAPSHOT_VERSION,
             head_seq: session.next_seq,
@@ -2692,6 +2798,7 @@ impl UiProtocolLedger {
                     v: LEDGER_DISK_VERSION,
                     seq: entry.seq,
                     event: entry.event.clone(),
+                    external_prompt: entry.external_prompt,
                 })
                 .collect(),
         };
@@ -2957,6 +3064,7 @@ impl UiProtocolLedger {
                     },
                     event: entry.event.clone(),
                     from_connection: None,
+                    external_prompt: entry.external_prompt,
                 })
                 .collect::<Vec<_>>();
             let needs_disk = session
@@ -3007,6 +3115,35 @@ impl UiProtocolLedger {
         &self,
         session_id: &SessionKey,
         after: Option<&UiCursor>,
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
+        self.snapshot_with_cursor_filtered(session_id, after, None)
+    }
+
+    /// Turn-scoped variant of [`Self::snapshot_with_cursor`]: identical
+    /// locking, disk-recovery, and cursor semantics, but the returned events
+    /// are only the ones belonging to `turn_id` — exactly the set
+    /// `project_turn_from_ledger` consumes — so a `turn/state` poll on a
+    /// session with a long ledger no longer deep-clones the whole ring to
+    /// project a single turn.
+    pub(crate) fn snapshot_events_for_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
+        let turn_wire_id = turn_id.0.to_string();
+        let (events, _) = self.snapshot_with_cursor_filtered(
+            session_id,
+            None,
+            Some(&|event| event_belongs_to_turn(event, turn_id, &turn_wire_id)),
+        )?;
+        Ok(events)
+    }
+
+    fn snapshot_with_cursor_filtered(
+        &self,
+        session_id: &SessionKey,
+        after: Option<&UiCursor>,
+        event_filter: Option<&dyn Fn(&UiProtocolLedgerEvent) -> bool>,
     ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
         // Shadow with the per-project STORAGE identity (no-op when no scope
         // is registered): ring lookups, disk fallbacks, minted cursor
@@ -3118,7 +3255,7 @@ impl UiProtocolLedger {
         let events: Vec<LedgeredUiProtocolEvent> = session
             .entries
             .iter()
-            .filter(|entry| entry.seq > after.seq)
+            .filter(|entry| entry.seq > after.seq && event_filter.is_none_or(|f| f(&entry.event)))
             .map(|entry| LedgeredUiProtocolEvent {
                 cursor: UiCursor {
                     stream: session_id.0.clone(),
@@ -3126,6 +3263,7 @@ impl UiProtocolLedger {
                 },
                 event: entry.event.clone(),
                 from_connection: None,
+                external_prompt: entry.external_prompt,
             })
             .collect();
 
@@ -3439,8 +3577,60 @@ fn replay_from_entries(
             },
             event: entry.event.clone(),
             from_connection: None,
+            external_prompt: entry.external_prompt,
         })
         .collect()
+}
+
+/// The approval or question id of an event that UPCR-2026-036 restricts to
+/// an external prompt's owner (see [`LedgerDiskRecord::external_prompt`]).
+pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<String> {
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return None;
+    };
+    match notification {
+        UiNotification::ApprovalRequested(e) => Some(e.approval_id.0.to_string()),
+        UiNotification::ApprovalDecided(e) => Some(e.approval_id.0.to_string()),
+        UiNotification::ApprovalCancelled(e) => Some(e.approval_id.0.to_string()),
+        UiNotification::ApprovalAutoResolved(e) => Some(e.approval_id.0.to_string()),
+        UiNotification::UserQuestionRequested(e) => Some(e.question_id.0.to_string()),
+        _ => None,
+    }
+}
+
+/// `"external_prompt":true` as the disk writer emits it (see
+/// [`LedgerDiskRecord::external_prompt`]); a cheap pre-filter for lines the
+/// snapshot fast path does not otherwise parse.
+const EXTERNAL_PROMPT_MARKER_JSON: &str = "\"external_prompt\":true";
+
+/// Apply one record to a session's set of unresolved external approvals
+/// (see [`SessionLedger::external_prompts`]).
+fn track_external_prompt(
+    external_prompts: &mut std::collections::HashSet<String>,
+    event: &UiProtocolLedgerEvent,
+    external_prompt: bool,
+) {
+    if !external_prompt {
+        return;
+    }
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return;
+    };
+    match notification {
+        UiNotification::ApprovalRequested(e) => {
+            external_prompts.insert(e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalDecided(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalCancelled(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalAutoResolved(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        _ => {}
+    }
 }
 
 fn hydrate_session_from_snapshot(session: &mut SessionLedger, snapshot: DiskSessionSnapshot) {
@@ -3450,6 +3640,7 @@ fn hydrate_session_from_snapshot(session: &mut SessionLedger, snapshot: DiskSess
     session.last_touched_at = Instant::now();
     session.active_log_path = Some(snapshot.active_log_path);
     session.active_log_bytes = snapshot.active_log_bytes;
+    session.external_prompts = snapshot.external_prompts;
     for entry in snapshot.retained_entries {
         session.in_memory_bytes = session.in_memory_bytes.saturating_add(entry.bytes);
         session.entries.push_back(entry);
@@ -3505,6 +3696,27 @@ fn cursor_out_of_range_error(
     RpcError::cursor_out_of_range(after, &ledger_head).with_data(Value::Object(data))
 }
 
+/// Whether a ledger event belongs to `turn_id` — exactly the set
+/// `project_turn_from_ledger` reads (turn lifecycle notifications plus the
+/// envelope thread backfill), so a turn-scoped snapshot projects identically
+/// to a full one. `turn_wire_id` is `turn_id` pre-rendered to its wire form.
+fn event_belongs_to_turn(
+    event: &UiProtocolLedgerEvent,
+    turn_id: &TurnId,
+    turn_wire_id: &str,
+) -> bool {
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return false;
+    };
+    match notification {
+        UiNotification::TurnStarted(e) => e.turn_id == *turn_id,
+        UiNotification::TurnCompleted(e) => e.turn_id == *turn_id,
+        UiNotification::TurnError(e) => e.turn_id == *turn_id,
+        UiNotification::EnvelopeV2(e) => e.envelope.turn_id == turn_wire_id,
+        _ => false,
+    }
+}
+
 fn notification_session_id(notification: &UiNotification) -> &SessionKey {
     match notification {
         UiNotification::SessionOpened(event) => &event.session_id,
@@ -3546,13 +3758,13 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::SessionGoalCleared(event) => &event.session_id,
         UiNotification::LoopUpdated(event) => &event.session_id,
         UiNotification::LoopFired(event) => &event.session_id,
-        UiNotification::LoopCompleted(event) => &event.session_id,
         UiNotification::MonitorUpdated(event) => &event.session_id,
         UiNotification::MonitorFired(event) => &event.session_id,
         UiNotification::MonitorExpired(event) => &event.session_id,
         UiNotification::ContextCompactionCompleted(event) => &event.session_id,
         UiNotification::ContextCompactionStarted(event) => &event.session_id,
         UiNotification::ContextNormalizationReported(event) => &event.session_id,
+        UiNotification::ContextStateReported(event) => &event.session_id,
         UiNotification::SessionOrchestration(event) => &event.session_id,
         UiNotification::PeerStaged(event) => &event.session_id,
         UiNotification::PeerClosed(event) => &event.session_id,
@@ -3579,8 +3791,8 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
 // ---------- Filename encoding ----------
 //
 // SessionKey may contain characters illegal on common filesystems
-// (`:`, `/`, etc.). We hex-encode a stable representation so the
-// session dir name is reversible and collision-free.
+// (`:`, `/`, etc.). Short names retain the legacy reversible hex encoding;
+// long names use a bounded hash with verified full identity metadata.
 
 /// Cheaply extract the top-level `seq` from a ledger disk line WITHOUT
 /// parsing the nested event payload. The writer (`write_record_locked`)
@@ -3688,12 +3900,150 @@ fn redact_ledger_event_secrets(event: &mut UiProtocolLedgerEvent) {
     redact_ui_notification_secrets(notification);
 }
 
+// Hex is retained for existing short identities. Hash only the filesystem
+// component, never the wire/storage key: peer, account and project scopes remain
+// distinct. Long names carry an exact identity record for cold discovery.
+const SESSION_IDENTITY_FILE: &str = "session-identity.json";
+const HASHED_SESSION_PREFIX: &str = "sha256-";
+const LEGACY_SESSION_MAX_BYTES: usize = 127;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDirectoryIdentity {
+    version: u8,
+    session_id: String,
+}
+
 fn encode_session_dir_name(session_id: &SessionKey) -> String {
+    if session_id.0.len() > LEGACY_SESSION_MAX_BYTES {
+        return format!(
+            "{HASHED_SESSION_PREFIX}{:x}",
+            Sha256::digest(session_id.0.as_bytes())
+        );
+    }
     let mut out = String::with_capacity(session_id.0.len() * 2);
     for byte in session_id.0.as_bytes() {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+fn invalid_session_directory() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid ledger session identity",
+    )
+}
+
+fn read_directory_identity(dir: &Path) -> std::io::Result<SessionKey> {
+    let path = dir.join(SESSION_IDENTITY_FILE);
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid_session_directory());
+    }
+    let record: SessionDirectoryIdentity =
+        serde_json::from_reader(fs::File::open(path)?).map_err(|_| invalid_session_directory())?;
+    if record.version != 1 || record.session_id.len() <= LEGACY_SESSION_MAX_BYTES {
+        return Err(invalid_session_directory());
+    }
+    let key = SessionKey(record.session_id);
+    if dir.file_name().and_then(|n| n.to_str()) != Some(encode_session_dir_name(&key).as_str()) {
+        return Err(invalid_session_directory());
+    }
+    Ok(key)
+}
+
+fn decode_session_directory(dir: &Path, name: &str) -> Option<SessionKey> {
+    let metadata = fs::symlink_metadata(dir).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    if name.starts_with(HASHED_SESSION_PREFIX) {
+        read_directory_identity(dir).ok()
+    } else {
+        decode_session_dir_name(name)
+    }
+}
+
+fn validate_session_directory(dir: &Path, key: &SessionKey) -> std::io::Result<()> {
+    if key.0.len() <= LEGACY_SESSION_MAX_BYTES {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_session_directory());
+    }
+    let stored = read_directory_identity(dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            // Only an absent directory is an empty ledger. Existing data with
+            // missing identity is corruption, never a new caller's namespace.
+            invalid_session_directory()
+        } else {
+            error
+        }
+    })?;
+    if stored != *key {
+        return Err(invalid_session_directory());
+    }
+    Ok(())
+}
+
+fn ensure_session_directory(dir: &Path, key: &SessionKey) -> std::io::Result<()> {
+    if key.0.len() <= LEGACY_SESSION_MAX_BYTES {
+        return fs::create_dir_all(dir);
+    }
+    fs::create_dir_all(dir.parent().ok_or_else(invalid_session_directory)?)?;
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(dir)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid_session_directory());
+            }
+            match fs::symlink_metadata(dir.join(SESSION_IDENTITY_FILE)) {
+                Ok(_) => return validate_session_directory(dir, key),
+                // Recover only a genuinely empty directory from an interrupted
+                // first creation. Existing unidentified data cannot be assigned.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if fs::read_dir(dir)?.next().is_some() {
+                        // A concurrent creator may have published since our read.
+                        return validate_session_directory(dir, key);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let record = SessionDirectoryIdentity {
+        version: 1,
+        session_id: key.0.clone(),
+    };
+    // NamedTempFile is private (0600 on Unix). No-clobber publish prevents a
+    // racing writer from replacing another identity; validate the winner.
+    // Stage in the parent so an interrupted write does not leave a temporary
+    // file that makes a newly created, otherwise-empty session unrecoverable.
+    let mut staged =
+        tempfile::NamedTempFile::new_in(dir.parent().ok_or_else(invalid_session_directory)?)?;
+    serde_json::to_writer(staged.as_file_mut(), &record).map_err(std::io::Error::other)?;
+    staged.as_file_mut().flush()?;
+    // The identity must reach stable storage before any log refers to it.
+    // This runs once per new long session, not on each ledger append.
+    staged.as_file_mut().sync_all()?;
+    match staged.persist_noclobber(dir.join(SESSION_IDENTITY_FILE)) {
+        Ok(_) => {
+            #[cfg(unix)]
+            {
+                fs::File::open(dir)?.sync_all()?;
+                fs::File::open(dir.parent().ok_or_else(invalid_session_directory)?)?.sync_all()?;
+            }
+            validate_session_directory(dir, key)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_session_directory(dir, key)
+        }
+        Err(error) => Err(error.error),
+    }
 }
 
 fn decode_session_dir_name(name: &str) -> Option<SessionKey> {
@@ -4135,6 +4485,7 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
                 session_result: None,
+                token_usage: None,
             }));
 
         assert!(matches!(
@@ -4549,6 +4900,249 @@ mod tests {
             .snapshot_with_cursor(&session_id, None)
             .expect("from-beginning hydrate must succeed on a trimmed ring");
         assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
+    }
+
+    fn append_turn_lifecycle(
+        ledger: &UiProtocolLedger,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        terminal: UiNotification,
+    ) {
+        ledger.append_notification(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        ));
+        ledger.emit_envelope_v2(
+            session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: format!("answer for {}", turn_id.0),
+                assistant_segment_id: format!("{}:assistant:iteration:0", turn_id.0),
+            },
+            None,
+        );
+        ledger.append_notification(terminal);
+    }
+
+    fn turn_event_seqs(events: &[LedgeredUiProtocolEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.cursor.seq).collect()
+    }
+
+    /// Explicit expected-set enumeration for one turn: the same event kinds
+    /// `project_turn_from_ledger` consumes, spelled out inline rather than
+    /// through `event_belongs_to_turn`. This is deliberately a third copy of
+    /// those arms — it is the ledger-level expectation; the drift guard is
+    /// the transport-side projection-equivalence test, which runs the real
+    /// projection over both snapshots.
+    fn full_snapshot_turn_seqs(events: &[LedgeredUiProtocolEvent], turn_id: &TurnId) -> Vec<u64> {
+        events
+            .iter()
+            .filter(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnStarted(started)) => {
+                    started.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(completed)) => {
+                    completed.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnError(errored)) => {
+                    errored.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    envelope.envelope.turn_id == turn_id.0.to_string()
+                }
+                _ => false,
+            })
+            .map(|event| event.cursor.seq)
+            .collect()
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_returns_only_target_turn_events_in_order() {
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:turn-scoped".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        ledger.append_notification(delta(&session_id, "noise-1"));
+        append_turn_lifecycle(
+            &ledger,
+            &session_id,
+            &turn_a,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+                token_usage: None,
+            }),
+        );
+        ledger.append_notification(delta(&session_id, "noise-2"));
+        append_turn_lifecycle(
+            &ledger,
+            &session_id,
+            &turn_b,
+            UiNotification::TurnError(TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                code: "interrupted".into(),
+                message: "stop".into(),
+                token_usage: None,
+                partial_result: None,
+            }),
+        );
+
+        let (full, head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full snapshot");
+        assert_eq!(full.len(), 8);
+
+        for turn in [&turn_a, &turn_b] {
+            let scoped = ledger
+                .snapshot_events_for_turn(&session_id, turn)
+                .expect("turn-scoped snapshot");
+            assert_eq!(
+                turn_event_seqs(&scoped),
+                full_snapshot_turn_seqs(&full, turn),
+                "turn-scoped snapshot must equal the full snapshot's events for the target turn, in order"
+            );
+            assert_eq!(scoped.len(), 3);
+            assert!(scoped.iter().all(|event| event.cursor.seq <= head.seq));
+        }
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_recovers_cold_session_from_disk() {
+        // The turn-scoped read must keep the lazy disk-recovery contract of
+        // `snapshot_with_cursor`: a session whose ring is cold (fresh
+        // process, nothing loaded yet) still projects its turn from the
+        // durable log.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:turn-scoped-cold".into());
+        let turn_id = TurnId::new();
+        let config = {
+            let mut config = LedgerConfig::durable(temp.path().into());
+            config.active_session_cap = 4;
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            append_turn_lifecycle(
+                &ledger,
+                &session_id,
+                &turn_id,
+                UiNotification::TurnError(TurnErrorEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    code: "failed".into(),
+                    message: "boom".into(),
+                    token_usage: None,
+                    partial_result: None,
+                }),
+            );
+            ledger.append_notification(delta(&session_id, "noise"));
+            config
+        };
+
+        let recovered = UiProtocolLedger::recover(config);
+        let scoped = recovered
+            .ledger
+            .snapshot_events_for_turn(&session_id, &turn_id)
+            .expect("turn-scoped snapshot on a cold session");
+        assert_eq!(scoped.len(), 3);
+        let (full, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full snapshot after recovery");
+        assert_eq!(
+            turn_event_seqs(&scoped),
+            full_snapshot_turn_seqs(&full, &turn_id)
+        );
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_on_unknown_session_is_empty() {
+        let ledger = UiProtocolLedger::new(4);
+        let events = ledger
+            .snapshot_events_for_turn(
+                &SessionKey("local:turn-scoped-missing".into()),
+                &TurnId::new(),
+            )
+            .expect("unknown session is empty, not an error");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_succeeds_on_trimmed_ring_missing_turn_started() {
+        // From-beginning (after: None) is always valid even when the ring
+        // wrapped past the turn's TurnStarted: the scoped read must return
+        // the retained subset — envelope(s) plus terminal — without a
+        // cursor error, and every retained envelope stays in the result
+        // (dedup/first-wins is the projection's call, not the filter's).
+        let ledger = UiProtocolLedger::new(3);
+        let session_id = SessionKey("local:turn-scoped-trimmed".into());
+        let turn_id = TurnId::new();
+        ledger.append_notification(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        ));
+        ledger.append_notification(delta(&session_id, "filler-1"));
+        ledger.emit_envelope_v2(
+            &session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: "first".into(),
+                assistant_segment_id: format!("{}:assistant:iteration:0", turn_id.0),
+            },
+            None,
+        );
+        ledger.emit_envelope_v2(
+            &session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: "second".into(),
+                assistant_segment_id: format!("{}:assistant:iteration:1", turn_id.0),
+            },
+            None,
+        );
+        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+            token_usage: None,
+        }));
+
+        // Ring (cap 3) retains: envelope "first", envelope "second",
+        // turn/completed — TurnStarted and the filler were evicted.
+        let scoped = ledger
+            .snapshot_events_for_turn(&session_id, &turn_id)
+            .expect("trimmed-ring scoped read must succeed");
+        let kinds: Vec<&str> = scoped
+            .iter()
+            .map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    assert_eq!(envelope.envelope.turn_id, turn_id.0.to_string());
+                    "envelope"
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(_)) => {
+                    "completed"
+                }
+                other => panic!("unexpected event in scoped snapshot: {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["envelope", "envelope", "completed"]);
     }
 
     /// Boot recovery must synthesize terminal events for task/turn/agent
@@ -5583,6 +6177,229 @@ mod tests {
         let encoded = encode_session_dir_name(&key);
         let decoded = decode_session_dir_name(&encoded).expect("decode");
         assert_eq!(decoded, key);
+    }
+
+    fn long_phone_session() -> SessionKey {
+        // Same 130-byte shape as a contained app's event context, with fictional tags.
+        SessionKey(format!(
+            "_main:api:octosense#peerctx-org-octosense-samples-inbox-{:016x}.{:08x}-p1-events-gmail-{:032x}",
+            1, 2, 3
+        ))
+    }
+
+    #[test]
+    fn long_session_storage_survives_append_hydrate_and_cold_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        assert_eq!(key.0.len(), 130);
+        let config = snapshot_config(temp.path(), 2);
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "one"));
+            ledger.append_notification(delta(&key, "two"));
+            ledger.append_notification(delta(&key, "three"));
+            assert!(encode_session_dir_name(&key).len() <= 255);
+            assert!(session_log_payload(temp.path(), &key).contains("three"));
+        }
+        let restored = UiProtocolLedger::recover(config.clone());
+        assert_eq!(restored.sessions_recovered, 1);
+        let (events, head) = restored.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.stream, key.0);
+        assert_eq!(head.seq, 3);
+        assert_eq!(replay_texts(&events), vec!["one", "two", "three"]);
+        let next = restored.ledger.append_notification(delta(&key, "four"));
+        assert_eq!(next.cursor.seq, 4);
+        drop(restored);
+        let restored = UiProtocolLedger::recover(config);
+        let (events, head) = restored.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.seq, 4);
+        assert_eq!(replay_texts(&events), vec!["one", "two", "three", "four"]);
+    }
+
+    #[test]
+    fn long_session_storage_keeps_unicode_account_and_project_identities_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = [
+            SessionKey("x".repeat(127)), // legacy 254-byte component
+            SessionKey("x".repeat(128)),
+            SessionKey(format!("{}-account-a", "x".repeat(4096))),
+            SessionKey(format!("{}-account-b", "x".repeat(4096))),
+            SessionKey("日历🗓".repeat(100)),
+            SessionKey(format!("{}\0~cwd-aaaa111122223333", long_phone_session().0)),
+            SessionKey(format!("{}\0~cwd-bbbb444455556666", long_phone_session().0)),
+        ];
+        let config = snapshot_config(temp.path(), 1);
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for (index, key) in keys.iter().enumerate() {
+                ledger.append_notification(delta(key, &format!("own-{index}")));
+                let name = encode_session_dir_name(key);
+                assert!(name.len() <= 254);
+                assert_eq!(
+                    decode_session_directory(&temp.path().join("ui-protocol").join(&name), &name),
+                    Some(key.clone())
+                );
+            }
+        }
+        let outcome = UiProtocolLedger::recover(config);
+        assert_eq!(outcome.sessions_recovered, keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let (events, head) = outcome.ledger.snapshot_with_cursor(key, None).unwrap();
+            assert_eq!(head.seq, 1);
+            assert_eq!(replay_texts(&events), vec![format!("own-{index}")]);
+        }
+    }
+
+    #[test]
+    fn long_session_storage_invalid_identity_never_recovers_or_overwrites_data() {
+        for malformed in [
+            None,
+            Some("not json".to_owned()),
+            Some(json!({"version":2,"session_id":long_phone_session().0}).to_string()),
+            Some(
+                json!({"version":1,"session_id":format!("{}-other",long_phone_session().0)})
+                    .to_string(),
+            ),
+            Some(json!({"version":1,"session_id":long_phone_session().0,"extra":true}).to_string()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let key = long_phone_session();
+            let config = snapshot_config(temp.path(), 1);
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "original"));
+            let name = encode_session_dir_name(&key);
+            let dir = temp.path().join("ui-protocol").join(&name);
+            let before = session_log_payload(temp.path(), &key);
+            let metadata = dir.join(SESSION_IDENTITY_FILE);
+            match malformed.as_ref() {
+                Some(value) => fs::write(&metadata, value).unwrap(),
+                None => fs::remove_file(&metadata).unwrap(),
+            }
+            assert!(decode_session_directory(&dir, &name).is_none());
+            assert!(ensure_session_directory(&dir, &key).is_err());
+            assert_eq!(
+                ledger
+                    .read_session_disk_snapshot(&key, &dir, None, false)
+                    .err()
+                    .expect("existing unidentified data must fail closed")
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            // A live writer must also recheck the identity rather than trusting
+            // an already-open session after metadata removal/replacement.
+            ledger.append_notification(delta(&key, "must-not-persist"));
+            assert_eq!(session_log_payload(temp.path(), &key), before);
+            drop(ledger);
+            let outcome = UiProtocolLedger::recover(config);
+            assert_eq!(outcome.sessions_recovered, 0);
+            let (events, _) = outcome.ledger.snapshot_with_cursor(&key, None).unwrap();
+            assert!(events.is_empty());
+            match malformed {
+                Some(value) => assert_eq!(fs::read_to_string(metadata).unwrap(), value),
+                None => assert!(!metadata.exists()),
+            }
+        }
+    }
+
+    #[test]
+    fn long_session_storage_preserves_legacy_short_hex_and_empty_create_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let short = SessionKey("local:test:abc/def".into());
+        let expected: String = short.0.bytes().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(encode_session_dir_name(&short), expected);
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        ledger.append_notification(delta(&short, "legacy"));
+        assert!(
+            !temp
+                .path()
+                .join("ui-protocol")
+                .join(expected)
+                .join(SESSION_IDENTITY_FILE)
+                .exists()
+        );
+        let long = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&long));
+        fs::create_dir_all(&dir).unwrap();
+        ensure_session_directory(&dir, &long).unwrap();
+        assert_eq!(read_directory_identity(&dir).unwrap(), long);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.join(SESSION_IDENTITY_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn long_session_storage_concurrent_first_creation_keeps_one_exact_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        let barrier = Arc::new(std::sync::Barrier::new(12));
+        let joins: Vec<_> = (0..12)
+            .map(|_| {
+                let key = key.clone();
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_session_directory(&dir, &key)
+                })
+            })
+            .collect();
+        for join in joins {
+            join.join().unwrap().unwrap();
+        }
+        assert_eq!(read_directory_identity(&dir).unwrap(), key);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let config = LedgerConfig::durable(temp.path().into());
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            ledger.append_notification(delta(&key, "after-concurrent-create"));
+        }
+        let outcome = UiProtocolLedger::recover(config);
+        assert_eq!(outcome.sessions_recovered, 1);
+        let (events, head) = outcome.ledger.snapshot_with_cursor(&key, None).unwrap();
+        assert_eq!(head.seq, 1);
+        assert_eq!(replay_texts(&events), vec!["after-concurrent-create"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_session_storage_rejects_symlinked_identity_and_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let key = long_phone_session();
+        let dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&key));
+        ensure_session_directory(&dir, &key).unwrap();
+        let external = temp.path().join("outside.json");
+        fs::rename(dir.join(SESSION_IDENTITY_FILE), &external).unwrap();
+        symlink(&external, dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        assert!(ensure_session_directory(&dir, &key).is_err());
+        assert!(validate_session_directory(&dir, &key).is_err());
+        fs::remove_file(dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        fs::rename(&external, dir.join(SESSION_IDENTITY_FILE)).unwrap();
+        let other = SessionKey(format!("{}-other", key.0));
+        let other_name = encode_session_dir_name(&other);
+        let alias = temp.path().join("ui-protocol").join(&other_name);
+        symlink(&dir, &alias).unwrap();
+        assert!(ensure_session_directory(&alias, &other).is_err());
+        assert!(decode_session_directory(&alias, &other_name).is_none());
     }
 
     #[test]
@@ -7226,6 +8043,7 @@ mod tests {
             v: LEDGER_DISK_VERSION,
             seq: 1,
             event: raw,
+            external_prompt: false,
         })
         .expect("record json");
         let log_path = session_dir.join(new_log_file_name());
@@ -7266,5 +8084,146 @@ mod tests {
                 .is_some_and(|first| first.contains(LEAKED_OPENAI_KEY)),
             "the historical row is read-only compatibility data, not rewritten"
         );
+    }
+
+    // ---------- #2625: durable external-prompt marker ----------
+
+    fn external_marker_approval(session: &SessionKey) -> UiNotification {
+        use octos_core::ui_protocol::{ApprovalId, ApprovalRequestedEvent};
+        UiNotification::ApprovalRequested(ApprovalRequestedEvent::generic(
+            session.clone(),
+            ApprovalId::new(),
+            TurnId::new(),
+            "shell",
+            "Run command",
+            "ls",
+        ))
+    }
+
+    fn external_marker_prompt_id(notification: &UiNotification) -> String {
+        ledger_event_prompt_id(&UiProtocolLedgerEvent::Notification(notification.clone()))
+            .expect("prompt id")
+    }
+
+    /// The pre-#2625 record shape, as an older octos reads it.
+    #[derive(Debug, Deserialize)]
+    struct PreMarkerDiskRecord {
+        v: u32,
+        seq: u64,
+        #[allow(dead_code)]
+        event: UiProtocolLedgerEvent,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PreMarkerSnapshotFile {
+        version: u32,
+        #[allow(dead_code)]
+        head_seq: u64,
+        entries: Vec<PreMarkerDiskRecord>,
+    }
+
+    #[test]
+    fn should_write_the_external_prompt_marker_additively_to_logs_and_snapshots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = SessionKey("local:ledger-2625-marker".into());
+        let mut config = LedgerConfig::durable(temp.path().into());
+        config.snapshot_every_events = 2;
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        let unmarked = external_marker_approval(&session);
+        let marked = external_marker_approval(&session);
+        let marked_id = external_marker_prompt_id(&marked);
+        super::super::host_managed::register_external_prompt(&marked_id, 7);
+        assert!(!ledger.append_notification(unmarked).external_prompt);
+        assert!(ledger.append_notification(marked).external_prompt);
+        super::super::host_managed::forget_external_prompt(&marked_id);
+
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session));
+        let log_path = list_log_files(&session_dir).expect("logs")[0].clone();
+        let log = fs::read_to_string(&log_path).expect("log");
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        // An unmarked record is byte-for-byte the pre-#2625 shape.
+        assert!(!lines[0].contains("external_prompt"), "{}", lines[0]);
+        // The marker is the last key, after `event`, so the leading
+        // `{"v","seq","event"}` layout `cheap_record_seq` reads is unchanged.
+        assert!(
+            lines[1].ends_with(",\"external_prompt\":true}"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(cheap_record_seq(lines[1]), Some(2));
+        // An older octos reads both records (it ignores the unknown key).
+        for line in &lines {
+            let old = serde_json::from_str::<PreMarkerDiskRecord>(line).expect("old reader");
+            assert_eq!(old.v, LEDGER_DISK_VERSION);
+            assert!(old.seq >= 1);
+        }
+        // The snapshot carries the marker too, readable by an older octos.
+        let snapshot = fs::read_to_string(session_dir.join(SESSION_SNAPSHOT_FILE_NAME))
+            .expect("snapshot written at seq 2");
+        let old = serde_json::from_str::<PreMarkerSnapshotFile>(&snapshot).expect("old reader");
+        assert_eq!(old.version, SESSION_SNAPSHOT_VERSION);
+        assert_eq!(old.entries.len(), 2);
+        assert!(snapshot.contains("\"external_prompt\":true"));
+
+        // Recovery (snapshot shortcut and full log scan alike) restores it.
+        drop(ledger);
+        for use_snapshot in [true, false] {
+            if !use_snapshot {
+                fs::remove_file(session_dir.join(SESSION_SNAPSHOT_FILE_NAME)).expect("rm");
+            }
+            let recovered = UiProtocolLedger::recover(config.clone()).ledger;
+            let replay = recovered
+                .replay_after(
+                    &session,
+                    Some(&UiCursor {
+                        stream: session.0.clone(),
+                        seq: 0,
+                    }),
+                )
+                .expect("replay");
+            let flags = replay
+                .iter()
+                .filter(|event| ledger_event_prompt_id(&event.event).is_some())
+                .map(|event| {
+                    (
+                        ledger_event_prompt_id(&event.event).unwrap() == marked_id,
+                        event.external_prompt,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(flags, vec![(false, false), (true, true)], "{use_snapshot}");
+        }
+    }
+
+    #[test]
+    fn should_mark_a_later_event_of_a_recovered_external_prompt() {
+        // Recovery rebuilds the session's set of external prompt ids, so an
+        // event appended after a session reload is still marked with the
+        // owner table empty.
+        use octos_core::ui_protocol::ApprovalCancelledEvent;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = SessionKey("local:ledger-2625-reload".into());
+        let config = LedgerConfig::durable(temp.path().into());
+        let marked = external_marker_approval(&session);
+        let marked_id = external_marker_prompt_id(&marked);
+        let UiNotification::ApprovalRequested(requested) = &marked else {
+            unreachable!()
+        };
+        let (approval_id, turn_id) = (requested.approval_id.clone(), requested.turn_id.clone());
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            super::super::host_managed::register_external_prompt(&marked_id, 9);
+            ledger.append_notification(marked);
+            super::super::host_managed::forget_external_prompt(&marked_id);
+        }
+        let ledger = UiProtocolLedger::recover(config).ledger;
+        let cancelled = ledger.append_notification(UiNotification::ApprovalCancelled(
+            ApprovalCancelledEvent::turn_interrupted(session.clone(), approval_id, turn_id),
+        ));
+        assert!(cancelled.external_prompt);
     }
 }

@@ -83,6 +83,69 @@ impl Drop for ProfileRuntimeLifecycle {
     }
 }
 
+/// Long-lived profile resources a replacement runtime takes over from the
+/// runtime it replaces instead of reopening them. `episodes.redb` admits a
+/// single writer, so reopening it while an in-flight turn still holds the
+/// previous runtime fails; sharing the handles makes a configuration change
+/// (model, key, route) take effect immediately without that lock.
+#[derive(Clone)]
+pub(crate) struct SharedProfileResources {
+    memory: Arc<EpisodeStore>,
+    memory_store: Arc<MemoryStore>,
+    recall: Arc<octos_memory::RecallStore>,
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    tool_config: Arc<ToolConfigStore>,
+    cron_service: Option<Arc<CronService>>,
+    runtime_lifecycle: Option<Arc<ProfileRuntimeLifecycle>>,
+    /// Handed over, not shared: it is stopped so the replacement can restart
+    /// the sweep with its own provider.
+    memory_refresh: Option<Arc<crate::memory_refresh::MemoryRefreshService>>,
+}
+
+/// Whether stores opened under `previous` stay valid under `next`: the
+/// embedder and recall width they were opened with are unchanged.
+fn configs_share_storage(previous: &Config, next: &Config) -> bool {
+    let embedding = |config: &Config| serde_json::to_value(&config.embedding).ok();
+    let recall_dimension = |config: &Config| {
+        config
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.recall_dimension)
+    };
+    if embedding(previous) != embedding(next)
+        || recall_dimension(previous) != recall_dimension(next)
+    {
+        return false;
+    }
+    // An embedder authenticated by a profile env var must not keep a
+    // credential the new configuration replaced.
+    next.embedding
+        .as_ref()
+        .and_then(|embedding| embedding.api_key_env.as_deref())
+        .is_none_or(|name| previous.env_vars.get(name) == next.env_vars.get(name))
+}
+
+/// The resources of a runtime a configuration commit removed, awaiting its
+/// replacement. See [`ProfileRuntime::retire`].
+pub(crate) struct RetiredProfileRuntime {
+    data_dir: PathBuf,
+    custom_session_root: bool,
+    // Boxed: callers hold the retiree across awaits, and `Config` is large.
+    config: Box<Config>,
+    resources: SharedProfileResources,
+}
+
+impl RetiredProfileRuntime {
+    /// Whether a runtime for `config` rooted at `data_dir` can take over these
+    /// stores: same storage location, and nothing that shapes how the stores
+    /// were opened (embedder, recall width) has changed.
+    pub(crate) fn can_share_with(&self, data_dir: &Path, config: &Config) -> bool {
+        self.data_dir == data_dir
+            && !self.custom_session_root
+            && configs_share_storage(&self.config, config)
+    }
+}
+
 /// Build an ISOLATED per-node pipeline provider router from the profile's
 /// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
 /// nodes, resolved via `RunPipelineTool`'s provider router).
@@ -96,6 +159,7 @@ impl Drop for ProfileRuntimeLifecycle {
 /// before. Mirrors the gateway's sub-provider registration
 /// (`gateway_runtime.rs`) but deliberately omits the primary/fallback
 /// auto-registration to keep the research lane isolated.
+#[cfg(test)]
 fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderRouter>> {
     if config.sub_providers.is_empty() {
         return None;
@@ -103,22 +167,15 @@ fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderR
     let router = Arc::new(octos_llm::ProviderRouter::new());
     let mut registered = 0usize;
     for sp in &config.sub_providers {
-        // Per-sub-provider key override, matching the gateway path: an explicit
-        // `api_key_env` selects a distinct credential; otherwise inherit the
-        // profile's default for the provider.
-        let sp_config = if sp.api_key_env.is_some() {
-            let mut c = config.clone();
-            c.api_key_env = sp.api_key_env.clone();
-            c
-        } else {
-            config.clone()
-        };
+        // Share the matching chat provider's saved route/credential unless
+        // this lane explicitly overrides it. Circuit breakers remain isolated.
+        let sp_config = config.for_sub_provider(sp);
         match chat::create_provider_with_api_type(
             &sp.provider,
             &sp_config,
             sp.model.clone(),
-            sp.base_url.clone(),
-            sp.api_type.as_deref(),
+            sp_config.base_url.clone(),
+            sp_config.api_type.as_deref(),
         ) {
             Ok(p) => {
                 router.register_with_full_meta(
@@ -180,6 +237,19 @@ pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
 /// session's own provider, which is the pre-#1935 behavior unchanged (the
 /// back-compat default) — when no `goal_verifier` lane is configured or the
 /// configured lane fails to build.
+/// The LLM provider family a resolved profile config selects: the explicit
+/// `provider` (populated from `llm.primary` by `config_from_profile`), else
+/// the family detected from the model id.
+pub(crate) fn configured_provider_name(config: &Config) -> Option<String> {
+    config.provider.clone().or_else(|| {
+        config
+            .model
+            .as_deref()
+            .and_then(crate::config::detect_provider)
+            .map(String::from)
+    })
+}
+
 pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvider>> {
     let sp = config
         .sub_providers
@@ -531,35 +601,7 @@ pub struct ProfileRuntime {
     /// Shared shutdown owner retained across replacement runtimes.
     pub runtime_lifecycle: Option<Arc<ProfileRuntimeLifecycle>>,
 
-    /// Per-spawn `RunPipelineTool` factory (NEW-07 fix).
-    ///
-    /// Gateway-path parity: when a session LLM calls `spawn(allowed_tools =
-    /// ["run_pipeline", ...])`, the spawned child's
-    /// [`octos_agent::ToolRegistry`] must contain `run_pipeline` so the
-    /// spawn preflight ([`octos_agent::tools::spawn::
-    /// ensure_subagent_tools_available`]) succeeds. The gateway path threads
-    /// a [`crate::session_actor::PipelineToolFactory`] through
-    /// [`crate::session_actor::SessionActor::build_session_tools`] (see
-    /// `session_actor.rs:2744-2748`); the WS / UI Protocol path needs the
-    /// same factory but had no place to read it from — the
-    /// `RunPipelineTool` registered on [`Self::tool_specs`] is shared (one
-    /// instance, used by the parent registry) and cannot be re-handed to
-    /// every spawn child without violating ownership.
-    ///
-    /// `None` when no LLM provider is configured (the same precondition
-    /// that prevents parent registration; bootstrap returns `Err` long
-    /// before this point in that case). A second `None` slot exists for
-    /// upstream tests that build a minimal `ProfileRuntime` by hand
-    /// without an LLM provider chain.
-    ///
-    /// Production effect: round-7 soak NEW-07 reproducer was mini1
-    /// `deep_research` stalling 900s when the LLM wrapped `run_pipeline`
-    /// in `spawn(allowed_tools=[run_pipeline])` — the WS path child
-    /// registry only had `send_file` + base tools, so preflight failed
-    /// with `required tool(s) not available on this host: run_pipeline`
-    /// at `spawn.rs:1476`. Phase 2-A (PR #1203) plumbed scope through
-    /// `RunPipelineTool` but left this child-registry wiring gap on the
-    /// WS path. This field closes it.
+    /// Reserved host extension hook. Octos does not register a DOT engine.
     pub pipeline_factory: Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>,
 
     /// Pre-built lifecycle hook executor (M11-F regression fix REG-3).
@@ -968,6 +1010,39 @@ impl ProfileRuntime {
         host_voice: Option<&crate::config::VoiceConfig>,
         host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_replacing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            host_plugins,
+            host_voice,
+            host_memory,
+            &mut None,
+        )
+        .await
+    }
+
+    /// [`Self::bootstrap_with_host_plugins`] for a configuration change of a
+    /// profile whose previous stores may still be open (an in-flight turn's
+    /// agent holds them even after the runtime itself is gone). When the new
+    /// configuration keeps the same storage, the new runtime takes over the
+    /// retired stores and long-lived services; every configuration-derived
+    /// part is rebuilt exactly as a cold bootstrap would. When it does not,
+    /// `previous` is released (set to `None`) before the cold bootstrap so
+    /// this process no longer pins the stores; otherwise it is left for the
+    /// caller to keep on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bootstrap_replacing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        host_plugins: Option<&crate::config::PluginsConfig>,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
+        previous: &mut Option<RetiredProfileRuntime>,
+    ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
         // step inspects `config.plugins.require_signed`.
@@ -983,10 +1058,41 @@ impl ProfileRuntime {
         // inherit the host budget.
         crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
-        Self::bootstrap_resolved(
-            profile, data_dir, octos_home, role, config, host_voice, false, None,
+        let shared = match previous {
+            Some(retired) if retired.can_share_with(data_dir, &config) => {
+                Some(retired.resources.clone())
+            }
+            _ => {
+                *previous = None;
+                None
+            }
+        };
+        Self::bootstrap_resolved_sharing(
+            profile, data_dir, octos_home, role, config, host_voice, false, None, shared,
         )
         .await
+    }
+
+    /// Keep this runtime's stores and long-lived services for its
+    /// replacement. Held strongly: an in-flight turn's agent can keep the
+    /// single-writer episode store open after every runtime handle is gone.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn retire(&self) -> RetiredProfileRuntime {
+        RetiredProfileRuntime {
+            data_dir: self.data_dir.clone(),
+            custom_session_root: self.session_store_root.is_some(),
+            config: Box::new(self.config.clone()),
+            resources: SharedProfileResources {
+                memory: self.memory.clone(),
+                memory_store: self.memory_store.clone(),
+                recall: self.recall.clone(),
+                embedder: self.embedder.clone(),
+                tool_config: self.tool_config.clone(),
+                cron_service: self.cron_service.clone(),
+                runtime_lifecycle: self.runtime_lifecycle.clone(),
+                memory_refresh: self.memory_refresh.clone(),
+            },
+        }
     }
 
     /// Local OUP adapters use the same assembler with their already-resolved
@@ -994,6 +1100,7 @@ impl ProfileRuntime {
     /// custom endpoints, API styles and explicit CLI policy overrides.
     /// A supplied provider is an embedding seam, not a second runtime path.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) async fn bootstrap_resolved(
         profile: &UserProfile,
         data_dir: &Path,
@@ -1003,6 +1110,32 @@ impl ProfileRuntime {
         host_voice: Option<&crate::config::VoiceConfig>,
         no_retry: bool,
         provider_override: Option<Arc<dyn LlmProvider>>,
+    ) -> Result<Arc<Self>> {
+        Self::bootstrap_resolved_sharing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            config,
+            host_voice,
+            no_retry,
+            provider_override,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_resolved_sharing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        config: Config,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        no_retry: bool,
+        provider_override: Option<Arc<dyn LlmProvider>>,
+        shared: Option<SharedProfileResources>,
     ) -> Result<Arc<Self>> {
         ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
             format!(
@@ -1016,18 +1149,9 @@ impl ProfileRuntime {
         // else falls back to `detect_provider(model)`.
         let model = config.model.clone();
         let base_url = config.base_url.clone();
-        let provider_name = config
-            .provider
-            .clone()
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
-            })?;
+        let provider_name = configured_provider_name(&config).ok_or_else(|| {
+            eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
+        })?;
 
         // Step 3: build the LLM provider chain.
         let base_provider = match provider_override {
@@ -1061,39 +1185,53 @@ impl ProfileRuntime {
         // different length. Sizing it from the configured provider is what
         // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
         // actually reach the vector lane instead of degrading to BM25-only.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
-        let index_dimension = embedder
-            .as_ref()
-            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
-
-        let memory_open_result = match role {
-            BootstrapRole::Serve => {
-                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
-            }
-            BootstrapRole::Gateway => {
-                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
-            }
-        };
-        let memory = Arc::new(memory_open_result.wrap_err_with(|| {
-            format!("failed to open episode store for profile '{}'", profile.id)
-        })?);
-        let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
-            format!("failed to open memory store for profile '{}'", profile.id)
-        })?);
-        let recall = open_recall_store(data_dir, &config, embedder.as_deref())
-            .await
-            .wrap_err_with(|| {
-                format!("failed to open recall store for profile '{}'", profile.id)
-            })?;
-
-        // Step 5: tool config store.
-        let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
-            format!(
-                "failed to open tool config store for profile '{}'",
-                profile.id
+        let (memory, memory_store, recall, embedder, tool_config) = if let Some(shared) =
+            shared.as_ref()
+        {
+            (
+                shared.memory.clone(),
+                shared.memory_store.clone(),
+                shared.recall.clone(),
+                shared.embedder.clone(),
+                shared.tool_config.clone(),
             )
-        })?);
+        } else {
+            let embedder =
+                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            let index_dimension = embedder
+                .as_ref()
+                .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
+            let memory_open_result = match role {
+                BootstrapRole::Serve => {
+                    EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+                }
+                BootstrapRole::Gateway => {
+                    EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+                }
+            };
+            let memory = Arc::new(memory_open_result.wrap_err_with(|| {
+                format!("failed to open episode store for profile '{}'", profile.id)
+            })?);
+            let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
+                format!("failed to open memory store for profile '{}'", profile.id)
+            })?);
+            let recall = open_recall_store(data_dir, &config, embedder.as_deref())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to open recall store for profile '{}'", profile.id)
+                })?;
+
+            // Step 5: tool config store.
+            let tool_config =
+                Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
+                    format!(
+                        "failed to open tool config store for profile '{}'",
+                        profile.id
+                    )
+                })?);
+            (memory, memory_store, recall, embedder, tool_config)
+        };
 
         // Step 6: resolve credentials from the profile's declared env
         // vars (keychain-aware). Used by MCP, plugin spawns, and the
@@ -1116,6 +1254,11 @@ impl ProfileRuntime {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| data_dir.to_path_buf());
         let mut plugin_env_template = profile_plugin_env(profile);
+        crate::commands::gateway::profile_factory::apply_resolved_profile_llm_env(
+            &mut plugin_env_template,
+            &config,
+            &profile.updated_at.to_rfc3339(),
+        );
         push_runtime_plugin_env(
             &mut plugin_env_template,
             data_dir,
@@ -1233,7 +1376,8 @@ impl ProfileRuntime {
             plugin_dirs: plugin_dirs.clone(),
             plugin_env: plugin_env_template.clone(),
             work_dir: plugin_work_dir,
-            synthesis_config: None,
+            synthesis_config:
+                crate::commands::gateway::profile_factory::build_research_synthesis_config(&config),
             require_signed: config.plugins.require_signed,
             verified_cache_dir: effective_octos_home.join("cache").join("verified"),
             tool_policy: config.tool_policy.clone(),
@@ -1269,160 +1413,9 @@ impl ProfileRuntime {
             tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
         }
 
-        // REG-7 follow-up: register `run_pipeline` at profile scope so
-        // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
-        // it just like the gateway path does at
-        // `crates/octos-cli/src/session_actor.rs:2283-2305`. The serve
-        // path is the one `octos serve` mounts for web clients; prior
-        // to this, only the gateway (octos chat / bus channels)
-        // registered `run_pipeline`, so the LLM in serve mode received
-        // `"No tools matched"` when it tried `activate_tools(["run_pipeline"])`
-        // for `深度研究X` queries (per PR #930's ACT-DIRECTLY rule).
-        //
-        // The original M11-D split-out at `e01a07e4` (PR #764) called
-        // this gap out as a follow-up but never landed; PR #903
-        // restored 6 of 10 regressions and explicitly deferred this
-        // one. PR #930's prompt rewrite — which makes the LLM call
-        // `run_pipeline` directly rather than wrapping it in `spawn`
-        // — turned the latent gap into an observable production
-        // failure on the dspfac profile (May 13 2026).
-        //
-        // Profile scope is sufficient: `RunPipelineTool` only captures
-        // `llm` / `memory` / `data_dir` / `plugin_dirs` / optional
-        // `adaptive_router` / `provider_policy`, all of which are
-        // profile-level. Per-session workspace context is threaded
-        // separately via `PipelineHostContext` at execute time (see
-        // `crates/octos-pipeline/src/tool.rs::execute`).
-        //
-        // `mark_spawn_only` keeps the tool out of LRU eviction and
-        // tells the execution loop to background the call so the chat
-        // bubble doesn't block on the long-running pipeline. The
-        // message text mirrors session_actor.rs:2287-2291 verbatim.
-        // `RunPipelineTool::with_provider_router` takes
-        // `octos_llm::ProviderRouter` (a sub-provider routing
-        // registry assembled from `config.sub_providers` in the
-        // gateway path). The serve path doesn't build that table
-        // — the adaptive router that lives on `ProfileRuntime`
-        // is `AdaptiveRouter`, a distinct concrete type for
-        // top-level multi-provider QoS routing. Skipping
-        // `with_provider_router` here is correct; the
-        // `default_provider` we hand in (`llm`) is already wrapped
-        // by `RetryProvider` → `ProviderChain` → `AdaptiveRouter`
-        // when adaptive is configured, so per-node calls still
-        // fan out through the adaptive layer.
-        //
-        // The profile's embedding provider was resolved ONCE back in Step 4
-        // (the episodic index has to be sized from it). The same handle feeds
-        // the pipeline factory below AND rides on the returned ProfileRuntime
-        // so the serve spawn/delegate wiring hands every worker the exact same
-        // embed-on-save + hybrid-recall behaviour.
-
-        // NEW-07: hoist the per-instance `RunPipelineTool` builder
-        // into a [`crate::session_actor::PipelineToolFactory`] impl
-        // so the WS / UI Protocol spawn-wiring site can hand a fresh
-        // `run_pipeline` instance to every spawned child registry
-        // (mirroring the gateway path at `session_actor.rs:2744-2748`).
-        // Without this, an LLM emitting
-        // `spawn(allowed_tools=["run_pipeline"])` on the WS path
-        // failed the spawn preflight
-        // (`spawn.rs::ensure_subagent_tools_available`) with
-        // `"required tool(s) not available on this host: run_pipeline"`
-        // — reproduced by mini1 `deep_research` round-7 soak (binary
-        // `5cfd85f3`).
-        let pipeline_factory: Option<
-            Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
-        > = {
-            #[derive(Clone)]
-            struct AppUiPipelineToolFactory {
-                llm: Arc<dyn LlmProvider>,
-                memory: Arc<EpisodeStore>,
-                data_dir: PathBuf,
-                policy: Option<ToolPolicy>,
-                plugin_dirs: Vec<PathBuf>,
-                octos_home: PathBuf,
-                plugin_require_signed: bool,
-                /// NEW-06 fix: forwarded to every worker `Agent` via
-                /// `RunPipelineTool::with_embedder` so pipeline-spawned
-                /// agents inherit the contamination-safe hybrid scored
-                /// + filtered memory recall path.
-                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
-                /// Isolated per-node model router built from the profile's
-                /// `sub_providers` (e.g. `deep_research`'s `cheap`/`strong`
-                /// nodes). Registers ONLY sub-providers, so per-node failover
-                /// trips its own breakers and never disturbs the coding
-                /// provider/cache. `None` ⇒ nodes use the shared coding `llm`.
-                provider_router: Option<Arc<octos_llm::ProviderRouter>>,
-            }
-
-            impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
-                fn with_plugin_dirs(
-                    &self,
-                    plugin_dirs: Vec<PathBuf>,
-                ) -> Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>
-                {
-                    let mut factory = self.clone();
-                    factory.plugin_dirs = plugin_dirs;
-                    Some(Arc::new(factory))
-                }
-
-                fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
-                    let mut pt = octos_pipeline::RunPipelineTool::new(
-                        self.llm.clone(),
-                        self.memory.clone(),
-                        self.data_dir.clone(),
-                        self.data_dir.clone(),
-                    )
-                    .with_provider_policy(self.policy.clone())
-                    .with_plugin_dirs(self.plugin_dirs.clone())
-                    .with_plugin_require_signed(self.plugin_require_signed)
-                    // #1607 (codex round 4): confine pipeline command
-                    // validators to the SESSION-effective sandbox passed in by
-                    // the caller (`SessionRuntime`/`ActorFactory`), NOT a
-                    // profile-time default captured at factory-build time — a
-                    // read-only session's validators must not regain removed
-                    // writes/network.
-                    .with_sandbox(sandbox.clone())
-                    .with_octos_home(self.octos_home.clone());
-                    if let Some(ref embedder) = self.embedder {
-                        pt = pt.with_embedder(embedder.clone());
-                    }
-                    if let Some(ref router) = self.provider_router {
-                        pt = pt.with_provider_router(router.clone());
-                    }
-                    Arc::new(pt)
-                }
-            }
-
-            let factory: Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync> =
-                Arc::new(AppUiPipelineToolFactory {
-                    llm: llm.clone(),
-                    memory: memory.clone(),
-                    data_dir: data_dir.to_path_buf(),
-                    policy: config.tool_policy.clone(),
-                    plugin_dirs: plugin_dirs.clone(),
-                    octos_home: effective_octos_home.clone(),
-                    plugin_require_signed: config.plugins.require_signed,
-                    embedder: embedder.clone(),
-                    provider_router: build_sub_provider_router(&config),
-                });
-
-            // Register the parent `run_pipeline` via the same factory so the
-            // parent registry and every spawn-child registry observe
-            // byte-identical config. This profile-scope registration uses the
-            // profile default sandbox; `SessionRuntime::bootstrap_*` re-registers
-            // it with the SESSION-effective sandbox (which `rebind_cwd` does not
-            // touch, since `run_pipeline` is not a CWD-bound tool).
-            tools.register_arc(factory.create(&sandbox_config));
-            tools.mark_spawn_only(
-                "run_pipeline",
-                Some(
-                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
-                        .to_string(),
-                ),
-            );
-
-            Some(factory)
-        };
+        // DOT graph execution is retired from Octos. Leave the host extension
+        // hook empty, including for spawned agents and plugin reloads.
+        let pipeline_factory = None;
 
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
@@ -1447,13 +1440,27 @@ impl ProfileRuntime {
         // on `ProfileRuntime::cron_service`; without that field the
         // tokio task `start()` spawned would be cancelled the moment
         // this function returned.
-        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-        let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
-        cron_service.start();
+        // A replacement runtime keeps the running service and its shutdown
+        // owner: a second `start()` on the same `cron.json` would fire jobs
+        // twice, and dropping the previous lifecycle would stop the timer.
+        let (cron_service, runtime_lifecycle) = match shared.as_ref().and_then(|shared| {
+            Some((
+                shared.cron_service.clone()?,
+                shared.runtime_lifecycle.clone()?,
+            ))
+        }) {
+            Some((cron_service, lifecycle)) => (cron_service, Some(lifecycle)),
+            None => {
+                let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+                let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
+                cron_service.start();
+                let lifecycle = Arc::new(ProfileRuntimeLifecycle {
+                    cron_service: Some(cron_service.clone()),
+                });
+                (cron_service, Some(lifecycle))
+            }
+        };
         tools.register(CronTool::with_context(cron_service.clone(), "api", ""));
-        let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
-            cron_service: Some(cron_service.clone()),
-        }));
         // Hand the same service to the AppUI orchestrator so `loop/delete` can
         // reap the cron jobs a loop created. Without this the orchestrator has
         // no cron handle at all and the reap silently does nothing.
@@ -1654,16 +1661,26 @@ impl ProfileRuntime {
         // mirror bank pages, embed records that arrived without vectors,
         // and apply the heat policy. Runs off the bootstrap path so a large
         // bank never delays the first turn; errors only log.
-        spawn_recall_maintenance(
-            recall.clone(),
-            memory_store.clone(),
-            embedder.clone(),
-            profile.id.clone(),
-        );
+        // A replacement shares stores whose upkeep already ran.
+        if shared.is_none() {
+            spawn_recall_maintenance(
+                recall.clone(),
+                memory_store.clone(),
+                embedder.clone(),
+                profile.id.clone(),
+            );
+        }
 
         // Start the background memory-refresh sweep when enabled. The
         // flock decides ownership when serve and gateway share a profile
-        // dir; the loser just logs and skips.
+        // dir; the loser just logs and skips. A replacement first stops the
+        // sweep it takes over so the restarted one uses the new provider.
+        if let Some(previous) = shared
+            .as_ref()
+            .and_then(|shared| shared.memory_refresh.as_ref())
+        {
+            previous.shutdown().await;
+        }
         let memory_refresh = if memory_refresh_enabled {
             let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
             crate::memory_refresh::MemoryRefreshService::try_start(
@@ -1937,6 +1954,222 @@ mod tests {
     #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
+
+    fn gemini_profile(id: &str, model: &str) -> UserProfile {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("GEMINI_API_KEY".to_string(), format!("fixture-{id}"));
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                env_vars,
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("google".to_string()),
+                        model_id: Some(model.to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Configuration-derived state that a replacement must rebuild exactly as
+    /// a cold bootstrap would.
+    fn derived_snapshot(rt: &ProfileRuntime) -> serde_json::Value {
+        let mut env = rt.plugin_env_template.clone();
+        env.sort();
+        let mut tools = rt.tool_specs.tool_names();
+        tools.sort();
+        serde_json::json!({
+            "env": env,
+            "provider": rt.provider_name,
+            "model": rt.primary_model_id,
+            "tools": tools,
+            "system_prompt": rt.system_prompt,
+            "memory_refresh_enabled": rt.memory_refresh_enabled,
+        })
+    }
+
+    #[tokio::test]
+    async fn should_share_stores_and_match_cold_bootstrap_when_replacing_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("swap").join("data");
+        let first = gemini_profile("swap", "gemini-m1");
+        let mut second = gemini_profile("swap", "gemini-m2");
+        second.updated_at = first.updated_at + chrono::Duration::seconds(5);
+
+        // `old` stays alive like a runtime held by an in-flight turn: it
+        // keeps the single-writer episode store open.
+        let old = ProfileRuntime::bootstrap(&first, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let cold_while_held =
+            ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve).await;
+        assert!(
+            cold_while_held.is_err(),
+            "a cold bootstrap cannot reopen the store the old runtime holds"
+        );
+
+        // Retire, then keep only what an in-flight agent keeps: the episode
+        // store. Every runtime handle is gone, the redb lock is not.
+        let mut retired = Some(old.retire());
+        let held_by_agent = old.memory.clone();
+        let old_memory_store = old.memory_store.clone();
+        let old_recall = old.recall.clone();
+        let old_tool_config = old.tool_config.clone();
+        let old_cron = old.cron_service.clone().unwrap();
+        let old_lifecycle = old.runtime_lifecycle.clone().unwrap();
+        assert_eq!(old.primary_model_id, "gemini-m1");
+        drop(old);
+        let replacement = ProfileRuntime::bootstrap_replacing(
+            &second,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            &mut retired,
+        )
+        .await
+        .expect("replacement shares the held stores");
+        assert!(
+            retired.is_some(),
+            "a shareable retiree stays with the caller"
+        );
+        drop(retired);
+        assert!(Arc::ptr_eq(&replacement.memory, &held_by_agent));
+        assert!(Arc::ptr_eq(&replacement.memory_store, &old_memory_store));
+        assert!(Arc::ptr_eq(&replacement.recall, &old_recall));
+        assert!(Arc::ptr_eq(&replacement.tool_config, &old_tool_config));
+        assert!(Arc::ptr_eq(
+            replacement.cron_service.as_ref().unwrap(),
+            &old_cron
+        ));
+        assert!(Arc::ptr_eq(
+            replacement.runtime_lifecycle.as_ref().unwrap(),
+            &old_lifecycle
+        ));
+        assert!(
+            old_cron.is_running(),
+            "the shared cron service keeps running"
+        );
+        assert_eq!(replacement.primary_model_id, "gemini-m2");
+        use fs2::FileExt as _;
+        if replacement.memory_refresh.is_some() != replacement.memory_refresh_enabled {
+            // Unreachable in a quiet process: the predecessor's lock is
+            // released before the replacement's try_start (#2666), and
+            // nothing else holds this fresh tempdir's lock — so a
+            // mismatch means the lock setup itself failed. Probe the
+            // lock file's live state so the failure names its cause
+            // instead of red-ing opaquely (#2684).
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .open(data_dir.join("memory").join(".refresh.lock"))
+                .map(|file| {
+                    let lock_free = file.try_lock_exclusive().is_ok();
+                    drop(file);
+                    lock_free
+                });
+            panic!(
+                "the replacement takes over the memory refresh sweep \
+                 (enabled={}, sweep_running={}, lock probe open+try_lock={probe:?})",
+                replacement.memory_refresh_enabled,
+                replacement.memory_refresh.is_some(),
+            );
+        }
+        let derived = derived_snapshot(&replacement);
+
+        drop(replacement);
+        drop((held_by_agent, old_memory_store, old_recall, old_tool_config));
+        drop((old_cron, old_lifecycle));
+        let cold = ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("cold bootstrap once the stores are released");
+        assert_eq!(derived, derived_snapshot(&cold));
+    }
+
+    #[tokio::test]
+    async fn should_refuse_sharing_when_storage_shape_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("shape").join("data");
+        let profile = gemini_profile("shape", "gemini-m1");
+        let old = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let same = old.config.clone();
+        let retired = old.retire();
+        assert!(retired.can_share_with(&data_dir, &same));
+        assert!(!retired.can_share_with(&tmp.path().join("elsewhere"), &same));
+
+        let mut embedding = same.clone();
+        embedding.embedding = Some(crate::config::EmbeddingConfig {
+            provider: "openai".to_string(),
+            api_key_env: None,
+            base_url: None,
+            model: Some("text-embedding-3-small".to_string()),
+            dimensions: Some(256),
+            model_path: None,
+            auto_download: None,
+        });
+        assert!(!retired.can_share_with(&data_dir, &embedding));
+
+        let mut recall = same.clone();
+        recall
+            .memory
+            .get_or_insert_with(Default::default)
+            .recall_dimension = Some(64);
+        assert!(!retired.can_share_with(&data_dir, &recall));
+
+        // An unshareable retiree is released before the cold bootstrap, so
+        // the process does not pin the stores it can no longer use.
+        drop(old);
+        let mut unshareable = Some(retired);
+        let mut changed = profile.clone();
+        changed.config.memory = Some(crate::config::MemoryConfig {
+            recall_dimension: Some(64),
+            ..Default::default()
+        });
+        let rebuilt = ProfileRuntime::bootstrap_replacing(
+            &changed,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            &mut unshareable,
+        )
+        .await;
+        assert!(unshareable.is_none());
+        assert!(
+            rebuilt.is_ok(),
+            "nothing else holds the stores: {:?}",
+            rebuilt.err()
+        );
+
+        let mut keyed = embedding.clone();
+        keyed.embedding.as_mut().unwrap().api_key_env = Some("EMBED_KEY".to_string());
+        let mut keyed_old = keyed.clone();
+        keyed
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "new".to_string());
+        keyed_old
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "old".to_string());
+        assert!(configs_share_storage(&keyed_old, &keyed_old.clone()));
+        assert!(!configs_share_storage(&keyed_old, &keyed));
+    }
 
     #[test]
     fn should_create_inbox_when_ensuring_profile_runtime_directories() {
@@ -2920,62 +3153,111 @@ mod tests {
         );
     }
 
-    /// NEW-07 regression: `ProfileRuntime::bootstrap` must populate
-    /// `pipeline_factory` so the WS / UI Protocol spawn-wiring site can
-    /// attach a fresh `run_pipeline` instance to every spawn-child
-    /// registry. Pre-fix the field did not exist and the WS path's
-    /// SpawnTool only carried a `send_file` child factory — so a child
-    /// agent declaring `allowed_tools=["run_pipeline"]` hit
-    /// `ensure_subagent_tools_available`'s missing-tool branch and the
-    /// spawn was rejected with
-    /// `required tool(s) not available on this host: run_pipeline`.
-    /// Round-7 soak (binary `5cfd85f3`) caught the regression on mini1
-    /// `deep_research`; this test pins it.
-    ///
-    /// We exercise the factory by:
-    ///   1. Bootstrapping a profile with a valid LLM env var.
-    ///   2. Asserting `pipeline_factory.is_some()`.
-    ///   3. Building a `ToolRegistry` with the factory's tool and the
-    ///      `octos_agent` builtins, then asserting the registry's
-    ///      `get("run_pipeline")` returns `Some` — the same predicate
-    ///      `ensure_subagent_tools_available` uses (see
-    ///      `crates/octos-agent/src/tools/spawn.rs::ensure_subagent_tools_available`).
+    /// The removed DOT tool must stay absent across profile/session bootstrap
+    /// and plugin reload, even if old pipeline files remain on disk.
     #[tokio::test]
-    async fn profile_runtime_bootstrap_populates_pipeline_factory_for_spawn_children() {
+    async fn profile_runtime_does_not_expose_dot_pipeline() {
         let _key = ScopedEnvKey::set("OCTOS_NEW07_PIPELINE_FACTORY_KEY");
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("profile-data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
+        // A leftover legacy graph must not restore the retired tool.
+        let graphs = data_dir.join("pipelines");
+        std::fs::create_dir_all(&graphs).unwrap();
+        std::fs::write(graphs.join("deep_research.dot"), "digraph deep_research {}").unwrap();
         let profile = fixture_profile("new07", "OCTOS_NEW07_PIPELINE_FACTORY_KEY");
         let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
             .await
             .expect("bootstrap should succeed");
 
-        let factory = rt
-            .pipeline_factory
-            .as_ref()
-            .expect("pipeline_factory must be Some after a successful bootstrap");
-        let pt = factory.create(&octos_agent::SandboxConfig::default());
-        assert_eq!(
-            pt.name(),
-            "run_pipeline",
-            "factory must produce the `run_pipeline` tool by name",
-        );
-
-        // Mirror the gateway's `with_child_tool_factory` consumer: clone
-        // the `Arc` and hand the child a fresh registry that mounts the
-        // factory output. This is exactly what `ui_protocol.rs` does at
-        // spawn-tool wiring time (see the NEW-07 comment block in the
-        // SpawnTool wiring), so success here proves the
-        // `ensure_subagent_tools_available` preflight will pass for
-        // `allowed_tools=["run_pipeline"]`.
-        let mut child_registry = octos_agent::ToolRegistry::with_builtins(&data_dir);
-        child_registry.register_arc(factory.create(&octos_agent::SandboxConfig::default()));
         assert!(
-            child_registry.get("run_pipeline").is_some(),
-            "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
+            rt.pipeline_factory.is_none(),
+            "DOT factory must not be installed"
         );
+        assert!(rt.tool_specs.get("run_pipeline").is_none());
+        assert!(
+            !rt.tool_specs
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "run_pipeline")
+        );
+        let reloaded = rt.rebuild_plugin_layer().await.unwrap();
+        assert!(reloaded.pipeline_factory.is_none());
+        assert!(reloaded.tool_specs.get("run_pipeline").is_none());
+        let session = super::super::SessionRuntime::bootstrap(
+            &reloaded,
+            octos_core::SessionKey::new("api", "no-dot"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(session.tools.get("run_pipeline").is_none());
+    }
+
+    #[tokio::test]
+    async fn native_research_synthesis_is_retained_for_plugin_reload() {
+        let _key = ScopedEnvKey::set("OCTOS_NATIVE_RESEARCH_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = fixture_profile("native-research", "OCTOS_NATIVE_RESEARCH_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, tmp.path(), None, BootstrapRole::Serve)
+            .await
+            .unwrap();
+        let config = rt
+            .plugin_reload
+            .as_ref()
+            .unwrap()
+            .synthesis_config
+            .as_ref()
+            .expect(
+                "serve must inject the current route into native research, including skill reloads",
+            );
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(
+            config.api_key,
+            std::env::var("OCTOS_NATIVE_RESEARCH_KEY").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn research_lane_router_sends_the_matching_chat_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 16384];
+            let n = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]).to_string();
+            let body = r#"{"id":"test","object":"chat.completion","model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "api_key_env":"CHAT_KEY",
+            "env_vars":{"CHAT_KEY":"wrong-primary-key", "SHARED_KEY":"matching-chat-key"},
+            "fallback_models":[{"provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url, "api_key_env":"SHARED_KEY", "api_type":"openai"}],
+            "sub_providers":[{"key":"cheap", "provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url}]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        let router = build_sub_provider_router(&config).unwrap();
+        let provider = router.resolve("cheap").unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.chat(
+                &[octos_core::Message::user("Reply OK")],
+                &[],
+                &octos_llm::ChatConfig::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.content.as_deref(), Some("OK"));
+        let request = capture.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer matching-chat-key"));
+        assert!(!request.contains("wrong-primary-key"));
     }
 
     /// #1935 — a `sub_providers` entry keyed [`GOAL_VERIFIER_LANE_KEY`]

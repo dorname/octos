@@ -452,6 +452,23 @@ async fn wait_for_request_count(requests: &Arc<Mutex<Vec<CapturedRequest>>>, min
     }
 }
 
+/// `Channel::start` binds the appservice listener only after a best-effort
+/// registration round-trip, so poll for the port to accept instead of
+/// gambling on a fixed sleep (slow runner lanes lose that race with
+/// ConnectionRefused, #2267).
+async fn wait_for_appservice_port(port: u16) {
+    for _ in 0..400 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("appservice listener on 127.0.0.1:{port} never accepted within 10s");
+}
+
 #[test]
 fn test_matrix_channel_name() {
     let ch = make_channel();
@@ -504,8 +521,21 @@ fn test_make_api_url_strips_trailing_slash() {
 }
 
 #[test]
-fn test_default_appservice_bind_addr_uses_all_interfaces() {
-    assert_eq!(default_appservice_bind_addr(9880), "0.0.0.0:9880");
+fn test_default_appservice_bind_addr_is_loopback() {
+    assert_eq!(appservice_bind_addr(9880, None), "127.0.0.1:9880");
+}
+
+#[test]
+fn test_appservice_bind_addr_env_override_wins() {
+    assert_eq!(
+        appservice_bind_addr(9880, Some("  0.0.0.0:9880  ")),
+        "0.0.0.0:9880"
+    );
+}
+
+#[test]
+fn test_appservice_bind_addr_blank_override_falls_back_to_loopback() {
+    assert_eq!(appservice_bind_addr(9880, Some("   ")), "127.0.0.1:9880");
 }
 
 #[test]
@@ -603,6 +633,16 @@ fn test_validate_hs_token_rejects_mismatched_query_and_header() {
     headers.insert("authorization", "Bearer wrong".parse().unwrap());
     let result = validate_hs_token(&query, &headers, "secret");
     assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn test_validate_hs_token_accepts_matching_query_and_header() {
+    let query = AccessTokenQuery {
+        access_token: Some("secret".to_string()),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
 }
 
 // ── txn_id dedup test ────────────────────────────────────────────────
@@ -912,7 +952,7 @@ async fn test_handle_room_query_requires_token() {
         tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() })
     };
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_appservice_port(appservice_port).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!(
@@ -964,7 +1004,7 @@ async fn test_handle_transaction_invite_joins_room() {
     });
 
     let client = reqwest::Client::new();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_appservice_port(appservice_port).await;
 
     let http_resp = client
             .put(format!(
@@ -2109,6 +2149,23 @@ fn test_matrix_registration_no_overwrite() {
 
     let content = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(content, "custom", "existing file should not be overwritten");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_matrix_registration_file_mode_is_owner_only() {
+    let ch = make_channel();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = ch.generate_registration(tmp.path()).unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "registration YAML must not be group/world accessible: {:o}",
+        mode & 0o777
+    );
 }
 
 #[test]

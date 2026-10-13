@@ -180,6 +180,31 @@ export SMTP_PASSWORD="your-app-password"
 
 源码：`crates/octos-cli/src/api/admin_setup.rs`、`dashboard/src/pages/wizard/`。
 
+### 2.5 给外部代理授予会话访问（工作密钥）
+
+外部 CLI 或脚本代理不应持有你的仪表盘 bearer 令牌。*工作密钥*（work secret）是一种短生命周期凭证，只授予一个代理对单个会话的访问权，走会话入口 WebSocket 路由（`/v1/session_ingress/ws/{session_id}`）：
+
+```bash
+# 运维提示走 stderr，编码后的密钥走 stdout
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+
+# 列出已记录的授权（只有 SHA-256 哈希前缀；令牌从不落盘）
+octos auth list-work-secrets
+
+# 在过期前撤销
+octos auth revoke-work-secret '<secret>'
+```
+
+- `--ttl` 接受 `15m`、`1h`、`3600s` 这类值（默认 `1h`）；对同一会话重新签发会替换早先的授权。
+- 访客解码密钥后带 `Authorization: Bearer <token>` 连接。无法设置请求头的 WebSocket 客户端仍可用 `?token=` 查询参数，但该形式已弃用且会被服务端记录。
+- 每个客户端请求前都会重验授权；授权被撤销、过期或被重签替换后，存活套接字以 1008 关闭。只接受限定在被授权会话内的方法。
+
+完整走查（含最小 Python 客户端）：`docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`。
+
 ---
 
 ## 3. 配置 LLM 提供商
@@ -452,7 +477,7 @@ octos auth logout --provider openai
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -461,7 +486,7 @@ octos auth logout --provider openai
 }
 ```
 
-- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：30 秒）
+- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：10 秒）
 - **`error_rate_threshold`** — 错误率超过此值的提供商被降低优先级（默认：30%）
 - **`probe_probability`** — 发送到非主要提供商的探测请求比例（默认：10%）
 - **`probe_interval_secs`** — 同一提供商两次探测之间的最小间隔（默认：60 秒）
@@ -925,7 +950,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 | 命令 | 说明 |
 |------|------|
-| `/new` | 分叉对话 — 创建新会话，复制最后 10 条消息 |
+| `/new` | 清空当前会话历史（等同于 `/clear`） |
+| `/new <name>` | 切换到——或创建——具名会话（`/new slides <name>`、`/new site <preset>` 脚手架生成项目会话） |
 | `/config` | 查看和修改工具配置（见[第 6 节](#6-工具配置)） |
 | `/exit`、`/quit`、`:q` | 退出聊天（仅 CLI 模式） |
 
@@ -935,7 +961,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 - **会话持久化：** `.octos/sessions/` 中的 JSONL 文件
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
-- **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
+- **具名会话：** `/new <name>` 切换到——或创建——具名会话；裸 `/new` 与 `/clear` 一样清空历史。若一次后台封存被中断（历史已封存、活跃文件缺失），该会话会自愈：打开它，或在网关上 `/new <name>`，都会从封存分段重建活跃文件并接续历史，而不是从空白开始。
+- **内部派生的子会话**（如后台 spawn）带有 `parent_key` 字段指向其来源——用户创建的具名会话没有。
 - **三层上下文压缩（M8.5）：** 工作层 / 冷层 / 归档层。当对话超过 LLM 的上下文窗口时，较旧的消息按首行摘要（工具参数被剥离），最早的消息被推入实体库作为长期记忆。
 - **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次流式事件之前完成绑定，并在后续 UI Protocol 更新中携带。终态事件还携带 `committed_seq`（最终写入的持久序号），客户端因此能够在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
 - **结构化恢复（M8.6）：** 当工作树缺失或子 Agent 失败时，监督者拒绝静默丢弃当前轮次，而是用一个描述失败原因的结构化恢复负载重新驱动 LLM。
@@ -2019,7 +2046,7 @@ chmod +x .octos/skills/translator/main
   // 自适应路由
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2179,6 +2206,9 @@ chmod +x .octos/skills/translator/main
 | **语音** | |
 | `ASR_API_URL` | 独立批量 ASR 服务基址；设置后转录不再走 OMiniX |
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
+| **会话存储** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |
 | **系统** | |
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
 | `OCTOS_LOG_JSON` | 启用 JSON 格式日志（设置为任意值） |
@@ -2298,7 +2328,7 @@ openssl rand -hex 32   # → hs_token
 
 #### 2. 创建应用服务注册文件
 
-创建 `appservices/octos-registration.yaml`：
+创建 `appservices/octos-registration.yaml`（文件明文携带两个 token，保持仅所有者可读：`chmod 600 appservices/octos-registration.yaml`）：
 
 ```yaml
 # Matrix 应用服务注册 — octos
@@ -2402,7 +2432,7 @@ Matrix 频道字段说明：
 | `server_name` | Matrix 域名（必须与 `palpo.toml` 一致）。 |
 | `sender_localpart` | 机器人用户名（必须与注册文件一致）。 |
 | `user_prefix` | 此应用服务管理的桥接用户 ID 前缀。 |
-| `port` | Octos 监听来自 Palpo 的应用服务事件的端口。 |
+| `port` | Octos 监听来自 Palpo 的应用服务事件的端口。监听默认只绑 `127.0.0.1`；跨容器部署用 `OCTOS_MATRIX_APPSERVICE_BIND` 覆盖绑定地址（见下方 compose 文件）。 |
 | `allowed_senders` | 允许与机器人对话的 Matrix 用户 ID。空数组 = 允许所有人。 |
 | `mention_only` | 可选，默认 `true`。在真正的 1:1 私聊之外，机器人只在被显式寻址时才回复（`m.mentions` 条目、MXID pill/提及、或客户端指定的 target）。真正的 1:1 私聊——1 个人类 + 该应用服务在此房间仅管理 1 个机器人（以应用服务自己的房间映射为准）——始终回复。多机器人房间即使只有 1 个人类也要求提及，避免所有机器人同时应答。设为 `false` 则在所有房间回复每条消息（带 `org.octos.explicit_room` 标记的消息仍走门控）。 |
 
@@ -2452,11 +2482,15 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # 应用服务监听（接收 Palpo 推送的事件）
+      # 8009 刻意不发布到主机：Palpo 通过 internal 桥接网络直连应用服务监听
+      # （http://octos:8009），监听只靠 hs_token 认证，不应暴露到 compose
+      # 网络之外。
       - 8010:8080     # Octos 仪表盘 / 管理 API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # 应用服务监听默认只绑回环地址；跨容器的 homeserver 推送需要显式放开。
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
@@ -2496,7 +2530,7 @@ Palpo 在启动时读取 `appservices/octos-registration.yaml`。当 Matrix 用�
 | 症状 | 原因 | 解决方法 |
 |------|------|----------|
 | 机器人无响应 | 注册文件与配置文件之间令牌不匹配 | 检查[令牌匹配清单](#164-令牌匹配检查清单) |
-| Palpo 日志中出现 `Connection refused` | Octos 未运行或注册文件中 `url` 错误 | 确保 Octos 已启动；使用 Docker 服务名（`http://octos:8009`），不要用 `localhost` |
+| Palpo 日志中出现 `Connection refused` | Octos 未运行、注册文件中 `url` 错误，或 Palpo 容器连不到监听 | 确保 Octos 已启动；使用 Docker 服务名（`http://octos:8009`），不要用 `localhost`。跨容器部署必须设置 `OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009` —— 监听默认只绑回环地址 |
 | `User ID not in namespace` | `sender_localpart` 与注册文件 `namespaces.users` 正则不匹配 | 更新正则以包含机器人的完整用户 ID |
 | 未授权用户的消息被忽略 | `allowed_senders` 过滤 | 将用户的 Matrix ID 添加到数组中，或设置为 `[]` 以允许所有人 |
 

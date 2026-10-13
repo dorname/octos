@@ -1056,8 +1056,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn local_frontends_share_oup_persistence_and_reopen_context() {
+    /// The local runtime's turn path polls deep agent futures, which need the
+    /// 8 MiB stacks every production entry point sets (chat, ACP, gateway,
+    /// MCP, embedded serve); `#[tokio::test]` drives this future on the test
+    /// thread itself, and a Windows debug build overflows that default stack —
+    /// which aborts the whole test binary, taking every other test's result
+    /// with it (#2581). Same class as the stdio dispatch test in
+    /// `api::ui_protocol_tests`, same treatment: run it on a thread with an
+    /// 8 MiB stack instead of whatever stack the harness hands out. Before the
+    /// wrapper, running the test binary under `RUST_MIN_STACK=1048576`
+    /// reproduced the abort on any platform.
+    #[test]
+    fn local_frontends_share_oup_persistence_and_reopen_context() {
+        std::thread::Builder::new()
+            .name("local-oup-reopen".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(local_frontends_share_oup_persistence_and_reopen_context_body());
+            })
+            .expect("spawn big-stack test thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+    }
+
+    async fn local_frontends_share_oup_persistence_and_reopen_context_body() {
         use crate::runtime::local_oup::{LocalOupOptions, bootstrap, local_profile};
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1173,20 +1200,14 @@ mod tests {
             .tools
             .get("workspace_probe")
             .expect("session must load its own project plugins");
-        assert!(
-            !Arc::ptr_eq(
-                a.profile.pipeline_factory.as_ref().unwrap(),
-                profile.pipeline_factory.as_ref().unwrap(),
-            ),
-            "project plugin discovery must also rebind the child pipeline factory"
-        );
-        assert!(
-            Arc::ptr_eq(
-                b.profile.pipeline_factory.as_ref().unwrap(),
-                profile.pipeline_factory.as_ref().unwrap(),
-            ),
-            "a workspace without project plugins keeps the shared factory"
-        );
+        assert!(profile.pipeline_factory.is_none());
+        for session in [&a, &b] {
+            assert!(
+                session.profile.pipeline_factory.is_none(),
+                "workspace plugin discovery must not restore the retired DOT factory"
+            );
+            assert!(session.tools.get("run_pipeline").is_none());
+        }
         let plugin = tool
             .as_any()
             .downcast_ref::<octos_agent::plugins::PluginTool>()

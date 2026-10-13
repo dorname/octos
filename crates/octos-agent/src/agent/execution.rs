@@ -396,7 +396,12 @@ struct ApprovedToolAutoApprover;
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for ApprovedToolAutoApprover {
-    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // A once-only approval (a host-routed app tool, UPCR-2026-035) is the
+        // person's answer to one exact call; a replay path never grants it.
+        if request.once_only {
+            return ToolApprovalDecision::Deny;
+        }
         ToolApprovalDecision::Approve
     }
 }
@@ -2220,6 +2225,7 @@ impl Agent {
                 content,
                 tool_files_modified,
                 tool_files_to_send,
+                tool_model_media,
                 tool_tokens,
                 tool_success,
                 tool_structured_metadata,
@@ -2285,6 +2291,14 @@ impl Agent {
                         tool_files_modified.push(file);
                     }
                     let tool_files_to_send = tool_result.files_to_send.clone();
+                    // Media the tool wants the model to see rides on the
+                    // tool message's `media`; each provider renders it in
+                    // its own shape for the current batch (octos_llm::tool_media).
+                    let tool_model_media: Vec<String> = tool_result
+                        .model_media
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -2302,6 +2316,7 @@ impl Agent {
                         tool_result.output,
                         tool_files_modified,
                         tool_files_to_send,
+                        tool_model_media,
                         tool_result.tokens_used,
                         success,
                         tool_result.structured_metadata,
@@ -2357,6 +2372,7 @@ impl Agent {
                         .any(|src| src.is::<crate::tools::ToolInputError>());
                     (
                         format!("Error: {e}"),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -2440,7 +2456,7 @@ impl Agent {
                 Message {
                     role: MessageRole::Tool,
                     content,
-                    media: vec![],
+                    media: tool_model_media,
                     tool_calls: None,
                     tool_call_id: Some(tc_id),
                     reasoning_content: None,
@@ -2605,7 +2621,16 @@ impl Agent {
         );
         let tool_timeout = tool_timeout_secs.map(Duration::from_secs);
 
-        let results: Vec<ToolCallResult> = if !any_exclusive {
+        let results: Vec<ToolCallResult> = if self.steer_input_pending() {
+            // A newer user instruction arrived during sampling or an earlier
+            // batch. Complete the call/result pairs without starting stale work;
+            // the loop drains the input before its next model request.
+            response
+                .tool_calls
+                .iter()
+                .map(steering_deferred_result)
+                .collect()
+        } else if !any_exclusive {
             // Parallel admission — the classic all-Safe path. Spawn every
             // tool call as a detached task and join them against one shared
             // deadline (see `join_parallel_handles` for the aggregation and
@@ -2706,7 +2731,6 @@ impl Agent {
                 structured_metadata.push(meta);
             }
         }
-
         Ok((
             messages,
             files_modified,
@@ -2770,6 +2794,11 @@ impl Agent {
                     "cancelling remaining tool call in serial batch after sibling error"
                 );
                 results.push(cancelled_result(tool_call));
+                continue;
+            }
+
+            if self.steer_input_pending() {
+                results.push(steering_deferred_result(tool_call));
                 continue;
             }
 
@@ -3011,6 +3040,17 @@ async fn join_parallel_handles(
     }
 }
 
+/// Preserve protocol pairing for a call not started because the user steered.
+/// Running tools finish normally; these results never claim execution or undo.
+fn steering_deferred_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
+    let mut result = cancelled_result(tool_call);
+    result.0.content = format!(
+        "Tool '{}' was not executed because a newer user instruction is pending. Read that instruction before deciding whether this call is still needed.",
+        tool_call.name
+    );
+    result
+}
+
 /// Build a synthetic tool-result message for a peer that was cancelled after
 /// a sibling tool errored in a serial (M8.8) batch.
 fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
@@ -3097,6 +3137,30 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn should_never_auto_approve_a_once_only_request() {
+        use crate::tools::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
+        let request = |once_only| ToolApprovalRequest {
+            tool_id: "c1".into(),
+            tool_name: "mail_send".into(),
+            title: "Approve".into(),
+            body: "exact args".into(),
+            command: None,
+            cwd: None,
+            once_only,
+            host_tool: None,
+        };
+        let approver = super::ApprovedToolAutoApprover;
+        assert_eq!(
+            approver.request_approval(request(true)).await,
+            ToolApprovalDecision::Deny
+        );
+        assert_eq!(
+            approver.request_approval(request(false)).await,
+            ToolApprovalDecision::Approve
+        );
+    }
+
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
         satisfied_completion_content, satisfied_delivery_is_failure, should_auto_send_tool_files,
@@ -3611,6 +3675,83 @@ mod tests {
         }
     }
 
+    /// Returns an image for the model to look at (`model_media`), the way
+    /// `view_image` does.
+    struct SeeingTool {
+        image: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for SeeingTool {
+        fn name(&self) -> &str {
+            "seeing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that hands the model an image"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "SEEING_TOOL_OUTPUT".to_string(),
+                success: true,
+                model_media: vec![self.image.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_carry_model_media_on_the_tool_row_and_add_no_other_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("grab.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SeeingTool {
+            image: image.clone(),
+        });
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent =
+            Agent::new(AgentId::new("seeing"), provider, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_see", "seeing_tool"),
+                tool_call("call_fast", "fast_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        // Exactly the two tool results: the media is on its row, and the
+        // providers render it from there. No synthetic user row — one
+        // would break role alternation on Anthropic and root a stray
+        // thread in the transcript.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
+        assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(
+            messages[0].media,
+            vec![image.to_string_lossy().into_owned()]
+        );
+        assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
+        assert!(messages[1].media.is_empty());
+    }
+
     /// Sleeps far past the batch ceiling so the batch timeout always fires
     /// while this call is still pending.
     struct SleepingTool;
@@ -3755,6 +3896,88 @@ mod tests {
                 success: true,
                 ..Default::default()
             })
+        }
+    }
+
+    struct SteeringBoundaryTool {
+        buffer: crate::steering::SharedSteerBuffer,
+        safe: bool,
+    }
+
+    #[async_trait]
+    impl Tool for SteeringBoundaryTool {
+        fn name(&self) -> &str {
+            "steering_boundary"
+        }
+        fn description(&self) -> &str {
+            "Injects steering while a tool is running"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            if self.safe {
+                crate::tools::ConcurrencyClass::Safe
+            } else {
+                crate::tools::ConcurrencyClass::Exclusive
+            }
+        }
+        async fn execute(&self, _: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.buffer.push("stop editing; explain first".into());
+            Ok(ToolResult {
+                output: "FIRST_COMPLETED".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_yields_after_running_tool_before_another_mutation() {
+        // Exercise both serial execution and the read-to-write boundary of a
+        // mixed batch. Real tools run: a later mutation must never be invoked.
+        for safe in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let buffer = Arc::new(crate::steering::SteerBuffer::default());
+            let mutated = Arc::new(AtomicBool::new(false));
+            let mut tools = ToolRegistry::new();
+            tools.register(SteeringBoundaryTool {
+                buffer: buffer.clone(),
+                safe,
+            });
+            tools.register(MutatingTool {
+                mutated: mutated.clone(),
+            });
+            let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+            let agent = Agent::new(
+                AgentId::new("boundary"),
+                Arc::new(NoChatProvider),
+                tools,
+                memory,
+            )
+            .with_steer_buffer(buffer.clone());
+            let response = ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    tool_call("first", "steering_boundary"),
+                    tool_call("second", "mutating_tool"),
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            };
+            let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+            assert!(!mutated.load(Ordering::SeqCst));
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "FIRST_COMPLETED");
+            assert_eq!(messages[1].tool_call_id.as_deref(), Some("second"));
+            assert!(messages[1].content.contains("was not executed"));
+            assert_eq!(
+                success,
+                vec![("first".into(), true), ("second".into(), false)]
+            );
+            assert_eq!(buffer.drain(), vec!["stop editing; explain first"]);
         }
     }
 

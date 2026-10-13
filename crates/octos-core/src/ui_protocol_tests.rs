@@ -114,6 +114,7 @@ fn reasoning_effort_level_wire_shape() {
         reasoning_effort: Some(ReasoningEffortLevel::Max),
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert_eq!(wire["reasoning_effort"], json!("max"));
@@ -153,6 +154,7 @@ fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert!(wire.get("live_video").is_none());
@@ -195,6 +197,7 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: Some(ReasoningEffortLevel::High),
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     assert_eq!(wire["reasoning_effort"], json!("high"));
@@ -222,6 +225,52 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
     let parsed: SessionOpened =
         serde_json::from_value(legacy).expect("legacy payload without field decodes");
     assert_eq!(parsed.reasoning_effort, None);
+}
+
+#[test]
+fn session_opened_echoes_accepted_client_commands() {
+    let opened = SessionOpened {
+        session_id: SessionKey("local:demo".into()),
+        active_profile_id: None,
+        workspace_root: None,
+        context: None,
+        context_state: None,
+        cursor: None,
+        panes: None,
+        capabilities: UiProtocolCapabilities::first_server_slice(),
+        reasoning_effort: None,
+        accepted_client_commands: Some(vec!["/model".into()]),
+    };
+    let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+    assert_eq!(wire["accepted_client_commands"], json!(["/model"]));
+    let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+    assert_eq!(back.accepted_client_commands, Some(vec!["/model".into()]));
+
+    // A declaration the server dropped entirely stays distinguishable from
+    // an open that declared nothing.
+    let all_dropped = SessionOpened {
+        accepted_client_commands: Some(Vec::new()),
+        ..opened.clone()
+    };
+    let wire = serde_json::to_value(&all_dropped).expect("serialize empty");
+    assert_eq!(wire["accepted_client_commands"], json!([]));
+
+    let undeclared = SessionOpened {
+        accepted_client_commands: None,
+        ..opened
+    };
+    let wire = serde_json::to_value(&undeclared).expect("serialize None");
+    assert!(wire.get("accepted_client_commands").is_none());
+    let legacy = json!({
+        "session_id": "local:demo",
+        "capabilities": serde_json::to_value(
+            UiProtocolCapabilities::first_server_slice()
+        )
+        .unwrap()
+    });
+    let parsed: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy payload without field decodes");
+    assert_eq!(parsed.accepted_client_commands, None);
 }
 
 #[test]
@@ -340,6 +389,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
             read_allow_paths: vec!["/repo/docs".into()],
         }),
         after: None,
+        client_commands: None,
     };
 
     let wire = serde_json::to_value(&params).expect("serialize session/open params");
@@ -362,6 +412,39 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     assert!(decoded_legacy.topic.is_none());
     assert!(decoded_legacy.cwd.is_none());
     assert!(decoded_legacy.sandbox.is_none());
+}
+
+#[test]
+fn session_open_client_commands_round_trip() {
+    let params = SessionOpenParams {
+        session_id: SessionKey("local:demo".into()),
+        topic: None,
+        profile_id: None,
+        cwd: None,
+        sandbox: None,
+        after: None,
+        client_commands: Some(vec!["/model".into(), "/add-model".into()]),
+    };
+
+    let wire = serde_json::to_value(&params).expect("serialize session/open params");
+    assert_eq!(wire["client_commands"], json!(["/model", "/add-model"]));
+    let decoded: SessionOpenParams =
+        serde_json::from_value(wire).expect("deserialize session/open params");
+    assert_eq!(decoded, params);
+}
+
+#[test]
+fn session_open_client_commands_stay_off_the_wire_when_absent() {
+    let legacy: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo"})).expect("legacy params");
+    assert!(legacy.client_commands.is_none());
+    let wire = serde_json::to_value(&legacy).expect("serialize legacy params");
+    assert!(wire.get("client_commands").is_none());
+
+    let declared_none: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo", "client_commands": []}))
+            .expect("an empty declaration is distinct from an absent one");
+    assert_eq!(declared_none.client_commands, Some(Vec::new()));
 }
 
 #[test]
@@ -477,6 +560,7 @@ fn session_opened_pane_snapshot_round_trips() {
         }),
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -511,6 +595,7 @@ fn session_open_result_includes_capabilities_field() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     let capabilities = wire
@@ -534,6 +619,7 @@ fn session_open_result_includes_capabilities_field() {
     for feature in UI_PROTOCOL_KNOWN_FEATURES {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
+            || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
         {
             continue;
         }
@@ -874,6 +960,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "turn/started",
             "turn/completed",
             "turn/error",
+            "turn/steer_dropped",
             "message/delta",
             "message/reasoning_delta",
             "tool/started",
@@ -910,16 +997,20 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/goal/cleared",
             "loop/updated",
             "loop/fired",
-            "loop/completed",
             "monitor/fired",
             "monitor/updated",
             "monitor/expired",
             "context/compaction_completed",
             "context/compaction_started",
             "context/normalization_reported",
+            "context/state_reported",
+            "session/orchestration",
             "peer/staged",
             "peer/closed",
             "background/activity",
+            "peer/tool/call",
+            "peer/tool/cancel",
+            "peer/input",
         ]
     );
     assert_eq!(
@@ -1098,6 +1189,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "turn/started",
                 "turn/completed",
                 "turn/error",
+                "turn/steer_dropped",
                 "message/delta",
                 "message/reasoning_delta",
                 "tool/started",
@@ -1134,16 +1226,20 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/goal/cleared",
                 "loop/updated",
                 "loop/fired",
-                "loop/completed",
                 "monitor/fired",
                 "monitor/updated",
                 "monitor/expired",
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
+                "context/state_reported",
+                "session/orchestration",
                 "peer/staged",
                 "peer/closed",
-                "background/activity"
+                "background/activity",
+                "peer/tool/call",
+                "peer/tool/cancel",
+                "peer/input"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1188,6 +1284,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     })
     .into_rpc_request("req-turn-start")
     .expect("serialize turn/start");
@@ -1451,7 +1548,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
         ApprovalCommandDetails {
             argv: vec!["cargo".into(), "test".into()],
             command_line: Some("cargo test".into()),
-            cwd: Some("/Users/yuechen/home/octos".into()),
+            cwd: Some("/workspace/octos".into()),
             env_keys: vec!["RUST_LOG".into()],
             tool_call_id: Some("tool-1".into()),
         },
@@ -1459,7 +1556,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
             mode: Some("workspace_write".into()),
             filesystem_access: Some("workspace_write".into()),
             network_access: Some(false),
-            writable_roots: vec!["/Users/yuechen/home/octos".into()],
+            writable_roots: vec!["/workspace/octos".into()],
         }),
     );
     assert_typed_approval_round_trips(
@@ -1500,6 +1597,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                 filesystem: None,
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1518,10 +1616,11 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     operation: "write".into(),
                     paths: vec!["docs/example.md".into()],
                     outside_workspace: false,
-                    writable_roots: vec!["/Users/yuechen/home/octos".into()],
+                    writable_roots: vec!["/workspace/octos".into()],
                 }),
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1544,6 +1643,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     urls: vec!["https://api.openai.com/v1/responses".into()],
                 }),
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1576,6 +1676,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     justification: Some("Run integration tests".into()),
                     suggested_prefix_rule: vec!["cargo".into(), "test".into()],
                 }),
+                host_tool: None,
             }),
             ..generic
         },
@@ -1947,6 +2048,7 @@ fn ui_command_builds_and_parses_json_rpc_request() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let request = command
@@ -2015,6 +2117,7 @@ fn turn_start_round_trips_with_media_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2057,6 +2160,7 @@ fn turn_start_round_trips_with_topic_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2099,6 +2203,7 @@ fn turn_start_round_trips_with_rewrite_for_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2146,6 +2251,7 @@ fn turn_start_round_trips_with_all_beta1_fields() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2277,6 +2383,7 @@ fn typed_rpc_results_map_from_methods_and_round_trip() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -3029,19 +3136,6 @@ fn m15_autonomy_notifications_register_methods_and_round_trip() {
             }),
             methods::LOOP_FIRED,
         ),
-        (
-            UiNotification::LoopCompleted(LoopCompletedEvent {
-                session_id,
-                profile_id: Some("coding".into()),
-                loop_id: "loop_01".into(),
-                loop_state: Some(loop_state),
-                status: Some("completed".into()),
-                completed_at_ms: Some(1_778_870_090_000),
-                result: Some(json!({ "message": "iteration completed" })),
-                error: None,
-            }),
-            methods::LOOP_COMPLETED,
-        ),
     ];
 
     for (event, method) in cases {
@@ -3272,6 +3366,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     });
 
     let opened_wire = opened
@@ -3298,6 +3393,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         tokens_in: None,
         tokens_out: None,
         session_result: None,
+        token_usage: None,
     });
     let completed_wire = completed
         .clone()
@@ -3758,28 +3854,48 @@ fn input_item_unknown_kind_falls_through() {
 
 #[test]
 fn rpc_error_codes_partition_is_disjoint() {
-    // Application-layer codes must live in -32100..=-32199; the
-    // spec-pinned APPROVAL_NOT_PENDING is the documented exception.
-    for code in [
-        rpc_error_codes::UNKNOWN_SESSION,
-        rpc_error_codes::UNKNOWN_TURN,
-        rpc_error_codes::UNKNOWN_APPROVAL_ID,
-        rpc_error_codes::UNKNOWN_PREVIEW_ID,
-        rpc_error_codes::UNKNOWN_TASK_ID,
-        rpc_error_codes::APPROVAL_CANCELLED,
-        rpc_error_codes::CURSOR_OUT_OF_RANGE,
-        rpc_error_codes::CURSOR_INVALID,
-        rpc_error_codes::PERMISSION_DENIED,
-        rpc_error_codes::UNSUPPORTED_CAPABILITY,
-        rpc_error_codes::RUNTIME_NOT_READY,
-        rpc_error_codes::MALFORMED_RESULT,
-        rpc_error_codes::RATE_LIMITED,
-    ] {
+    // Application-layer codes must live in -32100..=-32199. The set under
+    // check is derived from the module's own constants rather than
+    // hand-copied, so a new constant is range-checked the moment it lands;
+    // only the documented out-of-band slots below are exempt, and each
+    // exemption must itself sit in its docblock band, so the exemption
+    // lists cannot silently swallow an application code.
+    let json_rpc_reserved = [
+        rpc_error_codes::PARSE_ERROR,
+        rpc_error_codes::INVALID_REQUEST,
+        rpc_error_codes::METHOD_NOT_FOUND,
+        rpc_error_codes::INVALID_PARAMS,
+        rpc_error_codes::INTERNAL_ERROR,
+    ];
+    let server_band = [
+        rpc_error_codes::METHOD_NOT_SUPPORTED,
+        rpc_error_codes::APPROVAL_NOT_PENDING,
+    ];
+    for &code in &json_rpc_reserved {
         assert!(
-            (-32199..=-32100).contains(&code),
-            "{code} outside -32100..=-32199",
+            (-32700..=-32600).contains(&code),
+            "{code} outside the JSON-RPC reserved block -32700..=-32600",
         );
     }
+    for &code in &server_band {
+        assert!(
+            (-32099..=-32000).contains(&code),
+            "{code} outside the server band -32000..=-32099",
+        );
+    }
+    let mut outside_band = Vec::new();
+    for (name, code) in parse_rpc_error_code_constants() {
+        if json_rpc_reserved.contains(&code) || server_band.contains(&code) {
+            continue;
+        }
+        if !(-32199..=-32100).contains(&code) {
+            outside_band.push(format!("{name}={code}"));
+        }
+    }
+    assert!(
+        outside_band.is_empty(),
+        "codes outside -32100..=-32199: {outside_band:?}",
+    );
     assert_eq!(rpc_error_codes::APPROVAL_NOT_PENDING, -32011);
     assert_eq!(rpc_error_codes::APPROVAL_CANCELLED, -32105);
 }
@@ -4144,6 +4260,9 @@ fn golden_session_hydrate_result_serde() {
             source: Some("user".into()),
             media: vec![],
             reasoning_content: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![],
         }]),
         threads: Some(vec![ThreadGraphEntry {
             thread_id: "thread-1".into(),
@@ -4200,6 +4319,76 @@ fn golden_session_hydrate_result_serde() {
     // Bug C: a non-negotiated client never sees the new field.
     assert!(!object.contains_key("replayed_envelopes"));
     assert!(!object.contains_key("replayed_tool_envelopes"));
+}
+
+/// UPCR-2026-039: tool rows carry their call id and tool name, an assistant
+/// row its calls. A row without either keeps the pre-UPCR wire shape, and a
+/// pre-UPCR row decodes with the fields absent.
+#[test]
+fn should_carry_tool_call_identity_when_a_hydrated_row_is_a_tool_call_or_result() {
+    let row = |role: &str| HydratedMessage {
+        seq: 3,
+        role: role.into(),
+        content: String::new(),
+        turn_id: None,
+        thread_id: Some("thread-1".into()),
+        client_message_id: None,
+        persisted_at: sample_persisted_at(),
+        message_id: None,
+        source: None,
+        media: vec![],
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: vec![],
+    };
+    let call = HydratedMessage {
+        tool_calls: vec![HydratedToolCall {
+            tool_call_id: "call-1".into(),
+            tool_name: "peer_send_input".into(),
+        }],
+        ..row("assistant")
+    };
+    let result = HydratedMessage {
+        tool_call_id: Some("call-1".into()),
+        tool_name: Some("peer_send_input".into()),
+        ..row("tool")
+    };
+
+    let call_wire = serde_json::to_value(&call).expect("serialize call row");
+    assert_eq!(
+        call_wire["tool_calls"],
+        json!([{ "tool_call_id": "call-1", "tool_name": "peer_send_input" }])
+    );
+    assert!(call_wire.get("tool_call_id").is_none());
+    assert!(call_wire.get("tool_name").is_none());
+    let result_wire = serde_json::to_value(&result).expect("serialize result row");
+    assert_eq!(result_wire["tool_call_id"], "call-1");
+    assert_eq!(result_wire["tool_name"], "peer_send_input");
+    assert!(result_wire.get("tool_calls").is_none());
+    for parsed in [&call, &result] {
+        let wire = serde_json::to_value(parsed).expect("serialize");
+        let decoded: HydratedMessage = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(&decoded, parsed);
+    }
+
+    // Additive: a plain row serializes without the new keys, and a row from
+    // a server without UPCR-2026-039 decodes with them absent.
+    let plain = serde_json::to_value(row("user")).expect("serialize plain row");
+    for key in ["tool_call_id", "tool_name", "tool_calls"] {
+        assert!(plain.get(key).is_none(), "{key} must be omitted: {plain}");
+    }
+    let legacy: HydratedMessage = serde_json::from_value(json!({
+        "seq": 4,
+        "role": "tool",
+        "content": "ok",
+        "thread_id": "thread-1",
+        "persisted_at": "2026-04-30T12:00:00Z",
+    }))
+    .expect("deserialize a pre-UPCR-2026-039 row");
+    assert_eq!(legacy.tool_call_id, None);
+    assert_eq!(legacy.tool_name, None);
+    assert!(legacy.tool_calls.is_empty());
 }
 
 #[test]
@@ -4873,6 +5062,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     // existing REST contract emits.
     let listing = SessionListResult {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        workspace_root: None,
+        profile_id: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5123,6 +5314,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // new wire shape so a rename/type-flip of the field fails here.
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
+        profile_id: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5131,6 +5323,21 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let parsed_cwd: SessionListParams =
         serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
     assert_eq!(parsed_cwd, with_cwd);
+    // session/list — WITH the additive `profile_id` (names the per-project
+    // store's profile, same as session/open). Also optional and skipped
+    // when absent, so the two pins above stay byte-identical.
+    let with_profile = SessionListParams {
+        cwd: Some("/home/me/proj".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&with_profile).expect("serialize"),
+        serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }),
+    );
+    let parsed_profile: SessionListParams =
+        serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }))
+            .expect("decode");
+    assert_eq!(parsed_profile, with_profile);
 
     // session/snapshot
     let p = SessionSnapshotParams {
@@ -5362,14 +5569,38 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
 /// downstream client. Each `assert_eq!` is the contract.
 #[test]
 fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
-    // session/list — `{ sessions: <opaque> }`
+    // session/list — `{ sessions: <opaque> }` for a legacy (unscoped)
+    // listing: the scope fields are absent, not null, so a client can tell
+    // "not scoped" from "scoped to nothing".
     assert_eq!(
         serde_json::to_value(SessionListResult {
             sessions: serde_json::json!([{ "id": "s-1" }]),
+            workspace_root: None,
+            profile_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
     );
+    // session/list — a workspace-scoped listing attests the canonical root
+    // and profile whose `<root>/.octos/<profile>` store it read.
+    let scoped = SessionListResult {
+        sessions: serde_json::json!([{ "id": "s-1" }]),
+        workspace_root: Some("/srv/project".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&scoped).expect("serialize"),
+        serde_json::json!({
+            "sessions": [{ "id": "s-1" }],
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
+    // Older servers never send the scope fields; they still decode.
+    let legacy: SessionListResult =
+        serde_json::from_value(serde_json::json!({ "sessions": [] })).expect("decode");
+    assert_eq!(legacy.workspace_root, None);
+    assert_eq!(legacy.profile_id, None);
 
     // session/snapshot — `{ status, files, tasks }`
     assert_eq!(
@@ -6656,6 +6887,10 @@ fn monitor_error_kinds_are_registered() {
         "monitor_policy_denied"
     );
     assert_eq!(autonomy_error_kinds::MONITOR_FLOODED, "monitor_flooded");
+    assert_eq!(
+        autonomy_error_kinds::MONITOR_INVALID_STATE,
+        "monitor_invalid_state"
+    );
 }
 
 /// #1977 — the monitor notifications roundtrip through `UiNotification`
@@ -6787,6 +7022,30 @@ fn turn_steer_dropped_topic_routing_matches_other_turn_events() {
     assert_eq!(rpc.params["topic"], json!("explicit"));
 }
 
+// #2540: both notifications ship on the wire — `turn/steer_dropped` from the
+// steer path (negotiated `event.turn_steer_dropped.v1`, delivery unfiltered)
+// and `session/orchestration` from the whole-job indicator — but neither sat
+// in `UI_PROTOCOL_NOTIFICATION_METHODS`, so `client_hello` never advertised
+// them and a strict client validating frames against the advertised set
+// would reject legitimate ones.
+#[test]
+fn wire_shipped_steer_dropped_and_orchestration_notifications_are_advertised() {
+    let capabilities = UiProtocolCapabilities::first_server_slice();
+    for method in [methods::TURN_STEER_DROPPED, methods::SESSION_ORCHESTRATION] {
+        assert!(
+            UI_PROTOCOL_NOTIFICATION_METHODS.contains(&method),
+            "{method} ships on the wire and must be advertised"
+        );
+        assert!(
+            capabilities
+                .supported_notifications
+                .iter()
+                .any(|advertised| advertised == method),
+            "first_server_slice must advertise {method}"
+        );
+    }
+}
+
 #[test]
 fn context_state_semantic_cache_diagnostics_are_optional_and_backward_compatible() {
     let legacy = json!({
@@ -6819,4 +7078,246 @@ fn context_state_semantic_cache_diagnostics_are_optional_and_backward_compatible
     let encoded = serde_json::to_value(current).unwrap();
     assert_eq!(encoded["cache_epoch_id"], "sha256:epoch");
     assert_eq!(encoded["semantic_head_kind"], "tool_interaction");
+}
+
+// §10 ↔ `rpc_error_codes` parity: spec §10 pins every numeric error code by
+// name and value, so docblocks may cite "Spec pins this at N" truthfully and
+// the two sides cannot drift apart silently.
+
+/// The §10 slice of the UI Protocol spec, cut the same fail-closed way as the
+/// §6 catalog test in `octos-cli`'s `api::ui_protocol_tests`: header to the
+/// next `## ` heading, erroring when either boundary moves.
+fn spec_section_10_slice() -> String {
+    let spec_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md"
+    );
+    let spec = std::fs::read_to_string(spec_path)
+        .unwrap_or_else(|e| panic!("cannot read UI Protocol spec at {spec_path}: {e}"));
+    let start = spec
+        .find("## 10. Error Model")
+        .expect("UI Protocol spec is missing `## 10. Error Model`");
+    let rest = &spec[start..];
+    let end = rest
+        .find("\n## ")
+        .expect("UI Protocol spec §10 must be followed by a `## ` section heading");
+    rest[..end].to_string()
+}
+
+/// Parse the `pub const NAME: i64 = VALUE;` lines out of the
+/// `rpc_error_codes` module. Reading the constants from source (instead of
+/// hand-copying them here) is what makes the §10 parity test fail when a new
+/// constant lands without a spec pin.
+fn parse_rpc_error_code_constants() -> Vec<(String, i64)> {
+    let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui_protocol.rs");
+    let source = std::fs::read_to_string(source_path)
+        .unwrap_or_else(|e| panic!("cannot read ui_protocol.rs at {source_path}: {e}"));
+    let module = &source[source
+        .find("pub mod rpc_error_codes")
+        .expect("ui_protocol.rs is missing `pub mod rpc_error_codes`")..];
+    // Bound the module at its column-0 closing brace; everything inside is
+    // indented, so a bare `\n}` can only be the module's own terminator.
+    let module = module
+        .split("\n}")
+        .next()
+        .expect("rpc_error_codes module must be closed by a column-0 `}`");
+
+    let mut constants = Vec::new();
+    for line in module.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(": i64 = ") else {
+            panic!("rpc_error_codes constant not in `pub const NAME: i64 = VALUE;` form: {line}");
+        };
+        let value: i64 = value
+            .trim_end_matches(';')
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse rpc_error_codes value for {name}: {e}"));
+        constants.push((name.to_string(), value));
+    }
+    assert!(
+        constants.len() >= 20,
+        "parsed only {} constants from rpc_error_codes — the §10 parity scan \
+         must fail closed when the constant format changes",
+        constants.len()
+    );
+    constants
+}
+
+/// Every `-32ddd` literal in `slice` that is not one of `pinned`. Digit
+/// guards on both sides keep longer numeric runs from partially matching.
+fn unpinned_numeric_codes(slice: &str, pinned: &[i64]) -> Vec<i64> {
+    let bytes = slice.as_bytes();
+    let mut orphans = Vec::new();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        let candidate = bytes[i] == b'-'
+            && bytes[i + 1] == b'3'
+            && bytes[i + 2] == b'2'
+            && bytes[i + 3..i + 6].iter().all(|b| b.is_ascii_digit())
+            && (i == 0 || !bytes[i - 1].is_ascii_digit())
+            && (i + 6 == bytes.len() || !bytes[i + 6].is_ascii_digit());
+        if candidate {
+            let code: i64 = slice[i..i + 6]
+                .parse()
+                .expect("candidate bytes validated as digits");
+            if !pinned.contains(&code) && !orphans.contains(&code) {
+                orphans.push(code);
+            }
+            i += 6;
+        } else {
+            i += 1;
+        }
+    }
+    orphans
+}
+
+#[test]
+fn unpinned_numeric_code_scan_flags_unknown_and_accepts_pinned_codes() {
+    let pinned = [-32100i64, -32004];
+    assert_eq!(
+        unpinned_numeric_codes("mix `-32100` and `-32004` with orphan `-32999`", &pinned),
+        vec![-32999]
+    );
+    assert!(unpinned_numeric_codes("no numeric codes in this slice", &pinned).is_empty());
+    // A longer numeric run must not partially match a code literal.
+    assert!(unpinned_numeric_codes(" `-3200004` is out of range", &pinned).is_empty());
+    // A code literal glued to a preceding digit is part of that longer run,
+    // and the scanner's start-of-slice / end-of-slice boundaries must hold.
+    assert!(unpinned_numeric_codes("9-32999", &pinned).is_empty());
+    assert_eq!(unpinned_numeric_codes("-32999", &pinned), vec![-32999]);
+    assert_eq!(
+        unpinned_numeric_codes("orphan -32998", &pinned),
+        vec![-32998]
+    );
+}
+
+#[test]
+fn rpc_error_code_names_and_values_are_unique() {
+    let constants = parse_rpc_error_code_constants();
+    let mut names: Vec<&str> = constants.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    let mut values: Vec<i64> = constants.iter().map(|(_, value)| *value).collect();
+    values.sort_unstable();
+    let duplicate_names: Vec<_> = names.windows(2).filter(|pair| pair[0] == pair[1]).collect();
+    assert!(
+        duplicate_names.is_empty(),
+        "rpc_error_codes must not reuse a constant name: {duplicate_names:?}"
+    );
+    let duplicate_values: Vec<_> = values
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .collect();
+    assert!(
+        duplicate_values.is_empty(),
+        "rpc_error_codes must not reuse a numeric code: {duplicate_values:?}"
+    );
+}
+
+#[test]
+fn spec_section_10_pins_every_rpc_error_code() {
+    let constants = parse_rpc_error_code_constants();
+    let slice = spec_section_10_slice();
+
+    let mut missing = Vec::new();
+    for (name, value) in &constants {
+        // §10 names codes in snake_case, so the constant's name is pinned in
+        // its lowercase form (`UNKNOWN_SESSION` must appear as
+        // `unknown_session`). Both pins must land on one line — the catalog
+        // rows read `-32100` (`unknown_session`) — so swapping the number
+        // between two rows cannot satisfy the name and value separately.
+        let name_pin = format!("`{}`", name.to_lowercase());
+        let value_pin = format!("`{value}`");
+        if !slice
+            .lines()
+            .any(|line| line.contains(&name_pin) && line.contains(&value_pin))
+        {
+            missing.push(format!("{value_pin} ({name_pin})"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "spec §10 is missing pins that rpc_error_codes declares: {missing:?} — \
+         every constant must be pinned in §10 by name and value on one line"
+    );
+}
+
+#[test]
+fn spec_section_10_carries_no_numeric_code_outside_rpc_error_codes() {
+    let constants = parse_rpc_error_code_constants();
+    let pinned: Vec<i64> = constants.iter().map(|(_, value)| *value).collect();
+    let orphans = unpinned_numeric_codes(&spec_section_10_slice(), &pinned);
+    assert!(
+        orphans.is_empty(),
+        "spec §10 carries numeric codes that rpc_error_codes does not declare: {orphans:?}"
+    );
+}
+
+// Treat the published v2 JSON examples as executable wire fixtures. Round trips
+// catch forgotten required fields AND examples whose fields serde would ignore.
+#[test]
+fn spec_v2_projection_examples_match_rust_wire_types() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md");
+    assert_spec_v2_projection_examples_match_rust_wire_types(spec);
+}
+
+#[test]
+fn spec_v2_projection_examples_accept_windows_line_endings() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_spec_v2_projection_examples_match_rust_wire_types(&spec);
+}
+
+fn assert_spec_v2_projection_examples_match_rust_wire_types(spec: &str) {
+    // Git can check the Markdown out with CRLF on Windows.
+    let spec = spec.replace("\r\n", "\n");
+    let section = spec
+        .split_once("## 14. Canonical v2 Projection Envelope\n")
+        .expect("canonical projection section")
+        .1
+        .split_once("\n## 15.")
+        .expect("bounded projection section")
+        .0;
+    let mut tags = std::collections::BTreeSet::new();
+    let mut envelope_count = 0;
+    for block in section.split("```json\n").skip(1) {
+        let value: Value = serde_json::from_str(block.split_once("\n```").unwrap().0)
+            .expect("valid JSON in projection spec");
+        let serialized = if value.get("payload").is_some() {
+            envelope_count += 1;
+            let envelope: EnvelopeWireV2 = serde_json::from_value(value.clone())
+                .expect("spec envelope matches flattened wire DTO");
+            serde_json::to_value(envelope).unwrap()
+        } else {
+            let payload: PayloadV2 = serde_json::from_value(value.clone())
+                .expect("spec payload matches Rust tagged union");
+            tags.insert(value["type"].as_str().unwrap().to_owned());
+            serde_json::to_value(payload).unwrap()
+        };
+        assert_eq!(
+            serialized, value,
+            "spec example loses fields or changes defaults"
+        );
+    }
+    assert_eq!(envelope_count, 1);
+    assert_eq!(
+        tags.into_iter().collect::<Vec<_>>(),
+        vec![
+            "assistant_delta",
+            "assistant_persisted",
+            "background/spawn_complete",
+            "file_attached",
+            "reasoning_delta",
+            "tool_end",
+            "tool_progress",
+            "tool_start",
+            "turn_terminal",
+            "user_message",
+        ],
+        "publish every current payload tag exactly as serialized"
+    );
 }

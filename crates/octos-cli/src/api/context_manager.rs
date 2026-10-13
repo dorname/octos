@@ -331,6 +331,12 @@ pub(crate) struct ToolOutputEnvelope {
     pub(crate) model_visible_bytes: usize,
     pub(crate) truncation_reason: Option<ToolOutputTruncationReason>,
     pub(crate) policy_id: String,
+    /// Media the tool handed the model (`ToolResult::model_media`, carried
+    /// on the tool row's `media`). Re-emitted on the prompt row under the
+    /// same `supports_media` policy as user media, so the providers can
+    /// render it; without this the image was dropped on every rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) media: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,7 +369,15 @@ pub(crate) struct PromptBuildPolicy {
     pub(crate) supports_media: bool,
     pub(crate) max_prompt_token_estimate: Option<usize>,
     pub(crate) model_capability_id: String,
+    /// UPCR-2026-035: render every earlier `memory_update` context event as
+    /// "no memory" instead of its content. Set for a turn on an app peer's
+    /// session that is not driven by the peer's host connection, so memory
+    /// injected into the host's earlier turns never reaches it.
+    pub(crate) redact_memory_events: bool,
 }
+
+/// What a redacted `memory_update` context event renders as.
+pub(crate) const REDACTED_MEMORY_EVENT: &str = "No injected memory is currently available.";
 
 impl Default for PromptBuildPolicy {
     fn default() -> Self {
@@ -372,6 +386,7 @@ impl Default for PromptBuildPolicy {
             supports_media: false,
             max_prompt_token_estimate: None,
             model_capability_id: "text-only-v1".to_owned(),
+            redact_memory_events: false,
         }
     }
 }
@@ -542,6 +557,8 @@ pub(crate) struct ForkedChildContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ContextSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) journal_checkpoint_id: Option<String>,
     pub(crate) schema: String,
     pub(crate) state: ContextState,
     /// Append-only canonical ledger. Compaction never removes entries from
@@ -556,6 +573,12 @@ pub(crate) struct ContextSnapshot {
     /// history during hydration; a high-watermark alone is not sufficient.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) source_head_hash: Option<String>,
+    /// Which durable messages this ledger consumed ([`SourceHistoryChain`]),
+    /// so a reload can be verified against history by hashing rather than by
+    /// replaying it. Absent on snapshots written before this field existed,
+    /// and on ledgers that can no longer say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_history: Option<SourceHistoryChain>,
     #[serde(default)]
     pub(crate) source_index: Vec<ContextSourceRecord>,
     #[serde(default)]
@@ -571,6 +594,7 @@ pub(crate) struct ContextSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContextManager {
+    journal: context_journal::Tracking,
     session_id: String,
     thread_id: Option<String>,
     generation: u64,
@@ -599,6 +623,13 @@ pub(crate) struct ContextManager {
     /// ledger from durable history. Consumed by the first epoch reconciliation
     /// so the rotation is reported as `ledger_rebuilt`, not `initialized`.
     ledger_rebuilt: bool,
+    /// Which durable messages this ledger consumed, when it can still say.
+    /// See [`SourceHistoryChain`]; `None` means "ask the replay".
+    source_history: Option<SourceHistoryChain>,
+    /// Set when [`ContextManager::adopt_verified_source_history`] gave this
+    /// ledger a chain it did not load with, so the caller knows the snapshot
+    /// on disk is worth rewriting. Never serialized.
+    source_history_adopted: bool,
 }
 
 /// #2131: what `recall` needs to re-materialize an output after its transcript
@@ -625,47 +656,30 @@ pub(crate) fn context_ledger_path(data_dir: &Path, session_id: &str) -> PathBuf 
         .join(format!("{encoded}.json"))
 }
 
+#[path = "context_journal.rs"]
+mod context_journal;
+
 pub(crate) fn persist_context_manager_snapshot(
     data_dir: &Path,
     session_id: &str,
     manager: &ContextManager,
 ) -> Result<PathBuf, String> {
-    persist_tool_output_artifacts(data_dir, manager)?;
-    let path = context_ledger_path(data_dir, session_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("context ledger path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create context ledger directory {} failed: {err}",
-            parent.display()
-        )
-    })?;
-    let tmp_name = format!(
-        "{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("context-ledger.json"),
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-    let bytes = serde_json::to_vec_pretty(&manager.snapshot())
-        .map_err(|err| format!("serialize context ledger snapshot failed: {err}"))?;
-    std::fs::write(&tmp_path, bytes).map_err(|err| {
-        format!(
-            "write context ledger snapshot {} failed: {err}",
-            tmp_path.display()
-        )
-    })?;
-    if let Err(err) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "install context ledger snapshot {} failed: {err}",
-            path.display()
-        ));
-    }
-    Ok(path)
+    context_journal::persist_checkpoint(data_dir, session_id, manager)
+}
+
+pub(crate) fn persist_context_manager_incremental(
+    data_dir: &Path,
+    session_id: &str,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    context_journal::persist_incremental(data_dir, session_id, manager)
+}
+
+pub(crate) fn remove_context_manager_store(
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<usize, String> {
+    context_journal::remove_store(data_dir, session_id)
 }
 
 fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<PathBuf, String> {
@@ -746,21 +760,11 @@ pub(crate) fn load_context_manager_snapshot(
     session_id: &str,
 ) -> Result<Option<ContextManager>, String> {
     let path = context_ledger_path(data_dir, session_id);
-    if !path.exists() {
+    let Some((snapshot, journal_offset)) = context_journal::load_snapshot(data_dir, session_id)?
+    else {
         return Ok(None);
-    }
-    let bytes = std::fs::read(&path).map_err(|err| {
-        format!(
-            "read context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
-    let snapshot = serde_json::from_slice::<ContextSnapshot>(&bytes).map_err(|err| {
-        format!(
-            "parse context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
+    };
+    let journal_id = snapshot.journal_checkpoint_id.clone();
     if snapshot.schema != CONTEXT_MANAGER_SCHEMA && snapshot.schema != LEGACY_CONTEXT_MANAGER_SCHEMA
     {
         return Err(format!(
@@ -784,7 +788,16 @@ pub(crate) fn load_context_manager_snapshot(
             path.display()
         ));
     }
+    let persisted_items = snapshot.items.clone();
     let mut manager = ContextManager::from_snapshot(snapshot);
+    context_journal::bind_loaded(
+        &manager,
+        data_dir,
+        session_id,
+        journal_id,
+        journal_offset,
+        &persisted_items,
+    );
     // Committed-only load: a snapshot persisted mid-turn carries the turn's
     // source-less conversation rows. If the daemon died before turn-end
     // persistence, durable history never received them; they must not reload
@@ -818,12 +831,21 @@ pub(crate) fn load_or_rebuild_context_manager(
 ) -> (ContextManager, ContextLedgerLoadStatus) {
     let session_id = session_id.into();
     match load_context_manager_snapshot(data_dir, &session_id) {
-        Ok(Some(manager)) if context_ledger_covers_history(&manager, messages) => {
+        Ok(mut loaded)
+            if loaded
+                .as_ref()
+                .is_some_and(|manager| context_ledger_covers_history(manager, messages)) =>
+        {
+            let mut manager = loaded.take().expect("checked above");
+            // Coverage was just proven; record it so the next load is cheap.
+            manager.adopt_verified_source_history(messages);
             (manager, ContextLedgerLoadStatus::Loaded)
         }
         Ok(Some(mut manager)) => {
             if rebase_context_manager_over_appended_history(&mut manager, messages) {
                 manager.set_recovery_state(ContextRecoveryState::Rebuilt);
+                // The rebase verified the result against `messages`.
+                manager.adopt_verified_source_history(messages);
                 (manager, ContextLedgerLoadStatus::Stale)
             } else {
                 let mut rebuilt =
@@ -877,6 +899,44 @@ fn rebase_context_manager_over_appended_history(
 }
 
 fn context_ledger_covers_history(manager: &ContextManager, messages: &[Message]) -> bool {
+    context_ledger_covers_history_with(manager, messages, source_history_fingerprint_enabled())
+}
+
+/// The coverage decision, with the fast path switchable.
+///
+/// Both answers must always agree: the fingerprint is an optimisation, never a
+/// different rule. `should_never_claim_coverage_the_replay_would_deny` pins
+/// that by running every fixture through both.
+fn context_ledger_covers_history_with(
+    manager: &ContextManager,
+    messages: &[Message],
+    use_fingerprint: bool,
+) -> bool {
+    // Fast path: the ledger recorded which messages it consumed, so hashing
+    // them answers the question. The slow path below replays the whole history
+    // through the recorder, which costs ~0.65 s on a 2 500-message session and
+    // runs on EVERY `session/open`.
+    if use_fingerprint
+        && let Some(chain) = manager.source_history()
+        && chain
+            .ledger
+            .is_none_or(|witness| witness == manager.source_ledger_witness())
+    {
+        let covered =
+            chain.messages == messages.len() && chain.digest == source_history_digest(messages);
+        if !covered {
+            // A miss pays the very replay this chain exists to avoid, so make
+            // it observable instead of a silent slowdown.
+            tracing::debug!(
+                chain_messages = chain.messages,
+                history_messages = messages.len(),
+                "context ledger chain does not match durable history; replaying"
+            );
+        }
+        return covered;
+    }
+    #[cfg(test)]
+    REPLAYED_COVERAGE_CHECKS.with(|count| count.set(count.get() + 1));
     let expected = ContextManager::from_session_history(
         manager.session_id.clone(),
         manager.thread_id.clone(),
@@ -884,6 +944,101 @@ fn context_ledger_covers_history(manager: &ContextManager, messages: &[Message])
     );
     manager.source_high_watermark() == expected.source_high_watermark()
         && manager.source_head_hash() == expected.source_head_hash()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many coverage checks fell through to the replay, per test thread.
+    /// Lets a test assert the fast path was actually taken, so deleting it
+    /// fails the suite. Thread-local: the suite runs tests in parallel.
+    static REPLAYED_COVERAGE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Kill switch for the source-history fast path: set
+/// `OCTOS_CONTEXT_FINGERPRINT=0` to force the exact replay on every check.
+fn source_history_fingerprint_enabled() -> bool {
+    !matches!(
+        std::env::var("OCTOS_CONTEXT_FINGERPRINT").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
+/// A ledger's record of exactly which durable messages it consumed.
+///
+/// Maintained by the two paths that consume durable history —
+/// [`ContextManager::record_persisted_message`] and
+/// [`ContextManager::record_persisted_message_merging_prompt_equivalent`] —
+/// and dropped by every path that takes a source row in some other way
+/// (a hand-built item, adoption from another manager, a fork). Dropping it
+/// only costs the replay; trusting a stale one would load a ledger that does
+/// not match durable history, which is far worse.
+///
+/// It counts MESSAGES, not rows: one message can expand into several
+/// transcript rows, and a System message into none at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceHistoryChain {
+    /// How many leading messages of the session's history this ledger holds.
+    pub(crate) messages: usize,
+    /// Chain digest over exactly those messages, in order.
+    pub(crate) digest: String,
+    /// The ledger shape the chain was written against. The chain is the
+    /// writer's claim; this makes the LEDGER corroborate it, so a snapshot
+    /// that lost or gained source rows without the chain noticing — a future
+    /// writer bug, an edited file — falls back to the replay instead of
+    /// loading silently. Absent on chains written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger: Option<SourceLedgerWitness>,
+}
+
+/// The shape of the ledger a [`SourceHistoryChain`] was written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceLedgerWitness {
+    /// Rows carrying a source ref.
+    pub(crate) source_rows: usize,
+    /// Highest source seq among them, if any.
+    pub(crate) watermark: Option<usize>,
+}
+
+/// Seed of an empty chain.
+const EMPTY_SOURCE_HISTORY_DIGEST: &str = "sha256:empty";
+
+/// Fold one message into a source-history chain digest.
+///
+/// Hashes only what the recorder turns into transcript rows. `timestamp`,
+/// `client_message_id` and `ToolCall::metadata` are deliberately excluded:
+/// the recorder never reads them, so two histories differing only there build
+/// the same ledger and must compare equal — including them would report a
+/// false mismatch and rebuild for nothing.
+fn extend_source_history_digest(previous: &str, message: &Message) -> String {
+    let body = serde_json::to_vec(&json!({
+        "role": message.role.as_str(),
+        "content": message.content,
+        "media": message.media,
+        "tool_calls": message.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .map(|call| json!({ "id": call.id, "name": call.name, "arguments": call.arguments }))
+                .collect::<Vec<_>>()
+        }),
+        "tool_call_id": message.tool_call_id,
+        "reasoning_content": message.reasoning_content,
+        "thread_id": message.thread_id,
+    }))
+    .expect("a Message's hashed fields always serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(previous.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(&body);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Chain digest of a whole history; matches the chain the recorders maintain.
+fn source_history_digest(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .fold(EMPTY_SOURCE_HISTORY_DIGEST.to_owned(), |digest, message| {
+            extend_source_history_digest(&digest, message)
+        })
 }
 
 /// Goal-snapshot fields that change on every turn without changing what the
@@ -1097,7 +1252,8 @@ fn expected_v2_active_projection(
         compaction_summary_insert_index(&installed),
         summary_item.clone(),
     );
-    if record.token_estimate_after != Some(estimate_items_tokens(&installed))
+    if (record.token_estimate_after != Some(estimate_items_tokens(&installed))
+        && record.token_estimate_after != Some(legacy_estimate_items_tokens(&installed)))
         || record.installed_transcript_hash.as_deref()
             != Some(
                 transcript_hash_for_projection(
@@ -1135,7 +1291,8 @@ fn v2_active_projection_is_coherent(
     let projected_ids = projected.iter().map(|item| &item.id).collect::<Vec<_>>();
     if projected_ids != expected_ids
         || snapshot.state.item_count != projected.len()
-        || snapshot.state.token_estimate != estimate_items_tokens(projected)
+        || (snapshot.state.token_estimate != estimate_items_tokens(projected)
+            && snapshot.state.token_estimate != legacy_estimate_items_tokens(projected))
         || snapshot.state.transcript_hash
             != transcript_hash_for_projection(
                 &snapshot.state.session_id,
@@ -1283,6 +1440,7 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
 impl ContextManager {
     pub(crate) fn new(session_id: impl Into<String>, thread_id: Option<String>) -> Self {
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: 0,
@@ -1298,6 +1456,16 @@ impl ContextManager {
             compactions: Vec::new(),
             cache_epoch: None,
             ledger_rebuilt: false,
+            // A fresh ledger has consumed nothing yet.
+            source_history: Some(SourceHistoryChain {
+                messages: 0,
+                digest: EMPTY_SOURCE_HISTORY_DIGEST.to_owned(),
+                ledger: Some(SourceLedgerWitness {
+                    source_rows: 0,
+                    watermark: None,
+                }),
+            }),
+            source_history_adopted: false,
         }
     }
 
@@ -1352,6 +1520,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: fork.parent_generation + 1,
@@ -1367,7 +1536,113 @@ impl ContextManager {
             compactions: Vec::new(),
             cache_epoch: None,
             ledger_rebuilt: false,
+            // A forked child inherits the parent's rows, source refs and all:
+            // it cannot speak for any history of its own.
+            source_history: None,
+            source_history_adopted: false,
         }
+    }
+
+    /// The loop explicitly merged newer durable rows before replacing the
+    /// canonical manager. Accept its newer disk lineage only if every changed
+    /// canonical tail row and compaction fact survived that merge.
+    pub(crate) fn rebase_context_persistence_after_merge(
+        &self,
+        canonical: &ContextManager,
+    ) -> bool {
+        if self.session_id != canonical.session_id || self.thread_id != canonical.thread_id {
+            return false;
+        }
+        if self.journal.same_lineage(&canonical.journal) {
+            return true;
+        }
+        if self.recovery_state != canonical.recovery_state {
+            return false;
+        }
+        let difference = self
+            .ledger_items
+            .iter()
+            .zip(canonical.ledger_items.iter())
+            .position(|(mine, current)| mine != current)
+            .unwrap_or(self.ledger_items.len().min(canonical.ledger_items.len()));
+        if !canonical.ledger_items[difference..].iter().all(|current| {
+            self.ledger_items[difference..].iter().any(|mine| {
+                mine.kind == current.kind
+                    && mine.source == current.source
+                    && mine.in_flight == current.in_flight
+                    && match &current.source_ref {
+                        Some(source) => mine.source_ref.as_ref() == Some(source),
+                        None => mine.id == current.id && mine.source == current.source,
+                    }
+            })
+        }) || !self.compactions.starts_with(&canonical.compactions)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && (self.last_compaction_id != canonical.last_compaction_id
+                || self.last_checkpoint_id != canonical.last_checkpoint_id)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && !canonical.items.iter().all(|current| {
+                self.items.iter().any(|mine| {
+                    mine.kind == current.kind
+                        && mine.source == current.source
+                        && match &current.source_ref {
+                            Some(source) => mine.source_ref.as_ref() == Some(source),
+                            None => mine.id == current.id,
+                        }
+                })
+            })
+        {
+            return false;
+        }
+        if self.cache_epoch != canonical.cache_epoch
+            && let Some(current) = canonical.cache_epoch.as_ref()
+        {
+            // A new local compaction may rotate the same stable route. Other
+            // newer route/settings changes cannot be silently reverted.
+            let local_compaction_rotation = self.cache_epoch.as_ref().is_some_and(|mine| {
+                mine.provider == current.provider
+                    && mine.model == current.model
+                    && mine.stable_instructions_hash == current.stable_instructions_hash
+                    && mine.ordered_tool_schema_hash == current.ordered_tool_schema_hash
+                    && self.last_compaction_id != canonical.last_compaction_id
+                    && self.compactions.len() > canonical.compactions.len()
+            });
+            if !local_compaction_rotation {
+                return false;
+            }
+        }
+        self.journal.rebase(&canonical.journal, difference);
+        true
+    }
+
+    /// Transfer an acknowledgement only between identical context states.
+    /// A newer background mutation or stale scratch clone cannot borrow it.
+    pub(crate) fn acknowledge_identical_context_persistence(
+        &mut self,
+        persisted: &ContextManager,
+    ) -> bool {
+        if self.session_id != persisted.session_id
+            || self.thread_id != persisted.thread_id
+            || self.generation != persisted.generation
+            || self.next_item_seq != persisted.next_item_seq
+            || self.ledger_items != persisted.ledger_items
+            || self.items != persisted.items
+            || self.last_checkpoint_id != persisted.last_checkpoint_id
+            || self.last_compaction_id != persisted.last_compaction_id
+            || self.recovery_state != persisted.recovery_state
+            || self.source_history != persisted.source_history
+            || self.compactions != persisted.compactions
+            || self.cache_epoch != persisted.cache_epoch
+        {
+            return false;
+        }
+        self.journal = persisted.journal.clone();
+        true
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -1581,6 +1856,7 @@ impl ContextManager {
                 ));
             }
         }
+        self.journal.dirty(0);
         self.ledger_items
             .retain(|item| !ghost_ids.contains(&item.id));
         self.items.retain(|item| !ghost_ids.contains(&item.id));
@@ -1605,6 +1881,75 @@ impl ContextManager {
         } else {
             "initialized"
         }
+    }
+
+    /// Which durable messages this ledger consumed, when it can still say.
+    pub(crate) fn source_history(&self) -> Option<SourceHistoryChain> {
+        self.source_history.clone()
+    }
+
+    /// The ledger shape a chain is checked against (see [`SourceLedgerWitness`]).
+    fn source_ledger_witness(&self) -> SourceLedgerWitness {
+        SourceLedgerWitness {
+            source_rows: self
+                .ledger_items
+                .iter()
+                .filter(|item| item.source_ref.is_some())
+                .count(),
+            watermark: self.source_high_watermark(),
+        }
+    }
+
+    /// Stamp a freshly advanced chain with the ledger it now describes.
+    fn witnessed_source_history(
+        &self,
+        chain: Option<SourceHistoryChain>,
+    ) -> Option<SourceHistoryChain> {
+        let witness = self.source_ledger_witness();
+        chain.map(|chain| SourceHistoryChain {
+            ledger: Some(witness),
+            ..chain
+        })
+    }
+
+    /// Adopt `messages` as this ledger's source history.
+    ///
+    /// Only for a caller that has just PROVEN coverage by the exact replay: a
+    /// ledger persisted before the chain existed (or one that gave the chain
+    /// up) then starts answering the cheap way, instead of paying the replay
+    /// on every `session/open` for the rest of its life.
+    fn adopt_verified_source_history(&mut self, messages: &[Message]) {
+        let adopted = SourceHistoryChain {
+            messages: messages.len(),
+            digest: source_history_digest(messages),
+            ledger: Some(self.source_ledger_witness()),
+        };
+        self.source_history_adopted = self.source_history.as_ref() != Some(&adopted);
+        self.source_history = Some(adopted);
+    }
+
+    /// Whether this ledger gained a source-history chain it did not load with,
+    /// i.e. whether rewriting its snapshot would buy anything.
+    pub(crate) fn source_history_adopted(&self) -> bool {
+        self.source_history_adopted
+    }
+
+    /// Advance the chain by one consumed message, or drop it when this message
+    /// is not the next one in sequence (a re-record, a gap, an unknown chain).
+    fn advanced_source_history(
+        &self,
+        source_seq: usize,
+        message: &Message,
+    ) -> Option<SourceHistoryChain> {
+        self.source_history
+            .as_ref()
+            .filter(|chain| chain.messages == source_seq)
+            .map(|chain| SourceHistoryChain {
+                messages: chain.messages + 1,
+                digest: extend_source_history_digest(&chain.digest, message),
+                // Witnessed by the caller once this message's rows are in.
+                ledger: None,
+            })
     }
 
     pub(crate) fn source_high_watermark(&self) -> Option<usize> {
@@ -1645,11 +1990,13 @@ impl ContextManager {
 
     pub(crate) fn snapshot(&self) -> ContextSnapshot {
         ContextSnapshot {
+            journal_checkpoint_id: None,
             schema: CONTEXT_MANAGER_SCHEMA.to_owned(),
             state: self.state(),
             items: self.ledger_items.clone(),
             active_item_ids: self.items.iter().map(|item| item.id.clone()).collect(),
             source_head_hash: Some(self.source_head_hash()),
+            source_history: self.source_history.clone(),
             source_index: self.source_index(),
             compactions: self.compactions.clone(),
             semantic_blocks: self.semantic_ledger_blocks(),
@@ -1735,6 +2082,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: snapshot.state.session_id,
             thread_id: snapshot.state.thread_id,
             generation: snapshot.state.generation,
@@ -1754,6 +2102,8 @@ impl ContextManager {
             compactions: snapshot.compactions,
             cache_epoch: snapshot.cache_epoch,
             ledger_rebuilt: false,
+            source_history: snapshot.source_history,
+            source_history_adopted: false,
         }
     }
 
@@ -1859,6 +2209,15 @@ impl ContextManager {
         source_ref: Option<TranscriptSourceRef>,
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
+        // A durable row recorded here did not come through one of the two
+        // consumers (or came through one, which restores the chain after).
+        // Either way the chain cannot be trusted from inside this call.
+        if source_ref
+            .as_ref()
+            .is_some_and(|source| source.source_seq.is_some())
+        {
+            self.source_history = None;
+        }
         let id = self.next_item_id();
         // Only conversation rows persist later; supervisor/context rows
         // (source `Supervisor`, `Compaction`, `Synthetic`) never receive a
@@ -1879,6 +2238,7 @@ impl ContextManager {
             recorded_at_ms: Utc::now().timestamp_millis(),
             in_flight,
         };
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(item.clone());
         self.items.push(item);
         self.generation += 1;
@@ -1894,7 +2254,12 @@ impl ContextManager {
         message: &Message,
         source_seq: usize,
     ) -> Vec<TranscriptItemId> {
-        self.record_message_with_source_ref(
+        // Computed before recording and written after: the item-level
+        // recorder below drops the chain for any source row it sees, which is
+        // the right default for every path that is NOT one of the two durable
+        // consumers.
+        let advanced = self.advanced_source_history(source_seq, message);
+        let recorded = self.record_message_with_source_ref(
             message,
             Some(TranscriptSourceRef {
                 session_id: self.session_id.clone(),
@@ -1902,10 +2267,26 @@ impl ContextManager {
                 source_seq: Some(source_seq),
                 source_event_kind: message.role.as_str().to_owned(),
             }),
-        )
+        );
+        self.source_history = self.witnessed_source_history(advanced);
+        recorded
     }
 
     pub(crate) fn record_persisted_message_merging_prompt_equivalent(
+        &mut self,
+        message: &Message,
+        source_seq: usize,
+    ) -> Vec<TranscriptItemId> {
+        // Same as `record_persisted_message`: compute before, write after the
+        // stamping/splicing below clears it. This is the path production takes
+        // for every durable row, so the chain lives or dies here.
+        let advanced = self.advanced_source_history(source_seq, message);
+        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq);
+        self.source_history = self.witnessed_source_history(advanced);
+        recorded
+    }
+
+    fn record_merged_prompt_equivalent_inner(
         &mut self,
         message: &Message,
         source_seq: usize,
@@ -1982,6 +2363,10 @@ impl ContextManager {
         kind: &TranscriptItemKind,
         source_ref: &TranscriptSourceRef,
     ) -> Option<TranscriptItemId> {
+        // Stamping binds a durable source row onto an existing item, so the
+        // chain cannot speak for the ledger from here. Its durable consumer
+        // restores the chain around this call; anyone else loses it.
+        self.source_history = None;
         let (lower, upper) = self.source_order_window(source_ref.source_seq);
         let position = self.items[lower..upper]
             .iter()
@@ -2002,13 +2387,14 @@ impl ContextManager {
         existing.source_ref = Some(source_ref.clone());
         existing.in_flight = false;
         let existing_id = existing.id.clone();
-        if let Some(canonical) = self
+        if let Some(index) = self
             .ledger_items
-            .iter_mut()
-            .find(|item| item.id == existing_id)
+            .iter()
+            .position(|item| item.id == existing_id)
         {
-            canonical.source_ref = Some(source_ref.clone());
-            canonical.in_flight = false;
+            self.journal.dirty(index);
+            self.ledger_items[index].source_ref = Some(source_ref.clone());
+            self.ledger_items[index].in_flight = false;
         }
         self.generation += 1;
         Some(existing_id)
@@ -2045,6 +2431,9 @@ impl ContextManager {
         source_ref: TranscriptSourceRef,
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
+        // As in `stamp_prompt_equivalent_twin`: a durable row lands here, so
+        // only its durable consumer may re-establish the chain afterwards.
+        self.source_history = None;
         let id = self.next_item_id();
         let item = TranscriptItem {
             id: id.clone(),
@@ -2064,6 +2453,7 @@ impl ContextManager {
         let seq_of =
             |candidate: &TranscriptItem| candidate.source_ref.as_ref().and_then(|r| r.source_seq);
         let Some(seq) = seq_of(&item) else {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2082,6 +2472,7 @@ impl ContextManager {
             .map_or(0, |index| index + 1);
         let ledger_index = after_ordered.max(after_summary);
         if ledger_index >= self.ledger_items.len() {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2092,6 +2483,7 @@ impl ContextManager {
             .iter()
             .position(|candidate| candidate.id == successor_id)
             .unwrap_or(self.items.len());
+        self.journal.dirty(ledger_index);
         self.ledger_items.insert(ledger_index, item.clone());
         self.items.insert(items_index, item);
     }
@@ -2104,6 +2496,10 @@ impl ContextManager {
         source: &ContextManager,
         watermark: Option<usize>,
     ) -> Vec<TranscriptItemId> {
+        // Adoption copies another manager's source rows verbatim (its
+        // `session_id` included), so this ledger can no longer say which
+        // messages it consumed.
+        self.source_history = None;
         let mut adopted = Vec::new();
         let mut remapped_groups = HashMap::<String, String>::new();
         let _ = watermark;
@@ -2123,6 +2519,34 @@ impl ContextManager {
                     .iter()
                     .any(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind);
             if already_adopted {
+                // A background classification may change without adding a
+                // row or generation. Preserve it in the scratch projection;
+                // local semantic group IDs intentionally remain remapped.
+                for (index, mine) in self
+                    .ledger_items
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(_, mine)| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    if mine.source_ref != item.source_ref
+                        || mine.source != item.source
+                        || mine.in_flight != item.in_flight
+                    {
+                        self.journal.dirty(index);
+                        mine.source_ref = item.source_ref.clone();
+                        mine.source = item.source.clone();
+                        mine.in_flight = item.in_flight;
+                    }
+                }
+                for mine in self
+                    .items
+                    .iter_mut()
+                    .filter(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    mine.source_ref = item.source_ref.clone();
+                    mine.source = item.source.clone();
+                    mine.in_flight = item.in_flight;
+                }
                 continue;
             }
             present_seqs.insert(seq);
@@ -2156,6 +2580,13 @@ impl ContextManager {
         source_event_kind: &str,
     ) {
         let item_ids = item_ids.iter().collect::<HashSet<_>>();
+        if let Some(index) = self
+            .ledger_items
+            .iter()
+            .position(|item| item_ids.contains(&item.id))
+        {
+            self.journal.dirty(index);
+        }
         for item in self
             .items
             .iter_mut()
@@ -2291,12 +2722,16 @@ impl ContextManager {
                     let tool_name = self
                         .tool_name_for_call_id(&tool_call_id)
                         .unwrap_or_else(|| "unknown".to_owned());
-                    ids.push(self.record_tool_output_with_source_ref(
+                    let id = self.record_tool_output_with_source_ref(
                         tool_call_id,
                         tool_name,
                         &message.content,
                         source_ref.clone(),
-                    ));
+                    );
+                    if !message.media.is_empty() {
+                        self.attach_tool_output_media(&id, &message.media);
+                    }
+                    ids.push(id);
                 }
             }
         }
@@ -2360,6 +2795,23 @@ impl ContextManager {
         })
     }
 
+    /// One-line description of what the call behind `tool_call_id` was
+    /// about (file path and line range, command head, grep pattern), from
+    /// the recorded assistant call's arguments. `None` when no call is
+    /// recorded or its arguments carry nothing recognisable.
+    fn tool_target_for_call_id(&self, tool_call_id: &str) -> Option<String> {
+        self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::AssistantToolCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == tool_call_id => {
+                octos_agent::compaction::describe_tool_call(name, arguments)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn record_tool_output(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -2394,6 +2846,22 @@ impl ContextManager {
         Some(entry.model_visible_content.clone())
     }
 
+    /// Keep the media a tool handed the model on its recorded output.
+    fn attach_tool_output_media(&mut self, id: &TranscriptItemId, media: &[String]) {
+        if let Some(index) = self.ledger_items.iter().position(|item| &item.id == id) {
+            self.journal.dirty(index);
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut self.ledger_items[index].kind
+            {
+                envelope.media = media.to_vec();
+            }
+        }
+        if let Some(item) = self.items.iter_mut().rev().find(|item| &item.id == id) {
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind {
+                envelope.media = media.to_vec();
+            }
+        }
+    }
+
     pub(crate) fn record_tool_output_with_source_ref(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -2425,13 +2893,32 @@ impl ContextManager {
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
+        let tool_name: String = tool_name.into();
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
-        let (model_visible_content, truncation_reason) = truncate_utf8(
+        let (mut model_visible_content, truncation_reason) = truncate_utf8(
             raw_output,
             self.tool_output_policy.model_visible_max_bytes,
             ToolOutputTruncationReason::MaxBytes,
         );
+        if truncation_reason.is_some() {
+            // The bare `[truncated]` floor told the model that something was
+            // cut but not what, how much, or how to get it back — so a careful
+            // model re-read the file in slices (the round-3 GLM pattern). Name
+            // the call, the visible/original sizes and the recall handle.
+            let target = self
+                .tool_target_for_call_id(&tool_call_id)
+                .unwrap_or_else(|| tool_name_for_note(&tool_name));
+            model_visible_content = annotate_truncation(
+                model_visible_content,
+                &truncation_note(
+                    &target,
+                    self.tool_output_policy.model_visible_max_bytes,
+                    original_bytes,
+                    &tool_call_id,
+                ),
+            );
+        }
         let raw_artifact_ref = (truncation_reason.is_some()
             || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
@@ -2458,7 +2945,7 @@ impl ContextManager {
             TranscriptItemKind::ToolOutput {
                 envelope: ToolOutputEnvelope {
                     tool_call_id,
-                    tool_name: tool_name.into(),
+                    tool_name,
                     raw_sha256,
                     raw_artifact_ref,
                     ui_preview,
@@ -2467,6 +2954,7 @@ impl ContextManager {
                     model_visible_content,
                     truncation_reason,
                     policy_id: self.tool_output_policy.policy_id.clone(),
+                    media: Vec::new(),
                 },
             },
             source,
@@ -2740,6 +3228,7 @@ impl ContextManager {
         let (replacement_transcript_hash, compaction_item, candidate, token_estimate_after) =
             installed;
         self.next_item_seq += 1;
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(compaction_item.clone());
         retained = candidate;
         self.items = retained;
@@ -3071,6 +3560,9 @@ impl ContextManager {
                             let mut msg =
                                 message(MessageRole::Tool, envelope.model_visible_content.clone());
                             msg.tool_call_id = Some(call_id.clone());
+                            if policy.supports_media {
+                                msg.media = envelope.media.clone();
+                            }
                             entries.push(PromptMessageEntry::tool_output(
                                 msg,
                                 tool_item_id.clone(),
@@ -3121,6 +3613,13 @@ impl ContextManager {
                     label,
                     content,
                 } => {
+                    let content = if policy.redact_memory_events
+                        && *event_kind == ContextEventKind::MemoryUpdate
+                    {
+                        REDACTED_MEMORY_EVENT
+                    } else {
+                        content.as_str()
+                    };
                     entries.push(PromptMessageEntry::new(
                         message(
                             MessageRole::User,
@@ -3668,13 +4167,24 @@ fn truncate_tool_outputs_for_context_pressure(
         {
             continue;
         }
+        let original_bytes = entry.message.content.len();
         let (content, reason) = truncate_utf8(
             &entry.message.content,
             max_tool_bytes,
             ToolOutputTruncationReason::ContextWindowPressure,
         );
         if reason.is_some() {
-            entry.message.content = content;
+            let call_id = entry.message.tool_call_id.clone().unwrap_or_default();
+            entry.message.content = annotate_truncation(
+                content,
+                &format!(
+                    "[cut to {} of {} for context pressure; `recall` with tool_call_id \"{call_id}\" \
+                     returns the recorded output while this session still holds it, or repeat \
+                     the call.]",
+                    human_bytes(max_tool_bytes.min(original_bytes)),
+                    human_bytes(original_bytes),
+                ),
+            );
             for item_id in &entry.source_item_ids {
                 push_unique_item_id(truncated_item_ids, item_id.clone());
             }
@@ -3830,6 +4340,54 @@ fn truncate_utf8(
     (truncated, Some(reason))
 }
 
+/// Insert `note` before the closing `[truncated]` marker of a
+/// [`truncate_utf8`] result, keeping the marker last so every consumer that
+/// keys on the `[truncated]` suffix still recognises a capped output.
+fn annotate_truncation(truncated: String, note: &str) -> String {
+    match truncated.strip_suffix("\n[truncated]") {
+        Some(body) => format!("{body}\n{note}\n[truncated]"),
+        None => truncated,
+    }
+}
+
+fn human_bytes(n: usize) -> String {
+    if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn tool_name_for_note(tool_name: &str) -> String {
+    if tool_name.is_empty() || tool_name == "unknown" {
+        "this tool call".to_owned()
+    } else {
+        format!("{tool_name} output")
+    }
+}
+
+/// What the model reads in place of the cut part of a tool output: which
+/// call, how much of it is shown, and the two ways back (`recall` by id,
+/// paged, or a narrower re-run). The bare `[truncated]` floor left the model
+/// guessing at all three, and a careful model answered by re-reading the
+/// whole file in slices on every iteration. The `recall` promise is hedged:
+/// after a cold restart `tool_output_by_call_id` only holds the model-visible
+/// floor, so the re-run is always offered as the way back.
+fn truncation_note(
+    target: &str,
+    shown_bytes: usize,
+    original_bytes: usize,
+    call_id: &str,
+) -> String {
+    format!(
+        "[showing the first {} of {} of {target}. `recall` with tool_call_id \"{call_id}\" \
+         (page=N for later pages) returns the recorded output while this session still holds \
+         it; otherwise repeat the call for a narrower range.]",
+        human_bytes(shown_bytes.min(original_bytes)),
+        human_bytes(original_bytes),
+    )
+}
+
 fn tool_output_preview(value: &str) -> String {
     truncate_utf8(
         value,
@@ -3839,7 +4397,59 @@ fn tool_output_preview(value: &str) -> String {
     .0
 }
 
+/// Model-visible size, excluding ledger metadata, hidden reasoning, raw
+/// sidecars and checkpoints. Provider serialization overhead/tool declarations
+/// are reserved separately by the prompt bridge. Legacy estimates are accepted
+/// on snapshot load so upgrading does not discard a valid compacted history.
+fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    use octos_llm::context::estimate_tokens;
+    let text = |value: &str| estimate_tokens(value) as usize + 4;
+    match &item.kind {
+        TranscriptItemKind::SystemInstruction { content }
+        | TranscriptItemKind::DeveloperInstruction { content }
+        | TranscriptItemKind::AssistantFinal { content } => text(content),
+        TranscriptItemKind::UserInput { content, media } => {
+            let mut message = Message::user(content.clone());
+            message.media = media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::AssistantToolCall {
+            call_id,
+            name,
+            arguments,
+        } => text(name) + text(call_id) + text(&arguments.to_string()),
+        TranscriptItemKind::ToolOutput { envelope } => {
+            let mut message = Message::assistant(envelope.model_visible_content.clone());
+            message.media = envelope.media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::ContextInjection { label, content }
+        | TranscriptItemKind::ContextEvent { label, content, .. } => {
+            text(label) + text(content) + 24
+        }
+        TranscriptItemKind::ChildResultSummary {
+            child_agent_id,
+            summary,
+            artifact_refs,
+            reference_artifact_refs,
+        } => {
+            text(child_agent_id)
+                + text(summary)
+                + text(&artifact_refs.join(", "))
+                + text(&reference_artifact_refs.join(", "))
+        }
+        TranscriptItemKind::CompactionSummary { summary, .. } => text(summary) + 96,
+        TranscriptItemKind::AssistantReasoning { .. }
+        | TranscriptItemKind::Checkpoint { .. }
+        | TranscriptItemKind::ForkBoundary { .. } => 0,
+    }
+}
+
 fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum::<usize>().max(1)
+}
+
+fn legacy_estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
         .map(|item| {
@@ -3910,11 +4520,11 @@ fn xml_escape_text(value: &str) -> String {
 }
 
 fn estimate_messages_tokens(messages: &[Message]) -> usize {
-    let bytes = messages
+    messages
         .iter()
-        .map(|message| message.content.len() + message.media.iter().map(String::len).sum::<usize>())
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|message| octos_llm::context::estimate_message_tokens(message) as usize)
+        .sum::<usize>()
+        .max(1)
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -4266,15 +4876,11 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
 }
 
 fn estimate_semantic_block_tokens(items: &[&TranscriptItem]) -> usize {
-    let bytes = items
+    items
         .iter()
-        .map(|item| {
-            serde_json::to_vec(&item.kind)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
-        })
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|item| estimate_item_tokens(item))
+        .sum::<usize>()
+        .max(1)
 }
 
 fn hash_json(value: &Value) -> String {
@@ -4289,6 +4895,399 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    // --- source-history fingerprint (perf: skip the replay on session/open) ---
+
+    /// Coverage as the exact replay decides it (the fast path switched off).
+    fn covers_by_replay(manager: &ContextManager, messages: &[Message]) -> bool {
+        context_ledger_covers_history_with(manager, messages, false)
+    }
+
+    fn tool_call_message(call_id: &str, tool: &str) -> Message {
+        let mut assistant = message(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: call_id.to_owned(),
+            name: tool.to_owned(),
+            arguments: json!({ "path": "a" }),
+            metadata: None,
+        }]);
+        assistant
+    }
+
+    fn tool_result_message(call_id: &str, body: &str) -> Message {
+        let mut result = message(MessageRole::Tool, body);
+        result.tool_call_id = Some(call_id.to_owned());
+        result
+    }
+
+    /// Histories that exercise the shapes the recorder treats specially:
+    /// zero-row messages (System, empty assistant), multi-row messages
+    /// (reasoning + tool calls), tool results, and unanswered tool batches.
+    fn differential_histories() -> Vec<Vec<Message>> {
+        let mut reasoning = message(MessageRole::Assistant, "answer");
+        reasoning.reasoning_content = Some("thinking".to_owned());
+        let mut threaded = message(MessageRole::User, "threaded");
+        threaded.thread_id = Some("thread-7".to_owned());
+        vec![
+            vec![],
+            vec![message(MessageRole::User, "only one")],
+            vec![message(MessageRole::System, "system prompt")],
+            vec![
+                message(MessageRole::System, "system prompt"),
+                message(MessageRole::User, "after a zero-row message"),
+            ],
+            vec![message(MessageRole::Assistant, "")],
+            vec![reasoning],
+            vec![threaded],
+            vec![
+                message(MessageRole::User, "inspect"),
+                tool_call_message("call_a", "read"),
+                tool_result_message("call_a", "a result"),
+                message(MessageRole::Assistant, "done"),
+            ],
+            vec![
+                message(MessageRole::User, "inspect both"),
+                tool_call_message("call_b", "read"),
+                message(MessageRole::User, "continue without the answer"),
+            ],
+            vec![
+                message(MessageRole::User, "one"),
+                message(MessageRole::Assistant, "two"),
+                message(MessageRole::User, "three"),
+                message(MessageRole::Assistant, "four"),
+            ],
+        ]
+    }
+
+    /// The safety property of the whole change: the fast path may never be
+    /// MORE permissive than the exact replay. Loading a ledger the replay
+    /// would have rebuilt is the failure that matters; being stricter only
+    /// costs a rebuild (it happens for histories whose trailing messages
+    /// record no rows at all, e.g. a System message, which the replay cannot
+    /// tell apart from an empty history).
+    ///
+    /// Paired with the perf property: an unchanged history must take the fast
+    /// path, or the optimisation does nothing.
+    #[test]
+    fn should_count_tool_arguments_and_media_in_model_visible_budget() {
+        let plain = Message::user("inspect");
+        let mut image = plain.clone();
+        image.media.push("/tmp/chart.png".to_owned());
+        assert!(estimate_messages_tokens(&[image]) > estimate_messages_tokens(&[plain]) + 100);
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "one".into(),
+            name: "write_file".into(),
+            metadata: None,
+            arguments: json!({"content": "x".repeat(16_000)}),
+        }]);
+        assert!(estimate_messages_tokens(&[call]) >= 4_000);
+    }
+
+    #[test]
+    fn should_exclude_hidden_reasoning_and_raw_ledger_payload_from_compaction_threshold() {
+        let mut manager = ContextManager::new("model-budget", None);
+        let mut assistant = Message::assistant("artifact saved");
+        assistant.reasoning_content = Some("private reasoning ".repeat(50_000));
+        manager.record_message(&Message::user("continue"));
+        manager.record_message(&assistant);
+        assert!(legacy_estimate_items_tokens(manager.items()) > 100_000);
+        assert!(!manager.should_auto_compact(1_000));
+        manager.record_tool_output("one", "read_file", &"raw logs ".repeat(50_000));
+        assert!(
+            estimate_items_tokens(manager.items()) < 4_000,
+            "spilled raw data must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn should_load_legacy_token_estimates_without_losing_compacted_projection() {
+        let mut manager = ContextManager::new("budget-upgrade", None);
+        manager.record_message(&Message::user("old request ".repeat(500)));
+        manager.record_message(&Message::assistant("old answer ".repeat(500)));
+        manager.record_message(&Message::user("p36-v9 complete; next clean artwork"));
+        manager.compact_context(
+            "earlier work complete",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(64),
+                target_tokens_after_compaction: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let mut snapshot = manager.snapshot();
+        snapshot.state.token_estimate = legacy_estimate_items_tokens(manager.items());
+        let expected = manager.for_prompt(&PromptBuildPolicy::default()).messages;
+        let loaded = ContextManager::from_snapshot(snapshot);
+        let actual = loaded.for_prompt(&PromptBuildPolicy::default()).messages;
+        assert_eq!(
+            actual.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            expected.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.generation(), manager.generation());
+    }
+
+    #[test]
+    fn should_never_claim_coverage_the_replay_would_deny() {
+        for history in differential_histories() {
+            for recorder in ["persisted", "merging"] {
+                let mut manager = ContextManager::new("s", None);
+                for (seq, entry) in history.iter().enumerate() {
+                    if recorder == "persisted" {
+                        manager.record_persisted_message(entry, seq);
+                    } else {
+                        manager.record_persisted_message_merging_prompt_equivalent(entry, seq);
+                    }
+                }
+
+                let mut candidates: Vec<(String, Vec<Message>)> =
+                    vec![("unchanged".to_owned(), history.clone())];
+                let mut appended = history.clone();
+                appended.push(message(MessageRole::User, "appended"));
+                candidates.push(("appended".to_owned(), appended));
+                if !history.is_empty() {
+                    candidates.push((
+                        "truncated".to_owned(),
+                        history[..history.len() - 1].to_vec(),
+                    ));
+                    let mut edited = history.clone();
+                    let last = edited.len() - 1;
+                    edited[last] = message(MessageRole::User, "edited in place");
+                    candidates.push(("edited".to_owned(), edited));
+                }
+
+                for (label, candidate) in candidates {
+                    let fast = context_ledger_covers_history_with(&manager, &candidate, true);
+                    let replay = covers_by_replay(&manager, &candidate);
+                    assert!(
+                        !fast || replay,
+                        "{recorder} recorder, {label} history of {} message(s): \
+                         the fast path claimed coverage the replay denies",
+                        history.len()
+                    );
+                    if label == "unchanged" {
+                        // Fix-sensitive: the check must be ANSWERED by the
+                        // chain, not by a replay that happens to agree.
+                        let replays = REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get);
+                        assert!(
+                            context_ledger_covers_history_with(&manager, &candidate, true),
+                            "{recorder} recorder: unchanged history must be covered"
+                        );
+                        assert_eq!(
+                            REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get),
+                            replays,
+                            "{recorder} recorder: an unchanged history of {} message(s) \
+                             must be answered by the chain, not by a replay",
+                            history.len()
+                        );
+                        assert!(
+                            fast,
+                            "{recorder} recorder: an unchanged history of {} message(s) \
+                             must take the fast path",
+                            history.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same agreement, after the mutations that must NOT cost the chain.
+    #[test]
+    fn should_keep_answering_as_the_replay_does_after_projection_only_changes() {
+        let history = vec![
+            message(MessageRole::User, "inspect"),
+            tool_call_message("call_a", "read"),
+            tool_result_message("call_a", "a result"),
+        ];
+        let mut manager = ContextManager::new("s", None);
+        let mut ids = Vec::new();
+        for (seq, entry) in history.iter().enumerate() {
+            ids = manager.record_persisted_message_merging_prompt_equivalent(entry, seq);
+        }
+        assert!(manager.source_history().is_some());
+
+        manager.mark_source_event_kind(&ids, "background_result");
+        assert!(context_ledger_covers_history(&manager, &history));
+        assert!(covers_by_replay(&manager, &history));
+
+        manager.checkpoint("checkpoint");
+        assert!(context_ledger_covers_history(&manager, &history));
+        assert!(
+            manager.source_history().is_some(),
+            "a source-less row must not cost the chain"
+        );
+    }
+
+    #[test]
+    fn should_give_up_the_chain_when_a_source_row_arrives_outside_the_durable_recorders() {
+        let seeded = [message(MessageRole::User, "one")];
+        let mut manager = ContextManager::new("s", None);
+        manager.record_persisted_message(&seeded[0], 0);
+        assert!(manager.source_history().is_some());
+
+        manager.record_item_with_source_ref(
+            TranscriptItemKind::UserInput {
+                content: "hand built".to_owned(),
+                media: Vec::new(),
+            },
+            TranscriptItemSource::SessionLog,
+            Some(TranscriptSourceRef {
+                session_id: "s".to_owned(),
+                thread_id: None,
+                source_seq: Some(1),
+                source_event_kind: "user".to_owned(),
+            }),
+        );
+
+        assert_eq!(manager.source_history(), None, "the chain is given up");
+        // And the replay decides, as it did before this change.
+        let both = vec![seeded[0].clone(), message(MessageRole::User, "hand built")];
+        assert_eq!(
+            context_ledger_covers_history(&manager, &both),
+            covers_by_replay(&manager, &both)
+        );
+    }
+
+    #[test]
+    fn should_replay_when_the_ledger_lost_rows_behind_the_chain_s_back() {
+        // A writer bug (or an edited snapshot) drops a source row while the
+        // chain still claims full coverage. The chain must not be believed:
+        // the ledger's own shape has to corroborate it.
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+            message(MessageRole::User, "three"),
+        ];
+        let manager = ContextManager::from_session_history("s", None, &history);
+        let mut snapshot = manager.snapshot();
+        let dropped = snapshot
+            .items
+            .iter()
+            .position(|item| item.source_ref.as_ref().and_then(|r| r.source_seq) == Some(1))
+            .expect("a row for the middle message");
+        snapshot.items.remove(dropped);
+        snapshot.source_head_hash = Some(source_head_hash_for_items(&snapshot.items));
+        let tampered = ContextManager::from_snapshot(snapshot);
+
+        assert!(
+            tampered.source_history().is_some(),
+            "the chain survives the tamper — that is the point"
+        );
+        assert!(!context_ledger_covers_history_with(
+            &tampered, &history, true
+        ));
+        // And the replay agrees, so the caller rebuilds rather than loading
+        // a ledger that is missing a row.
+        assert!(!covers_by_replay(&tampered, &history));
+    }
+
+    #[test]
+    fn should_notice_a_history_whose_thread_ids_changed() {
+        // `thread_id` reaches the ledger through every row's source ref, so
+        // the digest must fold it: dropping it would make the fast path more
+        // permissive than the replay.
+        let mut threaded = message(MessageRole::User, "same text");
+        threaded.thread_id = Some("thread-a".to_owned());
+        let manager =
+            ContextManager::from_session_history("s", None, std::slice::from_ref(&threaded));
+
+        let mut moved = threaded.clone();
+        moved.thread_id = Some("thread-b".to_owned());
+
+        assert!(!context_ledger_covers_history_with(
+            &manager,
+            std::slice::from_ref(&moved),
+            true
+        ));
+        assert!(!covers_by_replay(&manager, std::slice::from_ref(&moved)));
+    }
+
+    #[test]
+    fn should_adopt_a_chain_for_a_ledger_persisted_before_chains_existed() {
+        // The migration path: a snapshot with no chain still loads through the
+        // replay, gains a chain at that moment, and answers cheaply after.
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+        ];
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let built = ContextManager::from_session_history("s", None, &history);
+        let mut legacy = built.snapshot();
+        legacy.source_history = None;
+        persist_context_manager_snapshot(temp.path(), "s", &ContextManager::from_snapshot(legacy))
+            .expect("persist a chainless snapshot");
+
+        let (loaded, status) = load_or_rebuild_context_manager(temp.path(), "s", None, &history);
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        assert!(loaded.source_history().is_some(), "the chain is adopted");
+
+        persist_context_manager_snapshot(temp.path(), "s", &loaded).expect("persist again");
+        let (again, status) = load_or_rebuild_context_manager(temp.path(), "s", None, &history);
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        let replays = REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get);
+        assert!(context_ledger_covers_history_with(&again, &history, true));
+        assert_eq!(
+            REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get),
+            replays,
+            "the second load answers from the chain"
+        );
+    }
+
+    #[test]
+    fn should_give_up_the_chain_when_a_message_arrives_out_of_sequence() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_persisted_message(&message(MessageRole::User, "one"), 0);
+        manager.record_persisted_message(&message(MessageRole::User, "six"), 5);
+        assert_eq!(manager.source_history(), None);
+    }
+
+    #[test]
+    fn should_carry_the_chain_through_a_persisted_snapshot() {
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+        ];
+        let manager = ContextManager::from_session_history("s", None, &history);
+        let reloaded = ContextManager::from_snapshot(manager.snapshot());
+
+        assert_eq!(reloaded.source_history(), manager.source_history());
+        assert!(context_ledger_covers_history(&reloaded, &history));
+    }
+
+    #[test]
+    fn should_ignore_fields_the_recorder_never_reads() {
+        // Two histories the recorder turns into identical ledgers must compare
+        // equal, or every reload would rebuild for nothing.
+        let mut first = message(MessageRole::User, "same");
+        first.client_message_id = Some("cmid-1".to_owned());
+        let mut second = first.clone();
+        second.timestamp = first.timestamp + chrono::Duration::seconds(30);
+        second.client_message_id = Some("cmid-2".to_owned());
+
+        let manager = ContextManager::from_session_history("s", None, std::slice::from_ref(&first));
+        assert!(context_ledger_covers_history(
+            &manager,
+            std::slice::from_ref(&second)
+        ));
+    }
+
+    #[test]
+    fn should_still_decide_correctly_with_the_fingerprint_switched_off() {
+        // What the kill switch leaves in charge.
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+        ];
+        let manager = ContextManager::from_session_history("s", None, &history);
+        assert!(context_ledger_covers_history_with(
+            &manager, &history, false
+        ));
+        assert!(!context_ledger_covers_history_with(
+            &manager,
+            &history[..1],
+            false
+        ));
+    }
+
     use super::*;
 
     fn assistant_tool_call(call_id: &str) -> Message {
@@ -4954,7 +5953,26 @@ mod tests {
         assert_eq!(envelope.original_bytes, 16);
         assert_eq!(
             envelope.model_visible_bytes,
-            "0123456789\n[truncated]".len()
+            envelope.model_visible_content.len()
+        );
+        // The visible content is the capped prefix, then a note that names
+        // the call, the shown/original sizes and the recall handle, then the
+        // `[truncated]` marker last.
+        assert!(envelope.model_visible_content.starts_with("0123456789\n"));
+        assert!(envelope.model_visible_content.ends_with("\n[truncated]"));
+        assert!(
+            envelope
+                .model_visible_content
+                .contains("showing the first 10 B of 16 B of shell output"),
+            "{}",
+            envelope.model_visible_content
+        );
+        assert!(
+            envelope
+                .model_visible_content
+                .contains("`recall` with tool_call_id \"call_1\""),
+            "{}",
+            envelope.model_visible_content
         );
         assert_eq!(
             envelope.truncation_reason,
@@ -5510,7 +6528,13 @@ mod tests {
             .iter()
             .find(|message| message.role == MessageRole::Tool)
             .expect("tool message");
-        assert_eq!(tool_message.content, "0123456789\n[truncated]");
+        assert!(tool_message.content.starts_with("0123456789\n"));
+        assert!(tool_message.content.ends_with("\n[truncated]"));
+        assert!(
+            tool_message
+                .content
+                .contains("`recall` with tool_call_id \"call_1\"")
+        );
         assert_eq!(
             frame.report.truncated_item_ids.len(),
             1,
@@ -5542,7 +6566,11 @@ mod tests {
             .find(|message| message.role == MessageRole::Tool)
             .expect("tool output should remain");
         assert!(tool_message.content.ends_with("[truncated]"));
-        assert!(tool_message.content.len() < 200);
+        assert!(
+            tool_message.content.matches('x').count() < 200,
+            "the raw output must be cut, not merely annotated"
+        );
+        assert!(tool_message.content.contains("for context pressure"));
         assert!(
             frame.report.truncated_item_ids.contains(&tool_item_id),
             "context-pressure truncation should report the affected tool output item"
@@ -5659,6 +6687,7 @@ mod tests {
                     model_visible_bytes: 0,
                     truncation_reason: None,
                     policy_id: String::new(),
+                    media: Vec::new(),
                 }
             })));
         assert!(
@@ -6317,6 +7346,37 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn tool_output_media_survives_the_prompt_rebuild_when_the_model_takes_media() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&message(MessageRole::User, "look at grab.png"));
+        manager.record_message(&assistant_tool_call("call_1"));
+        let mut tool = message(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec!["/tmp/grab.png".into()];
+        manager.record_message(&tool);
+        let with_media = manager.for_prompt(&PromptBuildPolicy {
+            supports_media: true,
+            ..PromptBuildPolicy::default()
+        });
+        let row = with_media
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row");
+        assert_eq!(row.media, vec!["/tmp/grab.png".to_string()]);
+        let text_only = manager.for_prompt(&PromptBuildPolicy::default());
+        let row = text_only
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row");
+        assert!(
+            row.media.is_empty(),
+            "a text-only model gets no media on the tool row"
         );
     }
 
@@ -8176,3 +9236,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "context_journal_tests.rs"]
+mod context_journal_tests;

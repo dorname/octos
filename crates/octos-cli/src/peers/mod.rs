@@ -48,7 +48,14 @@ use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
+pub(crate) mod app_binding;
+pub(crate) mod host_tools;
+pub(crate) mod purge;
 mod recovery;
+pub(crate) mod session_tool_list;
+pub(crate) mod shared_history;
+pub(crate) mod turn_origin;
+pub(crate) mod workspace_team;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
 // `recovery` (next to its writers); the derivation below uses both.
@@ -353,7 +360,8 @@ pub(crate) const PEER_TASK_ID_LEAF: &str = "task-id";
 const PEER_TASK_ID_STATE_LEAF: &str = "task-id-state";
 
 /// Registration-time task-id binding; callers must handle every write failure.
-/// `true` means both file data and its directory entry have been synced.
+/// `true` means the write succeeded — file data synced and, on Unix, the
+/// directory entry too (Windows has no directory sync, #2515).
 #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 #[must_use]
 pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_id: &str) -> bool {
@@ -672,6 +680,21 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
 
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
+/// The peer whose token budget (#2500) a session's turns are charged to: the
+/// peer itself for `peer-<slug>`, and the OWNING peer for a request context
+/// `peerctx-<slug>.<id>` (UPCR-2026-034/035), so an app cannot spend outside
+/// its budget by working through contexts.
+pub(crate) fn budget_peer_slug(session_id: &SessionKey) -> Option<&str> {
+    if let Some((_, slug)) = peer_slug_and_profile(session_id) {
+        return Some(slug);
+    }
+    let topic = session_id.topic()?;
+    topic.strip_prefix(app_binding::PEER_CONTEXT_TOPIC_PREFIX)?;
+    let (slug, context_id) = app_binding::parse_context_topic(topic)?;
+    (peer_slug_is_safe(slug) && app_binding::validate_context_id(context_id).is_ok())
+        .then_some(slug)
+}
+
 pub(crate) fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
     // NOT a peer session. The overwhelmingly common case, and the only one where
     // `None` is uninteresting — every caller correctly skips peer bookkeeping.
@@ -841,6 +864,39 @@ pub(crate) mod peer_io {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A cancelled host-tool task may still append its audit after the turn
+    /// reports a terminal. Serialize leaf mutations with final directory
+    /// removal: neither an append nor an atomic writer's temporary file may
+    /// appear while `peer/purge` is enumerating and deleting the directory.
+    /// This is separate from the round-publication lock (whose holders call
+    /// these helpers). Idle entries retain only weak references and are reaped.
+    pub(crate) fn mutation_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+        use std::{
+            collections::HashMap,
+            path::PathBuf,
+            sync::{Arc, Mutex, OnceLock, Weak},
+        };
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        // Normalize parent aliases without following a replaced final leaf.
+        // The actual I/O still performs its own fd-anchored no-follow checks.
+        let key = path
+            .parent()
+            .zip(path.file_name())
+            .and_then(|(parent, leaf)| dunce::canonicalize(parent).ok().map(|p| p.join(leaf)))
+            .unwrap_or_else(|| path.to_owned());
+        let mut locks = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     /// Read cap for the large peer files (`brief.md`, `result.md`). Over-cap
     /// content reads as absent (`None`) rather than a truncated prefix, matching
     /// `memory_panel`'s over-cap posture. 1 MiB is far above any legitimate
@@ -889,6 +945,16 @@ pub(crate) mod peer_io {
         imp::read_peer_file(peer_dir, leaf, cap).ok().flatten()
     }
 
+    /// Control files must distinguish an absent legacy leaf from an invalid
+    /// or unreadable one; treating both as absent would disable a budget.
+    pub(crate) fn read_peer_control_file(
+        peer_dir: &Path,
+        leaf: &str,
+        cap: usize,
+    ) -> std::io::Result<Option<String>> {
+        imp::read_peer_file(peer_dir, leaf, cap)
+    }
+
     pub(crate) fn read_peer_identity_file(peer_dir: &Path, leaf: &str) -> PeerFileRead {
         match imp::read_peer_file(peer_dir, leaf, PEER_FILE_READ_CAP_SMALL) {
             Ok(None) => PeerFileRead::Missing,
@@ -931,18 +997,25 @@ pub(crate) mod peer_io {
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, false)
     }
 
     /// Identity writes require BOTH file data and the renamed directory entry
     /// to be synced. Unlike ordinary peer output, directory-sync errors must
-    /// propagate to the registration/adoption gate.
+    /// propagate to the registration/adoption gate. Unix delivers that in
+    /// full; Windows has no directory sync, so it is best-effort there — the
+    /// file data is written and the rename is atomic, but sync errors never
+    /// occur (#2515).
     #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
     pub(crate) fn write_peer_file_durable(
         peer_dir: &Path,
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, true)
     }
 
@@ -952,7 +1025,61 @@ pub(crate) mod peer_io {
     /// planted FIFO fails fast instead of parking the writer on the missing
     /// reader.
     pub(crate) fn append_peer_line(peer_dir: &Path, leaf: &str, line: &str) -> std::io::Result<()> {
-        imp::append_peer_line(peer_dir, leaf, line)
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        mutation_test_hook::before_append(peer_dir);
+        imp::append_peer_line(peer_dir, leaf, line, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) mod mutation_test_hook {
+        use std::{
+            collections::HashMap,
+            path::{Path, PathBuf},
+            sync::{Mutex, OnceLock, mpsc},
+        };
+
+        type Pause = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        static PAUSES: OnceLock<Mutex<HashMap<PathBuf, Pause>>> = OnceLock::new();
+
+        pub(crate) fn pause_append(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), (started_tx, release_rx));
+            (started_rx, release_tx)
+        }
+
+        pub(super) fn before_append(path: &Path) {
+            let pause = PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(path);
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release held append");
+            }
+        }
+    }
+
+    /// Append and sync a control record before another turn may be admitted.
+    /// The sync is real on Unix and best-effort on Windows (#2515) — the line
+    /// is written either way.
+    pub(crate) fn append_peer_line_durable(
+        peer_dir: &Path,
+        leaf: &str,
+        line: &str,
+    ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        imp::append_peer_line(peer_dir, leaf, line, true)
     }
 
     /// `true` when the peer leaf exists as a REGULAR file, resolved under the
@@ -1104,6 +1231,7 @@ pub(crate) mod peer_io {
             peer_dir: &Path,
             leaf: &str,
             line: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             let dir = open_peer_dir(peer_dir)?;
             // O_APPEND create; O_NOFOLLOW refuses a symlinked leaf; O_NONBLOCK
@@ -1130,7 +1258,11 @@ pub(crate) mod peer_io {
                     "peer leaf is not a regular file",
                 ));
             }
-            file.write_all(line.as_bytes())
+            file.write_all(line.as_bytes())?;
+            if durable {
+                file.sync_data()?;
+            }
+            Ok(())
         }
 
         pub(crate) fn peer_file_mtime(
@@ -1345,9 +1477,14 @@ pub(crate) mod peer_io {
                 return Err(err);
             }
             if durable {
-                // Platforms unable to sync directories fail closed for new
-                // supervised staging instead of claiming false durability.
-                std::fs::File::open(peer_dir)?.sync_all()?;
+                // Windows cannot repeat this sync: a plain open of a directory
+                // is denied outright (os error 5) — only FILE_FLAG_BACKUP_
+                // SEMANTICS reaches a directory handle, and FlushFileBuffers
+                // is not a documented directory-metadata sync there. The
+                // rename above already made the record fully visible, so
+                // Windows runs best-effort durable instead of failing every
+                // budgeted stage and prepare (#2515); Unix keeps the
+                // fail-closed dir sync.
             }
             Ok(())
         }
@@ -1356,6 +1493,7 @@ pub(crate) mod peer_io {
             peer_dir: &Path,
             leaf: &str,
             line: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             if !peer_dir_ok(peer_dir) {
                 return Err(std::io::Error::new(
@@ -1376,7 +1514,16 @@ pub(crate) mod peer_io {
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            file.write_all(line.as_bytes())
+            file.write_all(line.as_bytes())?;
+            if durable {
+                // Windows cannot sync an append handle either: an append-mode
+                // open holds FILE_APPEND_DATA without FILE_WRITE_DATA, and
+                // FlushFileBuffers requires the write right, so sync_data
+                // failed with os error 5 on every budgeted admission (#2515).
+                // The line is written either way, so Windows runs best-effort
+                // durable instead; Unix syncs for real.
+            }
+            Ok(())
         }
 
         pub(crate) fn peer_file_mtime(
@@ -2901,6 +3048,153 @@ pub(crate) struct StagedPeer {
     pub(crate) worktree_branch: Option<String>,
 }
 
+/// A peer budget is independent of the master's goal budget. Usage is keyed
+/// by the staged slug, so reopening the peer under a new OUP session id does
+/// not reset its allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerTokenBudgetStatus {
+    pub(crate) limit: u64,
+    pub(crate) used: u64,
+}
+
+pub(crate) fn peer_token_budget_status(
+    peers_root: &Path,
+    slug: &str,
+) -> Result<Option<PeerTokenBudgetStatus>, String> {
+    use peer_io::PeerFileRead;
+
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Ok(None);
+    };
+    let limit = match peer_io::read_peer_identity_file(&dir, "token_budget") {
+        PeerFileRead::Missing => return Ok(None),
+        PeerFileRead::Valid(text) => text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| format!("peer '{slug}' has an invalid token budget"))?,
+        PeerFileRead::Invalid(error) => {
+            return Err(format!("cannot read peer '{slug}' token budget: {error}"));
+        }
+    };
+    match peer_io::read_peer_control_file(&dir, "token_budget_error", 1024) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(format!(
+                "peer '{slug}' token budget accounting is unavailable"
+            ));
+        }
+        Err(error) => {
+            return Err(format!("cannot check peer '{slug}' token budget: {error}"));
+        }
+    }
+    let mut turns = HashMap::<String, u64>::new();
+    match peer_io::read_peer_control_file(&dir, "token_budget_usage", 1024 * 1024) {
+        Ok(None) => {}
+        Ok(Some(text)) => {
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                let (Some(turn_id), Some(tokens), None) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    return Err(format!("peer '{slug}' has invalid token usage records"));
+                };
+                let tokens = tokens
+                    .parse::<u64>()
+                    .map_err(|_| format!("peer '{slug}' has invalid token usage records"))?;
+                if turns
+                    .insert(turn_id.to_owned(), tokens)
+                    .is_some_and(|old| old != tokens)
+                {
+                    return Err(format!("peer '{slug}' has conflicting token usage records"));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(format!("cannot read peer '{slug}' token usage: {error}"));
+        }
+    }
+    let used = turns.values().copied().fold(0_u64, u64::saturating_add);
+    Ok(Some(PeerTokenBudgetStatus { limit, used }))
+}
+
+/// Append one turn's spend. Duplicate terminal delivery is safe: the reader
+/// counts each turn id once. This is a turn-boundary budget, like goal budgets.
+pub(crate) fn charge_peer_token_budget(
+    peers_root: &Path,
+    slug: &str,
+    turn_id: &str,
+    tokens: u64,
+) -> Result<(), String> {
+    if peer_token_budget_status(peers_root, slug)?.is_none() {
+        return Ok(());
+    }
+    let dir = staged_peer_dir(peers_root, slug)
+        .ok_or_else(|| format!("peer '{slug}' is no longer staged"))?;
+    if let Err(error) = peer_io::append_peer_line_durable(
+        &dir,
+        "token_budget_usage",
+        &format!("{turn_id} {tokens}\n"),
+    ) {
+        let _ = peer_io::write_peer_file_durable(&dir, "token_budget_error", &error.to_string());
+        return Err(format!("cannot record peer '{slug}' token usage: {error}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod peer_token_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_accumulates_by_peer_and_deduplicates_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let peer = peers_root.join("reviewer");
+        let other = peers_root.join("implementer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        peer_io::write_peer_file_durable(&peer, "token_budget", "100").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "brief.md", "Review the change").unwrap();
+        peer_io::write_peer_file_durable(&other, "token_budget", "50").unwrap();
+        peer_io::write_peer_file_atomic(&other, "brief.md", "Implement the change").unwrap();
+
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "reviewer").unwrap(),
+            Some(PeerTokenBudgetStatus {
+                limit: 100,
+                used: 0,
+            })
+        );
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-1", 75).unwrap();
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-1", 75).unwrap();
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-2", 30).unwrap();
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "reviewer").unwrap(),
+            Some(PeerTokenBudgetStatus {
+                limit: 100,
+                used: 105,
+            })
+        );
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "implementer").unwrap(),
+            Some(PeerTokenBudgetStatus { limit: 50, used: 0 })
+        );
+    }
+
+    #[test]
+    fn malformed_usage_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = tmp.path().join("bad");
+        std::fs::create_dir_all(&peer).unwrap();
+        peer_io::write_peer_file_atomic(&peer, "token_budget", "100").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "brief.md", "Review").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "token_budget_usage", "not-a-record").unwrap();
+        assert!(peer_token_budget_status(tmp.path(), "bad").is_err());
+    }
+}
+
 /// #1801 v3: single-peer staging core shared by the `peer/prepare` fleet
 /// loop and the `peer_handoff` tool callback. Reserves the slug dir
 /// (`reserve_peer_dir` — `create_dir` is the atomic claim), optionally
@@ -2911,6 +3205,7 @@ pub(crate) struct StagedPeer {
 /// loop keeps it off the reactor via `spawn_blocking`, while the tool
 /// callback — a sync `Fn` — runs it directly on the tool's worker.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn stage_peer(
     peers_root: &Path,
     workspace_root: &Path,
@@ -2936,6 +3231,45 @@ pub(crate) fn stage_peer(
     goal_id: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<StagedPeer, RpcError> {
+    stage_peer_with_budget(
+        peers_root,
+        workspace_root,
+        seed,
+        name,
+        originator,
+        brief,
+        worktree,
+        goal_id,
+        task_id,
+        None,
+        None,
+    )
+}
+
+/// Stage a peer with an optional cumulative token budget. The budget is
+/// durable before `brief.md` makes the peer visible to OUP clients.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_peer_with_budget(
+    peers_root: &Path,
+    workspace_root: &Path,
+    seed: &str,
+    name: Option<&str>,
+    originator: Option<&str>,
+    brief: &str,
+    worktree: bool,
+    goal_id: Option<&str>,
+    task_id: Option<&str>,
+    token_budget: Option<u64>,
+    // UPCR-2026-034 — a host-owned app peer's durable binding (workspace +
+    // memory namespace), written BEFORE `brief.md` so the peer never becomes
+    // visible unbound. `None` for every agent-staged peer.
+    host_binding: Option<&app_binding::PeerHostBinding>,
+) -> Result<StagedPeer, RpcError> {
+    if token_budget == Some(0) {
+        return Err(RpcError::invalid_params(
+            "token_budget must be a positive integer",
+        ));
+    }
     // A NAMED peer reserves its EXACT (name-derived) slug and rejects
     // collisions — a name is the primary address, so it must be unique and
     // stable. An unnamed (legacy `peer/prepare`) peer keeps the auto-suffix
@@ -3061,6 +3395,32 @@ pub(crate) fn stage_peer(
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to record peer originator: {err}"
+            )));
+        }
+    }
+
+    if let Some(binding) = host_binding {
+        if let Err(err) = app_binding::write_host_binding_in(&peer_dir, binding) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to record the peer's host binding: {err}"
+            )));
+        }
+    }
+
+    if let Some(limit) = token_budget {
+        if let Err(err) =
+            peer_io::write_peer_file_durable(&peer_dir, "token_budget", &limit.to_string())
+        {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to record peer token budget: {err}"
+            )));
+        }
+        if let Err(err) = peer_io::write_peer_file_durable(&peer_dir, "token_budget_usage", "") {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to initialize peer token usage: {err}"
             )));
         }
     }
@@ -3357,9 +3717,9 @@ pub(crate) const PEER_HANDOFFS_PER_TURN_MAX: u32 = 4;
 /// recursively, and the tool is not even visible to the model there.
 #[cfg(any(feature = "api", test))]
 pub(crate) fn peer_handoff_allowed_for_session(session_id: &SessionKey) -> bool {
-    !session_id
-        .topic()
-        .is_some_and(|topic| topic.starts_with("peer-"))
+    !session_id.topic().is_some_and(|topic| {
+        topic.starts_with("peer-") || topic.starts_with(app_binding::PEER_CONTEXT_TOPIC_PREFIX)
+    })
 }
 
 /// #20a (smart worktree fencing) — a collision risk REASON. When the model
@@ -3520,7 +3880,7 @@ pub(crate) fn build_peer_handoff_callback(
         };
         let (effective_worktree, fence_warning) =
             resolve_peer_worktree(request.worktree, &fence_reasons);
-        let staged = stage_peer(
+        let staged = stage_peer_with_budget(
             &peers_root,
             &workspace_root,
             &request.name,
@@ -3531,6 +3891,8 @@ pub(crate) fn build_peer_handoff_callback(
             // Explicit goal_id wins; else the master's active goal (auto-bind).
             resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
+            request.token_budget,
+            None,
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -3607,6 +3969,7 @@ pub(crate) fn build_peer_handoff_callback(
             cwd: staged.cwd.to_string_lossy().into_owned(),
             worktree_branch: staged.worktree_branch,
             model_note,
+            token_budget: request.token_budget,
         })
     })
 }
@@ -3830,6 +4193,33 @@ pub(crate) fn peer_pending_summaries(
     approvals
 }
 
+/// The part of a peer's parked set its ORIGINATOR may answer. A host-owned app
+/// peer's tool approvals belong to the person in the app's own UI (ADR 0007,
+/// UPCR-2026-034): they are dropped here, so neither `peer_list` nor
+/// `peer_respond` offers them to the owning system agent. Every other peer's
+/// set is returned unchanged.
+pub(crate) fn peer_pending_answerable_by_originator(
+    peers_root: &Path,
+    slug: &str,
+    pendings: Vec<PeerPendingSummary>,
+) -> Vec<PeerPendingSummary> {
+    if !app_binding::peer_is_host_owned(peers_root, slug) {
+        return pendings;
+    }
+    pendings
+        .into_iter()
+        .filter(|pending| pending.kind != PeerPendingKind::Approval)
+        .collect()
+}
+
+/// The refusal `peer_respond` returns for a host-owned app peer's approval.
+fn host_owned_approval_refusal(slug: &str) -> String {
+    format!(
+        "peer '{slug}' is a host-owned app peer: its tool approvals are answered \
+         only by the person in the app, not via peer_respond — leave it to them"
+    )
+}
+
 /// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
 /// recorded server-side at `session/open`. `None` when the peer is not currently
 /// open — it then has no live oneshot to answer or cancel. This is the ONLY
@@ -3923,7 +4313,28 @@ pub(crate) fn peer_respond_resolve(
     };
 
     // The AUTHORITATIVE parked set for this peer, straight from the store.
-    let pendings = peer_pending_summaries(contracts, &peer_session);
+    let all_pendings = peer_pending_summaries(contracts, &peer_session);
+    // ADR 0007 — a host-owned app peer's approvals are the person's, answered
+    // in the app's own UI. The originator (the system agent) may answer the
+    // peer's questions but never approve its tools: refuse a targeted
+    // approval, and never select one by default.
+    if app_binding::peer_is_host_owned(peers_root, &slug) {
+        let targets_approval = match req.id.as_deref() {
+            Some(id) => all_pendings
+                .iter()
+                .any(|p| p.id == id && p.kind == PeerPendingKind::Approval),
+            None => {
+                req.decision.is_some()
+                    && all_pendings
+                        .iter()
+                        .any(|p| p.kind == PeerPendingKind::Approval)
+            }
+        };
+        if targets_approval {
+            return Err(host_owned_approval_refusal(&slug));
+        }
+    }
+    let pendings = peer_pending_answerable_by_originator(peers_root, &slug, all_pendings);
     if pendings.is_empty() {
         return Err(format!(
             "peer '{slug}' is not awaiting input — nothing to respond to \
@@ -4084,6 +4495,26 @@ pub(crate) fn peer_respond_resolve(
 /// inflate the derived version number (#1824).
 pub(crate) fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
     peer_io::peer_dir_count_prefixed(peer_dir, "result-", peer_io::PEER_DIR_SCAN_CAP) as u32
+}
+
+/// The lock a writer holds while it publishes one round of a staged peer
+/// (numbers `result-<n>.md`, writes it, `result.md` and the `turns.txt`
+/// line). A host-owned app peer's two lanes (its own session and a request
+/// context with shared history, UPCR-2026-034) finish turns concurrently;
+/// without it two writers could count the same `n` and one round would
+/// overwrite the other, or `turns.txt` and `result.md` could name rounds out
+/// of order. Keyed by the peer dir, process-wide (one kernel owns a peers
+/// root).
+pub(crate) fn peer_round_publish_lock(peer_dir: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(peer_dir.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Count how many `brief-<n>.md` instruction files exist in the peer directory
@@ -4712,7 +5143,13 @@ pub(crate) fn build_peer_list_callback(
             .filter(|row| !row.closed)
             .filter_map(|row| {
                 let session = peer_trusted_session(&profile_id, &row.slug)?;
-                let pending = peer_pending_summaries(&contracts, &session);
+                // ADR 0007 — a host-owned app peer's approvals are the
+                // person's; they are not shown to the originator as input to give.
+                let pending = peer_pending_answerable_by_originator(
+                    &peers_root,
+                    &row.slug,
+                    peer_pending_summaries(&contracts, &session),
+                );
                 (!pending.is_empty()).then(|| (row.slug.clone(), pending))
             })
             .collect();
@@ -5308,9 +5745,6 @@ mod peer_task_registry_tests {
     use super::*;
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn should_keep_modern_peer_parked_when_legacy_result_adoption_runs() {
         for lifetime in ["pending", "running", "failed", "invalid"] {
             let data = tempfile::tempdir().unwrap();
@@ -5373,9 +5807,6 @@ mod peer_task_registry_tests {
     }
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn peer_task_durable_identity_roundtrip_and_missing_new_id_refused() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
@@ -5535,9 +5966,6 @@ mod peer_task_registry_tests {
     }
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn peer_task_id_write_failure_stays_unadoptable_after_restart() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");

@@ -81,7 +81,7 @@ The complete configuration structure with all available fields:
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -384,6 +384,13 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 | Variable | Description |
 |----------|-------------|
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+
+### Session Storage
+
+| Variable | Description |
+|----------|-------------|
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 
 ### System
 

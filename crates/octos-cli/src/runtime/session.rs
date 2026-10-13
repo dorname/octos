@@ -21,6 +21,10 @@ use octos_core::{
 };
 
 use super::ProfileRuntime;
+use crate::commands::gateway::prompt::{
+    SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
+    strip_slash_commands,
+};
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
 ///
@@ -142,9 +146,67 @@ pub struct SessionRuntime {
     /// Opened at [`Self::sessions_root`] (which is
     /// [`ProfileRuntime::data_dir`] unless the session is cwd-scoped).
     pub sessions: Arc<tokio::sync::Mutex<SessionManager>>,
+
+    /// The memory stores this session captures into and is injected from:
+    /// the profile's own, or — for a host-bound app peer or one of its
+    /// request contexts (UPCR-2026-034) — the bound app/account namespace.
+    pub memory: super::memory_namespace::SessionMemory,
+
+    /// The app binding (UPCR-2026-034) this runtime was built for, and the
+    /// `peers/` root it was resolved under. A binding decides the workspace,
+    /// the memory stores and the permission clamp, so a runtime built for
+    /// another binding must be rebuilt, never reused
+    /// ([`Self::app_binding_is_current`]).
+    pub(crate) app_binding: crate::peers::app_binding::SessionAppBinding,
+    pub(crate) binding_peers_root: PathBuf,
+    /// The connection whose `client_commands` declaration is currently in
+    /// the prompt, so only that connection's close releases it.
+    client_commands_owner: std::sync::Mutex<Option<u64>>,
+}
+
+/// UPCR-2026-034 `read_parent`: a request context's read-only view of its
+/// peer's folder, minus every context's folder (its own stays its
+/// workspace): `(peer folder, excluded folders)`. Enforced by the session
+/// scope (file tools) and the sandbox (shell), never by convention.
+fn context_read_view(
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    match binding {
+        crate::peers::app_binding::SessionAppBinding::Bound {
+            read_view: Some(root),
+            ..
+        } => Some((
+            root.clone(),
+            vec![crate::peers::app_binding::contexts_folder(root)],
+        )),
+        _ => None,
+    }
+}
+
+/// Attach [`context_read_view`] to the session scope.
+fn with_context_read_view(
+    scope: Option<Arc<SessionScope>>,
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Result<Option<Arc<SessionScope>>, octos_core::SessionScopeError> {
+    match (scope, context_read_view(binding)) {
+        (Some(scope), Some((root, excluded))) => Ok(Some(Arc::new(
+            (*scope).clone().with_read_only_view(root, excluded)?,
+        ))),
+        (scope, _) => Ok(scope),
+    }
 }
 
 impl SessionRuntime {
+    /// Whether the durable app binding of this session still equals the one
+    /// this runtime was built for. `false` means the runtime is stale (e.g.
+    /// cached before `peer/prepare` bound the session) and must be rebuilt.
+    pub(crate) fn app_binding_is_current(&self) -> bool {
+        crate::peers::app_binding::resolve_session_app_binding(
+            &self.binding_peers_root,
+            &self.session_key,
+        ) == self.app_binding
+    }
+
     /// Construct a [`SessionRuntime`] for the given session key.
     ///
     /// See the M11-C contract in `workstreams/M11-runtime-unification.md`
@@ -220,6 +282,38 @@ impl SessionRuntime {
         .await
     }
 
+    /// Tell the agent which slash commands the client on connection `owner`
+    /// declared on `session/open` (octoscode#664); an empty list clears them.
+    /// Per-turn agents inherit it via the snapshot. Returns the names that
+    /// were accepted, for the `session/open` result to echo.
+    pub fn apply_client_commands(&self, owner: u64, commands: &[String]) -> Vec<String> {
+        let mut current = self
+            .client_commands_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let accepted = accepted_client_commands(commands);
+        *current = (!accepted.is_empty()).then_some(owner);
+        self.agent.set_prompt_segment(
+            SLASH_COMMANDS_SEGMENT_NAME,
+            render_client_commands(&accepted),
+        );
+        accepted
+    }
+
+    /// Clear the declared commands when connection `owner` closes, unless a
+    /// later `session/open` from another connection has replaced them.
+    pub fn release_client_commands(&self, owner: u64) {
+        let mut current = self
+            .client_commands_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == Some(owner) {
+            *current = None;
+            self.agent
+                .set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, String::new());
+        }
+    }
+
     /// [`Self::bootstrap`] with an explicit `sessions_in_cwd` flag. The
     /// convenience [`Self::bootstrap`] hard-codes `false` (legacy per-profile
     /// storage); this variant lets the AppUi path (and tests) request the
@@ -285,6 +379,77 @@ impl SessionRuntime {
         // BEFORE it is consumed — the sessions-root resolution below keys off
         // "was this a cwd/coding-agent session" (a hint), not off the derived
         // workspace path.
+        //
+        // UPCR-2026-034: a host-bound app peer (or one of its request
+        // contexts) runs ONLY in its bound workspace and on its bound memory
+        // namespace; a closed or never-opened binding refuses to run at all.
+        // The binding is durable kernel state written by `peer/prepare` /
+        // `peer/context/open`, never taken from this open's parameters.
+        let binding_peers_root = profile.data_dir.join("peers");
+        let app_binding = crate::peers::app_binding::resolve_session_app_binding(
+            &binding_peers_root,
+            &session_key,
+        );
+        // Kept on the runtime: a cached runtime whose binding no longer
+        // matches the durable one (the session was bound by `peer/prepare` or
+        // `peer/context/open` after it was cached) is never reused.
+        let bootstrapped_binding = app_binding.clone();
+        let (workspace_hint, bound_memory_namespace) = match app_binding {
+            crate::peers::app_binding::SessionAppBinding::Unbound => (workspace_hint, None),
+            crate::peers::app_binding::SessionAppBinding::Refused(reason) => {
+                eyre::bail!("session {session_key} cannot run: {reason}");
+            }
+            crate::peers::app_binding::SessionAppBinding::Bound {
+                cwd,
+                memory_namespace,
+                read_view,
+            } => {
+                // The bound folder (and a context's read-only view of its
+                // peer's folder) must still be the canonical directory the
+                // binding recorded: a symlink swapped in for it (or an
+                // ancestor) would otherwise re-root the session, or widen
+                // the view, wherever it points.
+                for dir in std::iter::once(&cwd).chain(read_view.iter()) {
+                    if let Err(reason) = crate::peers::app_binding::verify_bound_dir(dir) {
+                        eyre::bail!("session {session_key} cannot run: {reason}");
+                    }
+                }
+                if let Some(hint) = workspace_hint.as_ref() {
+                    let hint_canon = dunce::canonicalize(hint).unwrap_or_else(|_| hint.clone());
+                    let cwd_canon = dunce::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+                    if hint_canon != cwd_canon {
+                        eyre::bail!(
+                            "session {session_key} is bound to workspace {}; refusing {}",
+                            cwd.display(),
+                            hint.display()
+                        );
+                    }
+                }
+                (Some(cwd), Some(memory_namespace))
+            }
+        };
+        // UPCR-2026-035: a host-bound app session never runs with host
+        // filesystem access. `Host` (danger_full_access, e.g. a Solo profile
+        // run with `--danger-full-access`) leaves file tools unscoped and the
+        // sandbox off, so an app's read tools would accept any absolute path.
+        // Clamp it to workspace access, keeping the approval policy; the
+        // session scope is then attached below like for any other session.
+        let (permissions, sandbox_override) =
+            if bound_memory_namespace.is_some() && permissions.filesystem_scope.is_host() {
+                tracing::warn!(
+                    session = %session_key,
+                    "host-bound app session: clamping host filesystem access to its workspace"
+                );
+                (
+                    EffectivePermissions {
+                        approval_policy: permissions.approval_policy,
+                        ..EffectivePermissions::workspace_write()
+                    },
+                    None,
+                )
+            } else {
+                (permissions, sandbox_override)
+            };
         let had_workspace_hint = workspace_hint.is_some();
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         let workspace_profile = profile.for_workspace(&workspace_root).await?;
@@ -344,8 +509,14 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = sandbox_override
+        let mut sandbox = sandbox_override
             .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
+        if let Some((root, excluded)) = context_read_view(&bootstrapped_binding) {
+            sandbox.read_only_view = Some(Box::new(octos_agent::SandboxReadOnlyView {
+                root,
+                excluded,
+            }));
+        }
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
@@ -389,6 +560,22 @@ impl SessionRuntime {
         // enabled tool is emitted every turn, so there is no per-session
         // meta-tool to re-register or wire.
         profile.apply_tool_envelope(&mut tools);
+        let memory = match bound_memory_namespace.as_deref() {
+            Some(namespace) => {
+                let memory =
+                    super::memory_namespace::SessionMemory::namespaced(profile, namespace).await?;
+                super::memory_namespace::rebind_memory_tools(
+                    &mut tools,
+                    &memory,
+                    profile.embedder.clone(),
+                );
+                // `run_pipeline` captures episodes into the PROFILE's memory;
+                // a namespaced session must not write there.
+                tools.retain(|name| name != "run_pipeline");
+                memory
+            }
+            None => super::memory_namespace::SessionMemory::profile(profile),
+        };
         let tools = Arc::new(tools);
 
         // Step 5: build the per-session Agent. This is the only
@@ -485,7 +672,12 @@ impl SessionRuntime {
         } else {
             workspace_root.clone()
         };
-        let scope_zones: Vec<PathBuf> = if workspace_under_data {
+        // A host-bound app session (UPCR-2026-034) gets no shared zones:
+        // a kernel-provisioned app workspace lives under the data dir, but
+        // the profile's `research/` and `skills/` hold what the system agent
+        // and other apps wrote.
+        let scope_zones: Vec<PathBuf> = if workspace_under_data && bound_memory_namespace.is_none()
+        {
             DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
                 .iter()
                 .map(|name| scope_root.join(name))
@@ -562,12 +754,25 @@ impl SessionRuntime {
                 }
             }
         };
+        // A host-bound app session is always fenced to its workspace: never
+        // fall back to the unscoped legacy resolver.
+        if bound_memory_namespace.is_some() && session_scope.is_none() {
+            eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
+        }
+        let session_scope = with_context_read_view(session_scope, &bootstrapped_binding)
+            .wrap_err_with(|| {
+                format!("session {session_key}: the read view of its peer's folder")
+            })?;
 
+        // The prompt's slash commands (`/router`, `/queue`, …) are handled by
+        // bus channels only; serve sessions get the client's own commands
+        // instead, via `apply_client_commands` (octoscode#664).
+        let base_prompt = strip_slash_commands(&profile.prompt_parts.pre_memory);
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
             Arc::clone(&tools),
-            profile.memory.clone(),
+            memory.episodes.clone(),
         )
         .with_config(
             profile
@@ -585,7 +790,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
+        .with_system_prompt(base_prompt)
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -595,7 +800,7 @@ impl SessionRuntime {
         // runtime-held agent exactly like the per-turn AppUI rebuild does.
         .with_parent_session_key(session_key.to_string())
         .with_workspace_root(workspace_root.clone())
-        .with_recall(profile.recall.clone());
+        .with_recall(memory.recall.clone());
 
         if let Some(coding_profile) = profile.agent_profile.clone() {
             let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
@@ -635,26 +840,30 @@ impl SessionRuntime {
         // fabricates a "memory bank" when asked). The provider re-renders
         // the segment at each turn start when MEMORY.md / daily notes /
         // bank change on disk (one fingerprint stat per turn otherwise).
-        let memory_ctx = profile
+        agent.set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, String::new());
+        let memory_ctx = memory
             .memory_store
             .get_injectable_context(profile.memory_inject_tokens)
             .await;
         agent.set_prompt_segment(
             octos_agent::MEMORY_SEGMENT_NAME,
-            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+            octos_agent::compose_memory_segment(&memory_ctx, memory.refresh_enabled),
         );
         // Contract parity with chat.rs: `memory.refresh.enabled = false`
         // means NO per-turn memory re-read — the segment stays as seeded
         // at session bootstrap. Default-on makes disabled an explicit
         // opt-out.
-        if profile.memory_refresh_enabled {
+        // A namespaced session always re-renders per turn (its own
+        // `save_memory` writes must show up), without the capture policy that
+        // advertises the profile-only `memory_note` path.
+        if profile.memory_refresh_enabled || memory.namespace.is_some() {
             agent.add_prompt_segment_provider(Arc::new(
                 octos_agent::MemorySegmentProvider::new(
-                    profile.memory_store.clone(),
+                    memory.memory_store.clone(),
                     profile.memory_inject_tokens,
-                    true,
+                    memory.refresh_enabled,
                 )
-                .with_recall(profile.recall.clone(), profile.embedder.clone()),
+                .with_recall(memory.recall.clone(), profile.embedder.clone()),
             ));
         }
         // Post-memory half AFTER the named segment — the pre-refactor
@@ -723,6 +932,18 @@ impl SessionRuntime {
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&sessions_root).wrap_err("failed to open session manager")?,
         ));
+        // Remember only an actual project transcript store. A gateway's
+        // derived workspace, an app-owned namespace or an ephemeral chat must
+        // not be rediscovered as a project session after a restart.
+        if !bootstrapped_binding.is_bound_or_refused()
+            && sessions_root == project_sessions_root(&workspace_root, &profile.profile_id)
+        {
+            if let Err(error) =
+                super::workspace_history::remember(&profile.data_dir, &workspace_root)
+            {
+                tracing::warn!(%error, profile_id = %profile.profile_id, "could not remember project session store");
+            }
+        }
 
         Ok(Arc::new(Self {
             session_key,
@@ -735,6 +956,10 @@ impl SessionRuntime {
             agent,
             sessions_root,
             sessions,
+            memory,
+            app_binding: bootstrapped_binding,
+            binding_peers_root,
+            client_commands_owner: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -1480,6 +1705,63 @@ tools = ["read_file"]
         assert!(
             prompt.contains("Friday again"),
             "read-refresh must pick up post-bootstrap consolidations: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_sessions_drop_channel_slash_commands_and_take_client_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt =
+            "base rules\n\n## Slash Commands\n\n- `/router` — server router\n\n## Other Rules\n\nbe kind"
+                .to_string();
+        let profile = make_profile_with_prompt(dir.path().to_path_buf(), prompt).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "cmds"), None)
+            .await
+            .expect("bootstrap");
+        let before = rt.agent.system_prompt_snapshot();
+        assert!(!before.contains("`/router`"));
+        assert!(!before.contains("## Slash Commands"));
+        assert!(before.contains("be kind"));
+
+        let accepted =
+            rt.apply_client_commands(1, &["/model".into(), "/router".into(), "/add-model".into()]);
+        assert_eq!(accepted, ["/model", "/add-model"]);
+        let after = rt.agent.system_prompt_snapshot();
+        assert!(!after.contains("`/router`"));
+        assert!(after.contains("`/model`"));
+        assert!(after.contains("`/add-model`"));
+        assert!(after.contains("be kind"));
+
+        rt.apply_client_commands(1, &[]);
+        let none = rt.agent.system_prompt_snapshot();
+        assert!(!none.contains("`/router`"));
+        assert!(!none.contains("`/model`"));
+    }
+
+    #[tokio::test]
+    async fn client_commands_are_released_only_by_the_declaring_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = make_profile(dir.path().to_path_buf()).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "owner"), None)
+            .await
+            .expect("bootstrap");
+
+        rt.apply_client_commands(1, &["/model".into()]);
+        rt.release_client_commands(2);
+        assert!(
+            rt.agent.system_prompt_snapshot().contains("`/model`"),
+            "another connection closing must not clear this declaration"
+        );
+
+        rt.release_client_commands(1);
+        assert!(!rt.agent.system_prompt_snapshot().contains("`/model`"));
+
+        rt.apply_client_commands(1, &["/model".into()]);
+        rt.apply_client_commands(2, &["/add-model".into()]);
+        rt.release_client_commands(1);
+        assert!(
+            rt.agent.system_prompt_snapshot().contains("`/add-model`"),
+            "a superseded declarer closing must not clear the newer declaration"
         );
     }
 
@@ -2531,6 +2813,10 @@ tools = ["read_file"]
         // <cwd>/.octos/<profile_id>.
         let expected_root = cwd_canon.join(".octos").join(&profile.profile_id);
         assert_eq!(rt.sessions_root, expected_root);
+        assert_eq!(
+            crate::runtime::workspace_history::load(&profile.data_dir).unwrap(),
+            vec![dunce::canonicalize(&rt.workspace_root).unwrap()]
+        );
         {
             let mgr = rt.sessions.lock().await;
             assert_eq!(mgr.data_dir(), expected_root);

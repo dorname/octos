@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use eyre::Result;
-use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
+use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantRecord, WorkSecretGrantStore};
 
 use super::Executable;
 use crate::auth::{AuthStore, keychain, oauth, token};
@@ -52,7 +52,11 @@ pub enum AuthAction {
     /// Show authentication status for all providers.
     Status,
 
-    /// Store an API key in the macOS Keychain.
+    /// Store an API key in the OS secret store.
+    ///
+    /// macOS stores it in the Keychain; Linux in a 0600 file under
+    /// `~/.octos/secrets`; Windows has no secret store yet — plain API keys
+    /// can be passed via the environment or the profile's `env_vars`.
     #[command(name = "set-key")]
     SetKey {
         /// Environment variable name (e.g. OPENAI_API_KEY).
@@ -70,7 +74,12 @@ pub enum AuthAction {
         #[arg(long, short)]
         profile: Option<String>,
     },
-    /// Remove an API key from the macOS Keychain.
+    /// Remove an API key from the OS secret store.
+    ///
+    /// macOS deletes the Keychain item; Linux the file under
+    /// `~/.octos/secrets`. Only `"keychain:"`-marker entries are removed —
+    /// plain `env_vars` values are left untouched; Windows has no secret
+    /// store.
     #[command(name = "remove-key")]
     RemoveKey {
         /// Environment variable name to remove (e.g. OPENAI_API_KEY).
@@ -80,18 +89,23 @@ pub enum AuthAction {
         profile: Option<String>,
     },
 
-    /// Unlock the macOS Keychain for SSH sessions.
+    /// Unlock the OS secret store for SSH sessions (macOS Keychain).
     ///
-    /// Required before set-key/remove-key when connected via SSH.
-    /// With auto-login enabled, this is only needed once per boot.
+    /// Required before set-key/remove-key over SSH on macOS. With
+    /// auto-login enabled, this is only needed once per boot. Linux's file
+    /// store has no lock, so this is a no-op there; Windows has no secret
+    /// store to unlock.
     #[command(name = "unlock")]
     Unlock {
-        /// macOS login password. If omitted, reads interactively.
+        /// macOS login password (unused on Linux). If omitted, reads
+        /// interactively.
         #[arg(long)]
         password: Option<String>,
     },
 
     /// Issue a short-lived session ingress secret for an external CLI agent.
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
     #[command(name = "issue-work-secret")]
     IssueWorkSecret {
         /// Session id the external agent may access.
@@ -112,10 +126,22 @@ pub enum AuthAction {
     },
 
     /// Revoke a previously issued work secret.
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
     #[command(name = "revoke-work-secret")]
     RevokeWorkSecret {
         /// Encoded work secret or raw session_ingress_token.
         token_or_secret: String,
+        /// Data directory that `octos serve` uses.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// List issued work secret grants (hashes only; the token is never stored).
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
+    #[command(name = "list-work-secrets")]
+    ListWorkSecrets {
         /// Data directory that `octos serve` uses.
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -159,6 +185,7 @@ impl AuthCommand {
                 token_or_secret,
                 data_dir,
             } => revoke_work_secret(&token_or_secret, data_dir),
+            AuthAction::ListWorkSecrets { data_dir } => list_work_secrets(data_dir),
         }
     }
 }
@@ -322,6 +349,31 @@ fn unsafe_tty_check() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Restore the account, not merely its existence. Never print credential bytes.
+fn restore_secret(account: &str, previous: Option<&str>) -> Result<()> {
+    match previous {
+        Some(previous) => keychain::set_secret(account, previous),
+        None => keychain::delete_secret(account).map(|_| ()),
+    }
+}
+
+fn replace_secret(account: &str, secret: &str) -> Result<Option<String>> {
+    let previous = keychain::get_secret(account)?;
+    if let Err(store_error) = keychain::set_secret(account, secret) {
+        // A backend can fail after changing the account (e.g. a sync failure).
+        // Preserve the prior credential in that case too.
+        return match restore_secret(account, previous.as_deref()) {
+            Ok(()) => Err(eyre::eyre!(
+                "secret store failed; rolled back the account: {store_error}"
+            )),
+            Err(rollback_error) => Err(eyre::eyre!(
+                "secret store failed ({store_error}); rollback also failed ({rollback_error}); check the account before retrying"
+            )),
+        };
+    }
+    Ok(previous)
+}
+
 /// #2234/45c — injectable profile-save seam (issue Tests requested:
 /// "Profile-save failure rolls back the newly stored secret"). Production
 /// passes the direct store save; tests inject a failing closure to pin the
@@ -369,27 +421,42 @@ fn set_key_with_save(
 
     // Shared keys: store once up front (also covers the orphan / no-profile
     // case). Scoped keys are stored per profile in the loop below.
-    if !scoped {
-        keychain::set_secret(name, &secret)?;
-    }
+    let shared_previous = if !scoped {
+        replace_secret(name, &secret)?
+    } else {
+        None
+    };
 
     // Update profile(s) to use the keychain marker
     let mut updated_count = 0;
     for mut profile in profiles {
         if profile_references_key(&profile, name) {
             let (account, marker) = keychain_target(name, &profile.id, &secret);
-            if scoped {
-                keychain::set_secret(&account, &secret)?;
-            }
+            let previous = if scoped {
+                replace_secret(&account, &secret)?
+            } else {
+                shared_previous.clone()
+            };
             profile.config.env_vars.insert(name.to_string(), marker);
             profile.updated_at = chrono::Utc::now();
-            // #2234/45b — store-then-save with rollback: if the profile
-            // save fails after the secret landed, delete the freshly
-            // stored account so a half-applied update leaves no orphan.
+            // Per-account rollback, not an all-profile transaction: earlier
+            // successful saves remain committed. In particular, a shared key
+            // must stay available once any successful save references it.
             if let Err(save_err) = save_profile(&profile) {
-                let _ = keychain::delete_secret(&account);
+                if !scoped && updated_count > 0 {
+                    return Err(eyre::eyre!(
+                        "profile '{}' save failed; {updated_count} profile(s) updated; shared secret retained for those profiles: {save_err}",
+                        profile.id
+                    ));
+                }
+                if let Err(rollback_error) = restore_secret(&account, previous.as_deref()) {
+                    return Err(eyre::eyre!(
+                        "profile '{}' save failed ({save_err}); secret rollback also failed ({rollback_error}); {updated_count} profile(s) updated; check the account before retrying",
+                        profile.id
+                    ));
+                }
                 return Err(eyre::eyre!(
-                    "profile '{}' save failed; rolled back the stored secret: {save_err}",
+                    "profile '{}' save failed; rolled back that account's secret; {updated_count} profile(s) updated: {save_err}",
                     profile.id
                 ));
             }
@@ -562,7 +629,7 @@ fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
     let all_profiles = store.list()?;
     if let Some(id) = profile_id {
         if !all_profiles.iter().any(|p| p.id == id) {
-            eyre::bail!("profile '{id}' not found");
+            eyre::bail!("{}", super::profile_not_found_message(&all_profiles, id));
         }
     }
 
@@ -651,8 +718,16 @@ fn issue_work_secret(
     profile: Option<String>,
     data_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let secret = create_work_secret(session, ttl, api_base_url, profile, data_dir)?;
+    let (secret, grant) = create_work_secret(session, ttl, api_base_url, profile, data_dir)?;
+    // stdout stays the encoded secret and nothing else (scripts and the docs
+    // both rely on that); operator-facing notes go to stderr.
     println!("{}", secret.encode()?);
+    eprintln!(
+        "Grant for session '{}' expires {} (ttl {}). Re-issuing for the same session replaces it: the earlier grant is removed, not kept as a revoked entry. Revoke early: octos auth revoke-work-secret '<secret>'. See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.",
+        display_id(session),
+        grant.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_ttl(grant.expires_at - grant.created_at),
+    );
     Ok(())
 }
 
@@ -662,13 +737,13 @@ fn create_work_secret(
     api_base_url: &str,
     profile: Option<String>,
     data_dir: Option<PathBuf>,
-) -> Result<WorkSecret> {
+) -> Result<(WorkSecret, WorkSecretGrantRecord)> {
     let data_dir = super::resolve_data_dir(data_dir)?;
     let ttl = parse_ttl(ttl)?;
     let token = generate_ingress_token()?;
     let store = WorkSecretGrantStore::new(&data_dir);
-    store.issue(session, &token, api_base_url, ttl, profile)?;
-    Ok(WorkSecret::new(api_base_url, token))
+    let grant = store.issue(session, &token, api_base_url, ttl, profile)?;
+    Ok((WorkSecret::new(api_base_url, token), grant))
 }
 
 fn revoke_work_secret(token_or_secret: &str, data_dir: Option<PathBuf>) -> Result<()> {
@@ -683,6 +758,84 @@ fn revoke_work_secret(token_or_secret: &str, data_dir: Option<PathBuf>) -> Resul
         println!("No active work secret matched the provided token");
     }
     Ok(())
+}
+
+fn list_work_secrets(data_dir: Option<PathBuf>) -> Result<()> {
+    let data_dir = super::resolve_data_dir(data_dir)?;
+    let store = WorkSecretGrantStore::new(&data_dir);
+    let grants = store.list()?;
+    if grants.is_empty() {
+        println!("No work secret grants in {}.", store.path().display());
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    println!(
+        "{}",
+        format!("Work secret grants in {}:", store.path().display()).bold()
+    );
+    for grant in &grants {
+        println!("{}", format_work_secret_grant(grant, now));
+    }
+    Ok(())
+}
+
+/// Session and profile ids are user-controlled (they end up in the grant
+/// file), so control characters are rendered inert before they reach terminal
+/// or log output — one grant line must not be able to forge another.
+fn display_id(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// One line of `list-work-secrets` output, computed purely (no I/O) so it's
+/// unit-testable. Only the token hash prefix is shown — the grant store never
+/// holds the token itself.
+fn format_work_secret_grant(
+    grant: &WorkSecretGrantRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let status = match grant.revoked_at {
+        Some(at) => format!("revoked {}", at.format("%Y-%m-%d %H:%M:%S UTC"))
+            .red()
+            .to_string(),
+        None if !grant.active(now) => "expired".yellow().to_string(),
+        None => "active".green().to_string(),
+    };
+    let hash_prefix = grant.token_hash.get(..12).unwrap_or(&grant.token_hash);
+    format!(
+        "  {}: {} [profile {}] hash {}… created {} expires {} ttl {}",
+        display_id(&grant.session_id).cyan(),
+        status,
+        grant
+            .profile_id
+            .as_deref()
+            .map(display_id)
+            .unwrap_or_else(|| "-".to_string()),
+        hash_prefix,
+        grant.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        grant.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_ttl(grant.expires_at - grant.created_at),
+    )
+}
+
+/// Render a ttl the way `parse_ttl` accepts it (largest exact suffix wins).
+/// Durations outside `parse_ttl`'s domain (zero or negative, only reachable
+/// via a hand-edited grant file) render verbatim with an `s` suffix.
+fn format_ttl(ttl: chrono::Duration) -> String {
+    let seconds = ttl.num_seconds();
+    if seconds <= 0 {
+        return format!("{seconds}s");
+    }
+    if seconds % 86_400 == 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn generate_ingress_token() -> Result<String> {
@@ -721,7 +874,12 @@ fn get_profiles(
     if let Some(id) = profile_id {
         match store.get(id)? {
             Some(p) => Ok(vec![p]),
-            None => eyre::bail!("profile '{id}' not found"),
+            // If listing the registry fails too, surface that error rather
+            // than a hint built from an unknown set of profiles.
+            None => {
+                let existing = store.list()?;
+                eyre::bail!("{}", super::profile_not_found_message(&existing, id))
+            }
         }
     } else {
         store.list()
@@ -826,7 +984,6 @@ mod tests {
     /// scoped secret was stored, the save fails, the freshly stored account
     /// is deleted (rollback), and the error names the rollback.
     #[test]
-    #[cfg(target_os = "linux")]
     fn save_failure_rolls_back_stored_secret() {
         let tmp = tempfile::tempdir().unwrap();
         // Point BOTH the secret store and the profile store at the temp dir:
@@ -870,6 +1027,153 @@ mod tests {
         // Profile JSON bytes unchanged (the injected save never ran).
         let after = std::fs::read_to_string(&json_path).unwrap_or_default();
         assert_eq!(profile_json_before, after, "profile bytes must not change");
+    }
+
+    #[test]
+    fn should_restore_existing_secret_when_profile_save_fails() {
+        for (name, account, secret) in [
+            ("SHARED_KEY", "SHARED_KEY", "new-fixture"),
+            (
+                "VERTEX_SA_JSON",
+                "VERTEX_SA_JSON::fixture",
+                "{\"type\":\"service_account\",\"private_key\":\"fixture\"}",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+            let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+            let mut profile = profile_with_llm("fixture", None);
+            profile
+                .config
+                .env_vars
+                .insert(name.into(), keychain::marker_for(account));
+            store.save(&profile).unwrap();
+            keychain::set_secret(account, "old-fixture").unwrap();
+            let err = set_key_with_save(name, Some(secret.into()), Some("fixture"), &store, |_| {
+                Err(eyre::eyre!("injected profile save failure"))
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("rolled back"));
+            assert_eq!(
+                keychain::get_secret(account).unwrap().as_deref(),
+                Some("old-fixture")
+            );
+            assert_eq!(
+                store.get("fixture").unwrap().unwrap().config.env_vars[name],
+                keychain::marker_for(account)
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_shared_secret_when_an_earlier_profile_save_succeeded() {
+        for old in [None, Some("old-fixture")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+            let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+            for id in ["first", "second"] {
+                let mut profile = profile_with_llm(id, None);
+                profile
+                    .config
+                    .env_vars
+                    .insert("SHARED_KEY".into(), "placeholder".into());
+                store.save(&profile).unwrap();
+            }
+            if let Some(old) = old {
+                keychain::set_secret("SHARED_KEY", old).unwrap();
+            }
+            let saved = std::cell::RefCell::new(Vec::new());
+            let err = set_key_with_save(
+                "SHARED_KEY",
+                Some("new-fixture".into()),
+                None,
+                &store,
+                |profile| {
+                    if !saved.borrow().is_empty() {
+                        eyre::bail!("injected second profile save failure");
+                    }
+                    store.save(profile)?;
+                    saved.borrow_mut().push(profile.id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(saved.borrow().len(), 1);
+            assert_eq!(
+                keychain::get_secret("SHARED_KEY").unwrap().as_deref(),
+                Some("new-fixture"),
+                "a successfully saved marker must not dangle or silently rotate back"
+            );
+            assert!(err.to_string().contains("1 profile(s) updated"));
+            assert!(err.to_string().contains("retained"));
+            let saved_profile = store.get(&saved.borrow()[0]).unwrap().unwrap();
+            assert_eq!(
+                keychain::resolve_value("SHARED_KEY", &saved_profile.config.env_vars["SHARED_KEY"])
+                    .as_deref(),
+                Some("new-fixture")
+            );
+        }
+    }
+
+    #[test]
+    fn should_delete_only_new_uncommitted_shared_secret_on_save_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+        let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+        let mut profile = profile_with_llm("fixture", None);
+        profile
+            .config
+            .env_vars
+            .insert("KEY".into(), "placeholder".into());
+        store.save(&profile).unwrap();
+        let err = set_key_with_save(
+            "KEY",
+            Some("fixture".into()),
+            Some("fixture"),
+            &store,
+            |_| Err(eyre::eyre!("injected save failure")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rolled back"));
+        assert_eq!(keychain::get_secret("KEY").unwrap(), None);
+        assert_eq!(
+            store.get("fixture").unwrap().unwrap().config.env_vars["KEY"],
+            "placeholder"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_report_rollback_failure_instead_of_claiming_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        let _root = keychain::test_override_secrets_root(root.clone());
+        let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+        let mut profile = profile_with_llm("fixture", None);
+        profile
+            .config
+            .env_vars
+            .insert("KEY".into(), "keychain:".into());
+        store.save(&profile).unwrap();
+        keychain::set_secret("KEY", "old-fixture").unwrap();
+        let err = set_key_with_save(
+            "KEY",
+            Some("new-fixture".into()),
+            Some("fixture"),
+            &store,
+            |_| {
+                // Deterministic I/O failure during restoration; only this fixture
+                // account is removed. A directory cannot be replaced by a file.
+                std::fs::remove_file(root.join("KEY"))?;
+                std::fs::create_dir(root.join("KEY"))?;
+                eyre::bail!("injected save failure")
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rollback also failed"));
+        assert!(!err.to_string().contains("rolled back"));
+        assert!(!err.to_string().contains("old-fixture"));
+        assert!(!err.to_string().contains("new-fixture"));
     }
 
     /// #2234/45c — secret-store failure leaves profile JSON bytes UNCHANGED
@@ -1066,7 +1370,7 @@ mod tests {
     #[test]
     fn issue_work_secret_persists_decodable_grant() {
         let dir = tempfile::tempdir().unwrap();
-        let secret = create_work_secret(
+        let (secret, issued) = create_work_secret(
             "local:auth-test",
             "5m",
             "http://127.0.0.1:50080",
@@ -1083,5 +1387,94 @@ mod tests {
             .validate("local:auth-test", &decoded.session_ingress_token)
             .unwrap();
         assert_eq!(grant.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(grant.token_hash, issued.token_hash);
+    }
+
+    #[test]
+    fn format_ttl_round_trips_parse_ttl() {
+        for input in ["30s", "15m", "2h", "1d"] {
+            assert_eq!(format_ttl(parse_ttl(input).unwrap()), input);
+        }
+        assert_eq!(format_ttl(chrono::Duration::seconds(90)), "90s");
+        assert_eq!(format_ttl(chrono::Duration::seconds(5_400)), "90m");
+        // Outside parse_ttl's domain: rendered verbatim, never mis-suffixed.
+        assert_eq!(format_ttl(chrono::Duration::zero()), "0s");
+        assert_eq!(format_ttl(chrono::Duration::seconds(-90)), "-90s");
+    }
+
+    #[test]
+    fn format_work_secret_grant_shows_status_and_never_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkSecretGrantStore::new(dir.path());
+        store
+            .issue(
+                "local:auth-test",
+                "raw-token-abc",
+                "http://127.0.0.1:50080",
+                chrono::Duration::hours(1),
+                Some("profile-a".into()),
+            )
+            .unwrap();
+
+        let grants = store.list().unwrap();
+        let before_expiry = grants[0].created_at + chrono::Duration::seconds(1);
+        let line = format_work_secret_grant(&grants[0], before_expiry);
+        assert!(line.contains("local:auth-test"));
+        assert!(line.contains("active"));
+        assert!(line.contains(&grants[0].token_hash[..12]));
+        assert!(
+            !line.contains("raw-token-abc"),
+            "the raw token must never appear"
+        );
+
+        let after_expiry = grants[0].expires_at + chrono::Duration::seconds(1);
+        assert!(format_work_secret_grant(&grants[0], after_expiry).contains("expired"));
+
+        // Revocation wins over both, however recent the check is, and shows
+        // when it happened.
+        assert!(store.revoke_token("raw-token-abc").unwrap());
+        let grants = store.list().unwrap();
+        let revoked_line = format_work_secret_grant(&grants[0], before_expiry);
+        assert!(revoked_line.contains("revoked"));
+        assert!(
+            revoked_line.contains(
+                &grants[0]
+                    .revoked_at
+                    .unwrap()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            )
+        );
+    }
+
+    /// Session ids land in terminal output verbatim otherwise — a control
+    /// character in one grant must not let it forge another list line.
+    #[test]
+    fn display_id_neuters_control_characters() {
+        assert_eq!(display_id("local:auth-test"), "local:auth-test");
+        assert_eq!(display_id("a\nb"), "a\u{FFFD}b");
+        assert_eq!(display_id("a\u{1b}]0;xb"), "a\u{FFFD}]0;xb");
+    }
+
+    /// #2414 — a mistyped profile id must list the ids that exist instead of
+    /// dead-ending (and must say so plainly when none are configured).
+    #[test]
+    fn get_profiles_not_found_lists_existing_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            crate::profiles::ProfileStore::open_unified(&tmp.path().join(".octos")).unwrap();
+
+        let error = get_profiles(&store, Some("nope")).unwrap_err();
+        assert!(
+            error.to_string().contains("No profiles are configured"),
+            "empty store must say so: {error}"
+        );
+
+        store.save(&profile_with_llm("main", None)).unwrap();
+        let error = get_profiles(&store, Some("nope")).unwrap_err();
+        assert!(
+            error.to_string().contains("Existing profiles: main"),
+            "error must list existing ids: {error}"
+        );
     }
 }

@@ -104,6 +104,8 @@ pub struct UpdateProfileRequest {
 
 #[derive(Serialize)]
 pub struct ProfileResponse {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::ui_protocol_transport::ProfileRuntimeStatus>,
     #[serde(flatten)]
     pub profile: UserProfile,
     pub status: crate::process_manager::ProcessStatus,
@@ -118,7 +120,15 @@ impl ProfileResponse {
             profile,
             status,
             email: None,
+            runtime: None,
         }
+    }
+    pub(crate) fn with_runtime_transition(
+        mut self,
+        transition: Option<super::ui_protocol_transport::ProfileLlmRuntimeTransition>,
+    ) -> Self {
+        self.runtime = transition.map(|transition| transition.wire_status());
+        self
     }
     pub fn with_email_lookup(mut self, user_store: Option<&crate::user_store::UserStore>) -> Self {
         self.email = user_store
@@ -178,6 +188,7 @@ pub async fn overview(
             running += 1;
         }
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -231,6 +242,7 @@ pub async fn list_profiles(
     for p in page {
         let status = pm.status(&p.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -261,6 +273,7 @@ pub async fn get_profile(
     let status = pm.status(&id).await;
     Ok(Json(
         ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&profile),
             status,
@@ -284,8 +297,8 @@ pub async fn get_profile(
 /// already relocated stay in the keychain when a later key fails. Those
 /// entries are scoped per profile id, so they cannot leak across accounts,
 /// and a same-id retry (after the caller's profile rollback) overwrites
-/// them — recording the semantics rather than adding a cleanup pass,
-/// matching `delete_profile`'s keychain behavior (#2316).
+/// them (#2316); the admin API deletion paths release what relocation left
+/// behind (the CLI sub-account deletions still don't — #2702).
 pub(crate) fn relocate_keychain_backed_secrets(
     env_vars: &mut std::collections::HashMap<String, String>,
     profile_id: &str,
@@ -365,6 +378,7 @@ pub async fn create_profile(
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -487,6 +501,7 @@ pub async fn update_profile(
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -504,6 +519,11 @@ pub async fn update_profile(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(response))
 }
+
+// Lives in `crate::profiles` (it only needs the profile store, and the CLI
+// and gateway deletion paths compile without this crate's `api` feature);
+// re-exported so the API call sites keep their `crate::api::admin::` path.
+pub(crate) use crate::profiles::release_deleted_profiles_keychain_items;
 
 /// DELETE /api/admin/profiles/:id
 pub async fn delete_profile(
@@ -529,18 +549,17 @@ pub async fn delete_profile(
     let _ = pm.stop(&id).await;
 
     // Cascade: stop and delete all sub-accounts
-    if let Ok(subs) = store.list_sub_accounts(&id) {
-        for sub in &subs {
-            let _ = pm.stop(&sub.id).await;
-            // Clean up sub-account data directory
-            let sub_data_dir = store.resolve_data_dir(sub);
-            if sub_data_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
-                    tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
-                }
+    let subs = store.list_sub_accounts(&id).unwrap_or_default();
+    for sub in &subs {
+        let _ = pm.stop(&sub.id).await;
+        // Clean up sub-account data directory
+        let sub_data_dir = store.resolve_data_dir(sub);
+        if sub_data_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
+                tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
             }
-            let _ = store.delete(&sub.id);
         }
+        let _ = store.delete(&sub.id);
     }
 
     let deleted = store
@@ -550,6 +569,8 @@ pub async fn delete_profile(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
+
+    release_deleted_profiles_keychain_items(store, profile.iter().chain(subs.iter()));
 
     let before_summary = profile
         .as_ref()
@@ -1813,6 +1834,7 @@ pub async fn list_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&s),
             status,
@@ -2011,6 +2033,7 @@ pub async fn create_sub_account(
     Ok((
         StatusCode::CREATED,
         Json(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&sub),
             status,
@@ -3566,10 +3589,10 @@ pub async fn system_version(
     };
 
     let current_semver = env!("CARGO_PKG_VERSION");
-    let update_available = latest
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v != current_semver);
+    let update_available = update_available_for(
+        current_semver,
+        latest.get("version").and_then(|v| v.as_str()),
+    );
 
     Ok(Json(serde_json::json!({
         "current": current,
@@ -3587,6 +3610,27 @@ pub struct UpdateRequest {
 }
 fn default_version() -> String {
     "latest".to_string()
+}
+
+/// Whether `latest` is strictly newer than the running `current` release,
+/// with full semver precedence: `2.0.3-rc.12 < 2.0.3-rc.13 < 2.0.3`. This is
+/// deliberately pre-release-aware — unlike `octos_diagnostics`' planner, whose
+/// `parse_version` strips pre-releases — because the admin channel installs
+/// pinned rc tags and must keep the rc train flowing forward while still
+/// refusing downgrades. Unparseable on either side means "can't tell" and
+/// counts as up to date — never push a spurious (or backwards) update off an
+/// unparseable version.
+fn update_available_for(current: &str, latest: Option<&str>) -> bool {
+    let Some(latest) = latest else {
+        return false;
+    };
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current.trim().trim_start_matches('v')),
+        semver::Version::parse(latest.trim().trim_start_matches('v')),
+    ) else {
+        return false;
+    };
+    latest > current
 }
 
 /// POST /api/admin/system/update — download and apply an update
@@ -3609,6 +3653,17 @@ pub async fn system_update(
         updater.check_version(&tag).await
     }
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Release not found: {e}")))?;
+
+    // Refuse anything that is not strictly newer — an update channel that
+    // accepts equal or older releases is a downgrade vector.
+    let current = env!("CARGO_PKG_VERSION");
+    let new_version = &release.version;
+    if !update_available_for(current, Some(new_version)) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("refusing update: {new_version} is not newer than the running {current}"),
+        ));
+    }
 
     // Perform the update
     let result = updater.update(&release).await.map_err(|e| {
@@ -4550,6 +4605,21 @@ pub async fn delete_tenant(
     }))
 }
 
+/// The tunnel relay (frps) address this node hands out in setup scripts.
+/// There is no built-in default: it must be set as `frps_server` in the
+/// node config, otherwise tenant setup is refused with a clear error.
+fn required_frps_server(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    state
+        .frps_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tunnel relay not configured: set `frps_server` in this node's config".into(),
+        ))
+}
+
 /// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
 /// installs octos + frpc on a fresh Mac Mini.
 pub async fn tenant_setup_script(
@@ -4566,7 +4636,7 @@ pub async fn tenant_setup_script(
         .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_admin_tenant_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4686,6 +4756,9 @@ pub async fn register_tenant(
         ));
     }
 
+    // Fail before creating the tenant if this node has no tunnel relay.
+    let server = required_frps_server(&state)?;
+
     let ssh_port = store
         .next_ssh_port()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4714,7 +4787,6 @@ pub async fn register_tenant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let dashboard_url = format!("https://{}.{}", tenant.subdomain, domain);
 
     let mut email_sent = false;
@@ -4823,7 +4895,7 @@ pub async fn register_setup_script(
     ))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4849,12 +4921,15 @@ pub async fn register_setup_script_public(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "tenant not found".into()))?;
 
-    if tenant.auth_token != auth_token {
+    // Constant-time: the auth token gates the tenant's setup script (the
+    // #2344 face — a plaintext compare leaks the token byte-by-byte
+    // through response timing).
+    if !crate::api::router::constant_time_eq(tenant.auth_token.as_bytes(), auth_token.as_bytes()) {
         return Err((StatusCode::UNAUTHORIZED, "invalid auth token".into()));
     }
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4991,7 +5066,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("--tunnel"));
@@ -5000,7 +5075,7 @@ mod register_setup_script_tests {
         assert!(script.contains("--frps-token \"per-tenant-uuid\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(!script.contains("$FRPS_TOKEN"));
     }
 
@@ -5021,7 +5096,7 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(html.contains("/api/register/setup-script/alice/"));
         assert!(html.contains("install.ps1"));
@@ -5049,7 +5124,7 @@ mod register_setup_script_tests {
 
         let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
         let windows_command =
-            build_register_setup_command_windows(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_command_windows(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert_eq!(
             unix_command,
@@ -5085,7 +5160,7 @@ mod register_tenant_email_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
             ..AppState::empty_for_tests()
@@ -5223,7 +5298,7 @@ mod register_flow_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
             ..AppState::empty_for_tests()
@@ -5508,7 +5583,7 @@ mod register_flow_tests {
 
         assert!(script.contains("--tenant-name \"macmini\""));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(script.contains("--ssh-port"));
         assert!(
             script.contains(&format!("--frps-token \"{saved_tunnel_token}\"")),
@@ -5638,6 +5713,29 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// Strictly-newer only, with full semver precedence: the rc train flows
+    /// forward (rc.12 → rc.13), an rc graduates to its stable, but the older
+    /// July stable never shows as an "update" over a newer rc build — which
+    /// the string `!=` used to advertise.
+    #[test]
+    fn should_only_advertise_strictly_newer_releases() {
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.4")));
+        assert!(update_available_for("2.0.2", Some("2.0.3")));
+        // The rc train: forward allowed, backward refused.
+        assert!(update_available_for("2.0.3-rc.12", Some("2.0.3-rc.13")));
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.3")));
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.3-rc.12")));
+        // Stable beats the pre-release of the same core version…
+        assert!(!update_available_for("2.0.3", Some("2.0.3-rc.13")));
+        // …and plain downgrades, which `!=` used to count as updates.
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.2")));
+        assert!(!update_available_for("2.0.3", Some("2.0.3")));
+        // Unparseable on either side → never claim an update.
+        assert!(!update_available_for("2.0.3", None));
+        assert!(!update_available_for("2.0.3", Some("garbage")));
+        assert!(!update_available_for("garbage", Some("2.0.4")));
+    }
+
     /// The guard blocks exactly the link-local (metadata) ranges and nothing
     /// a local model server legitimately uses (loopback, RFC1918, hostnames).
     #[test]
@@ -5664,9 +5762,9 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        #[cfg(target_os = "linux")]
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         // #2234/45a — the availability predicate is now `keychain::is_available()`
         // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
         // never-plaintext contract holds where NO backend exists (unsupported
@@ -5717,9 +5815,9 @@ mod tests {
         // INJECTED temp root) the JSON is legitimately relocated: Ok, the
         // slot becomes a keychain marker, the raw value never remains.
         // Hosts with NO backend keep the rejection.
-        #[cfg(target_os = "linux")]
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
@@ -6099,6 +6197,121 @@ mod tests {
         assert!(
             user_store.get("parent--sub1").unwrap().is_some(),
             "the user entry lands once the save blocker is gone"
+        );
+    }
+
+    // #2315: deleting a profile must release the keychain items its stored
+    // markers point at. A scoped account (`VAR::id`) is unique to the deleted
+    // profile and always released; a legacy bare account is kept while a
+    // surviving profile still references it (the remove-key shared-account
+    // contract, #2261).
+    #[tokio::test]
+    async fn should_release_deleted_profile_keychain_accounts_but_keep_shared_ones() {
+        use crate::auth::keychain;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let mut parent = parent_profile();
+        parent.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account("VERTEX_SA_JSON", "parent")),
+        );
+        parent
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        // A bare account nothing else references: it goes with the profile.
+        parent.config.env_vars.insert(
+            "OPENAI_API_KEY".into(),
+            keychain::marker_for("OPENAI_API_KEY"),
+        );
+        profile_store.save(&parent).unwrap();
+        let mut sibling = parent_profile();
+        sibling.id = "sibling".into();
+        sibling.name = "Sibling".into();
+        sibling
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        profile_store.save(&sibling).unwrap();
+
+        keychain::set_secret(
+            &keychain::scoped_account("VERTEX_SA_JSON", "parent"),
+            "sa-json",
+        )
+        .unwrap();
+        keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+        keychain::set_secret("OPENAI_API_KEY", "solo-key").unwrap();
+
+        let Json(resp) = delete_profile(
+            None,
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+        )
+        .await
+        .expect("deletion succeeds");
+        assert!(resp.ok, "deletion reports success");
+        assert!(
+            profile_store.get("parent").unwrap().is_none(),
+            "the profile itself must be gone"
+        );
+
+        assert_eq!(
+            keychain::get_secret(&keychain::scoped_account("VERTEX_SA_JSON", "parent")).unwrap(),
+            None,
+            "the deleted profile's scoped keychain item must be released"
+        );
+        assert_eq!(
+            keychain::get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("shared-key"),
+            "a bare keychain account a surviving profile still references must be kept"
+        );
+        assert_eq!(
+            keychain::get_secret("OPENAI_API_KEY").unwrap(),
+            None,
+            "a bare keychain account with no surviving reference must be released"
+        );
+    }
+
+    // The delete cascade removes sub-accounts too, so their per-profile
+    // keychain items must go with them.
+    #[tokio::test]
+    async fn should_release_cascaded_sub_account_keychain_accounts_when_deleting_the_parent() {
+        use crate::auth::keychain;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        profile_store.save(&parent_profile()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&profile_store);
+        let sub_account = keychain::scoped_account("VERTEX_SA_JSON", &sub.id);
+        sub.config
+            .env_vars
+            .insert("VERTEX_SA_JSON".into(), keychain::marker_for(&sub_account));
+        profile_store.save(&sub).unwrap();
+        keychain::set_secret(&sub_account, "sa-json").unwrap();
+
+        let Json(resp) = delete_profile(
+            None,
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+        )
+        .await
+        .expect("deletion succeeds");
+        assert!(resp.ok, "deletion reports success");
+        assert!(
+            profile_store.get(&sub.id).unwrap().is_none(),
+            "the sub-account must be cascaded away"
+        );
+        assert_eq!(
+            keychain::get_secret(&sub_account).unwrap(),
+            None,
+            "the cascaded sub-account's keychain item must be released"
         );
     }
 

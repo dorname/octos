@@ -439,6 +439,14 @@ pub struct ToolApprovalRequest {
     pub body: String,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    /// This approval covers exactly this call: a remembered approval scope
+    /// (`approve_for_tool`, `approve_for_session`, …) must neither answer it
+    /// nor be recorded from it. Set by host-routed app tools (UPCR-2026-035),
+    /// whose approvals carry the exact arguments.
+    pub once_only: bool,
+    /// A host-routed app tool's call (UPCR-2026-035): the owning app, the
+    /// tool, the exact arguments and the caller, for the host's own sheet.
+    pub host_tool: Option<octos_core::ui_protocol::ApprovalHostToolDetails>,
 }
 
 /// Decision returned to a blocked tool after client approval handling.
@@ -602,6 +610,16 @@ pub struct ToolResult {
     /// Values are restricted to strings in v1; key shape must match
     /// `[a-z][a-z0-9_]*`. Absent (`None`) when the tool emits nothing.
     pub named_outputs: Option<std::collections::HashMap<String, String>>,
+    /// Images the tool wants the MODEL to look at, as local paths.
+    ///
+    /// Distinct from `files_to_send`, which goes to the human over the chat
+    /// channel and is never shown to the model. The agent loop turns these
+    /// into a user-role message carrying the image right after the batch's
+    /// tool results, so every provider renders them the way it renders a
+    /// user upload; the tool result itself stays text. `view_image` is the
+    /// first caller: without this, a model that can see could only learn a
+    /// screenshot's byte length.
+    pub model_media: Vec<PathBuf>,
 }
 
 /// Trait for implementing tools.
@@ -792,6 +810,13 @@ pub trait Tool: Send + Sync {
     fn blocks_on_human_input(&self) -> bool {
         false
     }
+
+    /// Where the tool's code runs ([`ToolOrigin`]). The registry records it
+    /// at registration, so a filter can select by origin instead of by
+    /// name. Default: [`ToolOrigin::Builtin`].
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
 }
 
 // Tool registry (extracted to its own module)
@@ -799,7 +824,7 @@ pub trait Tool: Send + Sync {
 pub(crate) mod read_paging_probe;
 pub(crate) mod read_window;
 mod registry;
-pub use registry::ToolRegistry;
+pub use registry::{RESERVED_BUILTIN_TOOL_NAMES, ToolOrigin, ToolRegistry};
 
 // Tool policy
 pub mod policy;
@@ -845,6 +870,7 @@ pub mod message;
 pub mod peer_close;
 pub mod peer_gather;
 pub mod peer_handoff;
+pub mod peer_host_tool;
 pub mod peer_list;
 pub mod peer_respond;
 pub mod peer_send_input;
@@ -918,11 +944,18 @@ pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
+pub use peer_host_tool::{
+    HOST_TOOL_MAX_ARGS_BYTES, HostRoutedTool, HostToolAudit, HostToolCall, HostToolCallOutcome,
+    HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, OccurrenceClaim,
+};
 pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
-pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
+pub use peer_send_input::{
+    PeerSendInputAnswerCallback, PeerSendInputCallback, PeerSendInputDelivery,
+    PeerSendInputRefusal, PeerSendInputRequest, PeerSendInputTool,
+};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall::{RecallTool, ToolOutputLedger};
@@ -1037,14 +1070,120 @@ pub fn resolve_path_with_scope(
     user_path: &str,
     filesystem_scope: FilesystemScope,
 ) -> Result<PathBuf> {
-    if filesystem_scope.is_host() {
+    let resolved = if filesystem_scope.is_host() {
         let candidate = PathBuf::from(user_path);
         if candidate.is_absolute() {
-            return Ok(normalize_lexical(&candidate));
+            normalize_lexical(&candidate)
+        } else {
+            normalize_lexical(&base_dir.join(user_path))
         }
-        return Ok(normalize_lexical(&base_dir.join(user_path)));
+    } else {
+        resolve_path(base_dir, user_path)?
+    };
+    if is_process_secret_path(&resolved) || is_process_secret_path(Path::new(user_path)) {
+        eyre::bail!("process environments and command lines are off limits: {user_path}");
     }
-    resolve_path(base_dir, user_path)
+    Ok(resolved)
+}
+
+/// Refuse any path that reaches into a git directory (`.git` as ANY path
+/// component). The kernel runs `git` over agent-writable trees (workspace
+/// snapshots, history tools, receipts), and a repository's `config`,
+/// `hooks/` and `info/attributes` decide which programs git executes — a
+/// model that could write `sites/x/.git/config` could make the kernel run a
+/// clean filter, fsmonitor or hook of its choosing. File tools therefore
+/// never create, modify, move or delete anything inside a `.git`.
+///
+/// Judged on the lexical path and, when an ancestor exists, on its canonical
+/// form (so a symlink pointing into a `.git` does not slip past). Matching is
+/// case-insensitive and ignores the trailing dots/spaces and `GIT~1` short
+/// name NTFS/APFS normalise away, the same spellings git itself refuses.
+pub fn refuse_git_internal_path(path: &Path) -> std::result::Result<(), String> {
+    fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
+        let lossy = name.to_string_lossy();
+        let head = lossy.split(':').next().unwrap_or("");
+        let trimmed = head.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        trimmed == ".git" || trimmed == "git~1"
+    }
+    fn has_git_component(path: &Path) -> bool {
+        path.components()
+            .any(|c| matches!(c, Component::Normal(name) if is_git_dir_name(name)))
+    }
+    let refused = || {
+        Err(format!(
+            "writes into a .git directory are not permitted: {}",
+            octos_core::truncated_utf8(&path.display().to_string(), 200, "…")
+        ))
+    };
+    if has_git_component(path) || has_git_component(&normalize_lexical(path)) {
+        return refused();
+    }
+    // Canonical check: the deepest existing ancestor, resolved, plus the
+    // not-yet-existing tail.
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.as_os_str().is_empty() && std::fs::symlink_metadata(&existing).is_err() {
+        match (
+            existing.file_name().map(|n| n.to_owned()),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    if let Ok(mut real) = std::fs::canonicalize(&existing) {
+        for name in tail.iter().rev() {
+            real.push(name);
+        }
+        if has_git_component(&real) {
+            return refused();
+        }
+    }
+    Ok(())
+}
+
+/// A process's private view: anything under `/proc/self`, `/proc/thread-self`
+/// or `/proc/<pid>` (environment, command line, `fd/`, `root/`, `cwd`,
+/// `mem`, …) and `/dev/fd`, `/dev/std*`. No file tool opens these in any
+/// filesystem scope, however the path is spelled: the raw spelling, its
+/// lexical normalization and (when it exists) its canonical target are all
+/// judged, so `..`, a leading `/../..` or a workspace symlink cannot slip
+/// past. System-wide `/proc` files such as `/proc/cpuinfo` stay readable.
+pub fn is_process_secret_path(path: &Path) -> bool {
+    fn private_view(path: &Path) -> bool {
+        let text = path.to_string_lossy();
+        let text = text.trim_end_matches('/');
+        let mut parts = text
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".");
+        let found = |parts: &mut dyn Iterator<Item = &str>| -> bool {
+            let mut previous = "";
+            for part in parts {
+                if previous == "proc"
+                    && (part == "self"
+                        || part == "thread-self"
+                        || part.chars().all(|c| c.is_ascii_digit()))
+                {
+                    return true;
+                }
+                if previous == "dev" && (part == "fd" || part.starts_with("std")) {
+                    return true;
+                }
+                if part == "environ" || part == "cmdline" {
+                    return text.contains("/proc/");
+                }
+                previous = part;
+            }
+            false
+        };
+        found(&mut parts)
+    }
+    private_view(path)
+        || private_view(&normalize_lexical(path))
+        || std::fs::canonicalize(path).is_ok_and(|real| private_view(&real))
 }
 
 /// Resolve and classify a user-supplied path against a [`SessionScope`]
@@ -1091,6 +1230,11 @@ fn resolve_for_scope(
     user_path: &str,
     for_write: bool,
 ) -> Result<PathBuf, &'static str> {
+    if is_process_secret_path(Path::new(user_path))
+        || is_process_secret_path(&normalize_lexical(Path::new(user_path)))
+    {
+        return Err("process environments and command lines are off limits");
+    }
     // Upload handles (`up/<base64>/<name>`) are opaque references to a file in
     // the authenticated upload tmpdir — NOT workspace-relative paths. Without
     // this short-circuit the join+classify logic below treats them as
@@ -1196,6 +1340,15 @@ fn resolve_for_scope(
         PathClassification::InSkillDir { .. } => {
             if for_write {
                 Err("Writes to plugin skill directories are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        // UPCR-2026-034 `read_parent`: a request context reads its peer's
+        // folder; it never writes there.
+        PathClassification::InReadOnlyView { .. } => {
+            if for_write {
+                Err("Writes outside this context's own folder are not permitted")
             } else {
                 Ok(lex_normalised)
             }
@@ -1476,6 +1629,12 @@ pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(St
 ///
 /// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::write`.
 pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
     let path = path.to_owned();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1535,6 +1694,12 @@ pub(crate) async fn write_no_follow_checked(
     content: &[u8],
     expected: crate::tools::read_window::ViewEpoch,
 ) -> std::io::Result<CheckedWrite> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
     let path = path.to_owned();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1607,6 +1772,50 @@ pub fn file_io_error(e: std::io::Error, display_path: &str) -> ToolResult {
 
 #[cfg(test)]
 mod nofollow_tests {
+
+    #[test]
+    fn should_flag_git_internal_paths_when_any_component_is_a_git_dir() {
+        for p in [
+            "/w/.git/config",
+            "/w/sites/demo/.git/hooks/pre-commit",
+            "/w/sites/demo/.GIT/config",
+            "/w/sites/demo/.git./config",
+            "/w/sites/demo/GIT~1/config",
+            "/w/.git",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_err(), "{p}");
+        }
+        for p in [
+            "/w/sites/demo/index.html",
+            "/w/.gitignore",
+            "/w/.github/x.yml",
+            "/w/a.git/x",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_ok(), "{p}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_flag_git_internal_paths_when_an_ancestor_symlink_points_into_git() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("sites/demo/.git"), dir.path().join("link"))
+            .unwrap();
+        assert!(refuse_git_internal_path(&dir.path().join("link/config")).is_err());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_write_no_follow_when_path_is_git_internal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(
+            write_no_follow(&dir.path().join(".git/config"), b"x")
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join(".git/config").exists());
+    }
     use super::*;
 
     #[tokio::test]
@@ -2725,5 +2934,29 @@ mod tool_context_tests {
         let permissions = ToolPermissions::default();
         assert!(permissions.is_tool_allowed("anything"));
         assert!(permissions.is_tool_allowed("shell"));
+    }
+}
+
+#[cfg(test)]
+mod process_secret_path_tests {
+    use super::*;
+
+    #[test]
+    fn should_refuse_process_environments_in_every_scope() {
+        for path in [
+            "/proc/1/environ",
+            "/proc/self/cmdline",
+            "/proc/9/task/9/environ",
+            "/proc/1/../1/environ",
+        ] {
+            assert!(
+                resolve_path_with_scope(Path::new("/tmp"), path, FilesystemScope::Host).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            resolve_path_with_scope(Path::new("/tmp"), "/proc/cpuinfo", FilesystemScope::Host)
+                .is_ok()
+        );
     }
 }

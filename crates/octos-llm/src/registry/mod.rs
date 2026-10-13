@@ -84,8 +84,8 @@ mod openrouter;
 pub(crate) mod r9s;
 mod vertex;
 mod vllm;
-mod zai;
-mod zai_coding;
+pub(crate) mod zai;
+pub(crate) mod zai_coding;
 mod zhipu;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -227,6 +227,44 @@ pub fn lookup(name: &str) -> Option<&'static ProviderEntry> {
         .find(|e| e.name == lower || e.aliases.iter().any(|a| a.eq_ignore_ascii_case(&lower)))
 }
 
+/// Root an explicit `api_type: "anthropic"` route on `entry`'s family targets
+/// when it carries no `base_url`.
+///
+/// For most families this is the family's own default root. The z.ai lanes
+/// moved their default root to Z.AI's OpenAI-compatible API, but the
+/// Anthropic Messages protocol is only served at the Anthropic-compatible
+/// root, so a saved `{"provider": "zai", "api_type": "anthropic"}` route
+/// without a `base_url` (documented in the user guide) keeps working there
+/// instead of posting `/v1/messages` to the OpenAI root.
+pub fn anthropic_api_type_default_root(entry: &ProviderEntry) -> Option<&'static str> {
+    match entry.name {
+        "zai" | "zai-coding" => Some(zai::LEGACY_ANTHROPIC_ROOT),
+        _ => entry.default_base_url,
+    }
+}
+
+/// The root a saved `base_url` is actually served at on `entry`'s own
+/// registry lane (no explicit `api_type` override), or `None` when the
+/// factory uses it verbatim. The z.ai lanes migrate a saved
+/// Anthropic-compatible root to their OpenAI-compatible one; surfaces that
+/// probe the route outside the factory (model discovery) must follow the
+/// same mapping or they probe an endpoint inference no longer uses.
+pub fn migrated_lane_base_url(entry: &ProviderEntry, base_url: &str) -> Option<String> {
+    let replacement = match entry.name {
+        "zai" => zai::DEFAULT_BASE_URL,
+        "zai-coding" => zai_coding::DEFAULT_BASE_URL,
+        _ => return None,
+    };
+    if !zai::is_legacy_anthropic_root(base_url) {
+        return None;
+    }
+    Some(zai::migrate_legacy_anthropic_root(
+        base_url,
+        replacement,
+        entry.name,
+    ))
+}
+
 /// All registered provider entries.
 pub fn all_entries() -> &'static [ProviderEntry] {
     ALL
@@ -275,6 +313,60 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One row of the pinned configuration surface below:
+    /// (name, aliases, api_key_env, key_env_aliases, default_base_url,
+    ///  requires_api_key, requires_base_url, requires_model, detect_patterns).
+    type EntrySurface = (
+        &'static str,
+        &'static [&'static str],
+        Option<&'static str>,
+        &'static [&'static str],
+        Option<&'static str>,
+        bool,
+        bool,
+        bool,
+        &'static [&'static str],
+    );
+
+    #[test]
+    fn should_keep_anthropic_api_type_routes_on_the_anthropic_root_for_zai_lanes() {
+        // A saved `{"provider": "zai", "api_type": "anthropic"}` route with no
+        // base_url (documented in the user guide) must not post Anthropic
+        // Messages to the lanes' new OpenAI-compatible default root.
+        for name in ["zai", "zai-coding"] {
+            let entry = lookup(name).unwrap();
+            assert_eq!(
+                anthropic_api_type_default_root(entry),
+                Some("https://api.z.ai/api/anthropic"),
+                "{name}"
+            );
+            assert_ne!(
+                entry.default_base_url,
+                anthropic_api_type_default_root(entry)
+            );
+        }
+        // Every other family keeps its own default root.
+        let anthropic = lookup("anthropic").unwrap();
+        assert_eq!(
+            anthropic_api_type_default_root(anthropic),
+            anthropic.default_base_url
+        );
+        // The lane migration only rewrites the legacy root.
+        let zai = lookup("zai").unwrap();
+        assert_eq!(
+            migrated_lane_base_url(zai, "https://api.z.ai/api/anthropic/").as_deref(),
+            Some(zai::DEFAULT_BASE_URL)
+        );
+        assert_eq!(
+            migrated_lane_base_url(zai, "https://proxy.example/v4"),
+            None
+        );
+        assert_eq!(
+            migrated_lane_base_url(anthropic, "https://api.z.ai/api/anthropic"),
+            None
+        );
+    }
 
     /// The catalog is the only place a default model is written down, so every
     /// family that claims one must actually find it there. A family silently
@@ -475,9 +567,13 @@ mod tests {
             Some("moonshot-coding")
         );
 
-        // Z.AI GLM coding plan: Anthropic-compat coding endpoint.
+        // Z.AI GLM coding plan: OpenAI-compat coding endpoint (the only Z.AI
+        // root that reports its implicit prompt cache).
         let zc = lookup("zai-coding").expect("zai-coding registered");
-        assert_eq!(zc.default_base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(
+            zc.default_base_url,
+            Some("https://api.z.ai/api/coding/paas/v4")
+        );
         assert_eq!(lookup("z.ai-coding").map(|e| e.name), Some("zai-coding"));
 
         // The base families are unshadowed by the coding families.
@@ -537,5 +633,91 @@ mod tests {
     #[test]
     fn detect_unknown_model() {
         assert_eq!(detect_provider("some-random-model"), None);
+    }
+
+    #[test]
+    fn every_entry_pins_its_user_facing_configuration_surface() {
+        // The registry's data plane is a user-facing contract: which env var a
+        // key is read from, which endpoint a family defaults to, and which
+        // spellings a profile may name — drifting on any of them silently
+        // breaks existing setups. Pin every entry's surface here;
+        // `all_entries_count` above already forces a new family to extend
+        // this table alongside it.
+        #[rustfmt::skip]
+        let expected: &[EntrySurface] = &[
+            // (name, aliases, api_key_env, key_env_aliases, default_base_url,
+            //  requires_api_key, requires_base_url, requires_model, detect_patterns)
+            ("anthropic", &[], Some("ANTHROPIC_API_KEY"), &[], Some("https://api.anthropic.com"), true, false, false, &["claude"]),
+            ("dashscope", &["qwen"], Some("DASHSCOPE_API_KEY"), &[], Some("https://dashscope.aliyuncs.com/compatible-mode/v1"), true, false, false, &["qwen"]),
+            ("deepseek", &[], Some("DEEPSEEK_API_KEY"), &[], Some("https://api.deepseek.com/v1"), true, false, false, &["deepseek"]),
+            ("gemini", &["google"], Some("GEMINI_API_KEY"), &[], Some("https://generativelanguage.googleapis.com/v1beta"), true, false, false, &["gemini"]),
+            ("groq", &[], Some("GROQ_API_KEY"), &[], Some("https://api.groq.com/openai/v1"), true, false, false, &["llama", "mixtral"]),
+            ("local", &["llamacpp", "llama.cpp", "llama-server", "llama_server", "lmstudio", "lm-studio", "openai-compatible"], None, &[], Some("http://127.0.0.1:8080/v1"), false, false, false, &[]),
+            ("minimax", &[], Some("MINIMAX_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &["minimax"]),
+            ("minimax-cn", &["minimaxi"], Some("MINIMAX_CN_API_KEY"), &["MINIMAX_API_KEY"], Some("https://api.minimaxi.com/v1"), true, false, false, &[]),
+            ("moonshot", &["kimi"], Some("MOONSHOT_API_KEY"), &["KIMI_API_KEY"], Some("https://api.moonshot.ai/v1"), true, false, false, &["kimi", "moonshot"]),
+            ("moonshot-coding", &["kimi-coding"], Some("KIMI_CODING_API_KEY"), &["KIMI_API_KEY", "MOONSHOT_API_KEY"], Some("https://api.kimi.com/coding/v1"), true, false, false, &[]),
+            ("nvidia", &["nim"], Some("NVIDIA_API_KEY"), &[], Some("https://integrate.api.nvidia.com/v1"), true, false, false, &[]),
+            ("ollama", &[], None, &[], Some("http://localhost:11434/v1"), false, false, false, &[]),
+            ("openai", &[], Some("OPENAI_API_KEY"), &[], Some("https://api.openai.com/v1"), true, false, false, &["gpt"]),
+            ("openrouter", &[], Some("OPENROUTER_API_KEY"), &[], Some("https://openrouter.ai/api/v1"), true, false, false, &[]),
+            ("r9s", &["r9s.ai"], Some("R9S_API_KEY"), &[], Some("https://api.r9s.ai/v1"), true, false, false, &[]),
+            ("vertex", &["vertex-ai", "vertexai"], Some("VERTEX_SA_JSON"), &[], None, true, false, false, &[]),
+            ("vllm", &[], Some("VLLM_API_KEY"), &[], None, false, true, true, &[]),
+            ("zai", &["z.ai"], Some("ZAI_API_KEY"), &[], Some("https://api.z.ai/api/paas/v4"), true, false, false, &[]),
+            ("zai-coding", &["z.ai-coding", "glm-coding"], Some("ZAI_CODING_API_KEY"), &["ZAI_API_KEY"], Some("https://api.z.ai/api/coding/paas/v4"), true, false, false, &[]),
+            ("zhipu", &["glm"], Some("ZHIPU_API_KEY"), &[], Some("https://open.bigmodel.cn/api/paas/v4"), true, false, false, &["glm"]),
+        ];
+        let by_name: HashMap<&str, &ProviderEntry> = all_entries()
+            .iter()
+            .map(|entry| (entry.name, entry))
+            .collect();
+        assert_eq!(
+            by_name.len(),
+            expected.len(),
+            "registry families and pin table disagree (missing, extra, or duplicated)"
+        );
+        for &(
+            name,
+            aliases,
+            api_key_env,
+            key_env_aliases,
+            default_base_url,
+            requires_api_key,
+            requires_base_url,
+            requires_model,
+            detect_patterns,
+        ) in expected
+        {
+            let entry = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("family {name} missing from the registry"));
+            assert_eq!(entry.aliases, aliases, "{name}: aliases");
+            assert_eq!(entry.api_key_env, api_key_env, "{name}: api_key_env");
+            assert_eq!(
+                entry.key_env_aliases, key_env_aliases,
+                "{name}: key_env_aliases"
+            );
+            assert_eq!(
+                entry.default_base_url, default_base_url,
+                "{name}: default_base_url"
+            );
+            assert_eq!(
+                entry.requires_api_key, requires_api_key,
+                "{name}: requires_api_key"
+            );
+            assert_eq!(
+                entry.requires_base_url, requires_base_url,
+                "{name}: requires_base_url"
+            );
+            assert_eq!(
+                entry.requires_model, requires_model,
+                "{name}: requires_model"
+            );
+            assert_eq!(
+                entry.detect_patterns, detect_patterns,
+                "{name}: detect_patterns"
+            );
+        }
     }
 }

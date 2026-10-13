@@ -1,13 +1,6 @@
 <div align="center">
 
-<pre>
- ██████╗  ██████╗████████╗ ██████╗ ███████╗
-██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
-██║   ██║██║        ██║   ██║   ██║███████╗
-██║   ██║██║        ██║   ██║   ██║╚════██║
-╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
- ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-</pre>
+<img src="images/octos-logo.svg" alt="Octos logo" width="128" height="128">
 
 </div>
 
@@ -26,6 +19,11 @@ Octos 的核心架构是 **可复用的内核 + 可编程的协议边界**。应
 
 [构建应用](#基于-octos-构建应用) · [通过 OUP 控制内核](#通过-oup-控制内核) ·
 [文档](https://octos-org.github.io/octos/zh/) · [English](README.md)
+
+[OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
+用一个日历请求串起请求准入、Tokio 任务、宿主工具调用和答案返回，
+并说明 app peer、人与系统 agent 的会话、存储边界，以及排查 OctoSense 时应阅读的源码版本。
+贡献约定见 [AGENTS.md](AGENTS.md)。
 
 ## 想直接使用编码 Agent？
 
@@ -62,8 +60,12 @@ Rust workspace 可以按应用需要组合：
 | [`octos-memory`](crates/octos-memory) | 持久化记忆、任务经验与检索 |
 | [`octos-llm`](crates/octos-llm) | 模型提供者接口、路由、重试与故障转移 |
 | [`octos-plugin`](crates/octos-plugin) | 技能与插件集成 |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | 工作流图、并行执行、验证与结果汇总 |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | 原生工作流定义、并行执行、验证与结果汇总 |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | 会话基础设施、运行时组装、OUP 托管与适配层 |
+
+CLI/服务端使用原生 `search` 和 `deep_crawl` 执行研究。运行时已移除
+`run_pipeline` 和 DOT 引擎；`octos-pipeline` 源码保留为独立开发 crate，
+不再是运行时依赖。
 
 在源码仓库中，构建原生 Agent 库或供其他语言调用的库：
 

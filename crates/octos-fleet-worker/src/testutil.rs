@@ -310,6 +310,13 @@ impl Sandbox for MarkerSandbox {
         true
     }
 
+    fn runs_posix_sh(&self) -> bool {
+        // Honest to the [`NoSandbox`] delegation below: it runs the worktree
+        // flow's POSIX sh strings exactly where the platform shell can
+        // (`sh -c` off Windows, `cmd /C` on it).
+        !cfg!(windows)
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         NoSandbox.wrap_command(shell_command, cwd)
     }
@@ -323,6 +330,11 @@ pub struct RestrictedSandbox;
 
 impl Sandbox for RestrictedSandbox {
     // Inherits the default `supports_repo_git_write() == false`.
+    fn runs_posix_sh(&self) -> bool {
+        // Honest to the [`NoSandbox`] delegation below, like [`MarkerSandbox`].
+        !cfg!(windows)
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         NoSandbox.wrap_command(shell_command, cwd)
     }
@@ -334,22 +346,52 @@ pub fn restricted_sandbox_factory() -> crate::SandboxFactory {
     Arc::new(|_, _| Arc::new(RestrictedSandbox) as Arc<dyn Sandbox>)
 }
 
+/// A test double for the latent worktree-flow combination (#2707): it reports
+/// `supports_repo_git_write() == true` (so a worktree IS allocated) while
+/// inheriting the default `runs_posix_sh() == false` — a full-FS backend whose
+/// shell cannot run the flow's POSIX sh strings (e.g. a future Windows backend
+/// wrapping via `cmd /C`). Used to prove the attempt-time sh gate terminates
+/// such an attempt instead of silently degrading it into empty-branch
+/// rejections.
+pub struct NoPosixShSandbox;
+
+impl Sandbox for NoPosixShSandbox {
+    fn supports_repo_git_write(&self) -> bool {
+        true
+    }
+
+    // Inherits the default `runs_posix_sh() == false`.
+
+    fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        NoSandbox.wrap_command(shell_command, cwd)
+    }
+}
+
+/// A [`SandboxFactory`] whose backend reports full-FS write but no POSIX sh
+/// (the #2707 combination). Threads a [`NoPosixShSandbox`].
+pub fn no_posix_sh_sandbox_factory() -> crate::SandboxFactory {
+    Arc::new(|_, _| Arc::new(NoPosixShSandbox) as Arc<dyn Sandbox>)
+}
+
 /// Plants a hanging `filter.*.clean` (a `sleep`) via `.gitattributes` +
 /// `.git/config`, then ends — so the deliverable auto-commit's `git add -A`
 /// triggers the clean filter and HANGS. Used to prove codex fix #4 (the bounded
 /// sandboxed commit kills a hung filter at the deadline). Populate already ran
 /// (clean tree) before this plants the filter, so only the later `git add`
-/// hangs, not the populate.
+/// hangs, not the populate. Unix-only: the planted filter is a POSIX `sleep`.
+#[cfg(unix)]
 pub struct HangCleanFilterProvider {
     calls: AtomicUsize,
 }
 
+#[cfg(unix)]
 impl Default for HangCleanFilterProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl HangCleanFilterProvider {
     pub fn new() -> Self {
         Self {
@@ -359,6 +401,7 @@ impl HangCleanFilterProvider {
 }
 
 #[async_trait]
+#[cfg(unix)]
 impl LlmProvider for HangCleanFilterProvider {
     async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -463,6 +506,46 @@ pub struct SuccessProvider;
 #[async_trait]
 impl LlmProvider for SuccessProvider {
     async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        Ok(end_turn("done, nothing to write"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// [`SuccessProvider`] with a gate: every `chat` parks on the returned
+/// [`Notify`] until it fires (one release per agent turn), then ends the turn.
+/// Pins an attempt mid-flight so a test can interleave pool calls against a
+/// live attempt — an instantly-finishing provider lets a whole run settle
+/// between two dispatches, and the launch CAS then answers `RejectedNotReady`
+/// for a terminal child (the correct answer to a different question), which
+/// flaked `dispatch_double_launch_is_rejected` in CI.
+pub struct GatedProvider {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl GatedProvider {
+    /// Returns the provider and the gate; `notify_one` on the gate lets the
+    /// parked attempt finish. Firing before the first `chat` is also safe (the
+    /// permit is stored and consumed by the first park).
+    pub fn new() -> (Self, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                release: gate.clone(),
+            },
+            gate,
+        )
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GatedProvider {
+    async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        self.release.notified().await;
         Ok(end_turn("done, nothing to write"))
     }
     fn model_id(&self) -> &str {

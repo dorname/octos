@@ -1,5 +1,8 @@
 //! Serve command: start the REST API server.
 
+#[path = "shared_instance.rs"]
+mod shared_instance;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +52,23 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// yields real isolation.
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+/// Default idle lifetime of a cached per-session runtime (30 minutes).
+const SESSION_CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Idle lifetime of a cached per-session runtime.
+///
+/// `OCTOS_SESSION_CACHE_IDLE_TTL_SECS` overrides it (minimum 1 s; a malformed
+/// or zero value keeps the default). Rebuilding an evicted runtime is correct
+/// but slow for a long session, so an operator on a big box may want it
+/// longer; tests want it short.
+fn session_cache_idle_ttl() -> std::time::Duration {
+    std::env::var("OCTOS_SESSION_CACHE_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -60,20 +80,23 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
     !sandbox.is_noop() && sandbox.refusal().is_none()
 }
 
-/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
-/// daemon-user FS write together with the reads git needs — the third gate
-/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
-/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
-/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
-/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
-/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// Whether the resolved sandbox backend can run the fleet WORKTREE flow (§5):
+/// grant a `FsGrant::Host` worker FULL daemon-user FS write together with the
+/// reads git needs, AND run the POSIX sh strings the flow feeds the worker.
+/// Computed at serve boot (mirrors [`fleet_sandbox_is_isolating`]) from the
+/// base sandbox's `supports_repo_git_write()` AND `runs_posix_sh()`: the write
+/// capability is `true` for bwrap and unrestricted-read macOS, `false` for
+/// docker, restricted-read macOS, Landlock, AppContainer, and no sandbox; the
+/// sh capability keeps a future full-FS backend that wraps `cmd /C` from
+/// degrading every worktree attempt into empty-branch rejections (#2707 — the
+/// populate/commit commands are POSIX sh, see `octos-core`'s `git_worktree`).
+/// When either is `false`, the pool falls back to a scratch workspace for every
 /// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
 /// lose its deliverable when the checkout is removed). Threaded into
 /// `PoolConfig.repo_git_write_supported`.
-fn fleet_sandbox_supports_repo_git_write(
-    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
-) -> bool {
-    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+fn fleet_sandbox_supports_worktree(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
+    sandbox.supports_repo_git_write() && sandbox.runs_posix_sh()
 }
 
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
@@ -333,6 +356,33 @@ pub struct ServeCommand {
     #[arg(long)]
     pub stdio: bool,
 
+    /// Publish an owner-readable discovery record for shared local clients.
+    /// Requires loopback and --solo; the server outlives individual clients.
+    #[arg(long, requires = "solo", conflicts_with_all = ["stdio", "host_managed"])]
+    #[serde(default)]
+    pub shared: bool,
+
+    /// Run as the loopback server of an embedding host (an app shell), which
+    /// owns this process: the host writes the host token and an optional
+    /// external-client token (an allowlist of UI Protocol methods only) as
+    /// the first two lines of stdin, never the environment; requests must
+    /// name the loopback
+    /// listener in `Host`, only configured browser origins are trusted,
+    /// pairing is off until the host enables it, profiles run in this
+    /// process, and the server stops when stdin reaches EOF. Requires
+    /// `--host 127.0.0.1` and a Local deployment. See
+    /// `docs/HOST_MANAGED_SERVE.md`.
+    #[arg(long, conflicts_with_all = ["stdio", "solo", "auth_token", "danger_full_access", "web_url"])]
+    #[serde(default)]
+    pub host_managed: bool,
+
+    /// With `--host-managed` on Unix: serve on the listening TCP socket the
+    /// host passed as this inherited descriptor (bound to 127.0.0.1) instead
+    /// of binding `--port`, so the host keeps the port across restarts.
+    #[arg(long, value_name = "FD", requires = "host_managed")]
+    #[serde(default)]
+    pub listen_fd: Option<i32>,
+
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
@@ -385,8 +435,9 @@ pub struct ServeCommand {
     /// local single-user install. OFF by default. Only honoured for direct
     /// loopback requests on a Local-mode host with profile/user stores, and
     /// never when the request carries reverse-proxy headers. Also settable
-    /// via `OCTOS_SOLO_LOGIN=1`. Do NOT set on a host fronted by a reverse
-    /// proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
+    /// via `OCTOS_SOLO_LOGIN=1`. In Local mode profiles run in this process;
+    /// per-profile gateways are not auto-started. Do NOT set on a host fronted by a
+    /// reverse proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
     #[arg(long)]
     pub solo: bool,
 
@@ -413,9 +464,15 @@ pub struct ServeCommand {
     /// context fills, ask the model for a high-quality handoff summary (a real
     /// model call — slower, a few seconds) instead of the instant deterministic
     /// heuristic. Falls back to the heuristic on any error/timeout, so it never
-    /// breaks a turn. Off by default.
-    #[arg(long)]
+    /// breaks a turn. On by default; use --no-llm-compaction to opt out.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true,
+          num_args = 0..=1, default_missing_value = "true", require_equals = true,
+          conflicts_with = "no_llm_compaction")]
     pub llm_compaction: bool,
+
+    /// Use deterministic heuristic context summaries instead of an LLM call.
+    #[arg(long, conflicts_with = "llm_compaction")]
+    pub no_llm_compaction: bool,
 
     /// Disable automatic retry on transient errors.
     #[arg(long)]
@@ -450,20 +507,22 @@ pub struct ServeCommand {
     pub swarm_backend_url: Option<String>,
 }
 
-/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
-/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+/// Wire a `task_query_store` when AppUI sessions run in this process: stdio
+/// and local solo HTTP. Leave it `None` when HTTP serve proxies to gateways.
 ///
-/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// These modes run session turns in *this* process with no gateway to proxy
 /// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
 /// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
 /// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
 /// at end of turn), which lets `handle_task_cancel` reach the live supervisor
 /// and actually cancel a running `spawn_only` background task. Without it the
 /// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
-/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
-/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
-fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
-    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+/// for AppUI task commands"). Gateway HTTP serve must stay `None` so
+/// `handle_task_cancel` keeps proxying via `resolve_api_port`.
+fn in_process_task_query_store(
+    in_process: bool,
+) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    in_process.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
 /// Where the effective dashboard bearer token came from. #2371: the argv
@@ -495,6 +554,34 @@ fn resolve_auth_token(
         Some(token) if !token.is_empty() => Some((token.to_string(), AuthTokenSource::Config)),
         _ => None,
     }
+}
+
+/// Validate `--host-managed`'s invariants and return `(host token, external
+/// token)`. Loopback IPv4 only (the `Host` allowlist and the listener agree),
+/// Local mode, and a host token from the environment.
+fn host_managed_preflight(
+    host: &str,
+    mode: &crate::config::DeploymentMode,
+    host_token: Option<String>,
+    external_token: Option<String>,
+) -> Result<(String, Option<String>)> {
+    use crate::api::host_managed::{EXTERNAL_TOKEN_ENV, HOST_TOKEN_ENV};
+    eyre::ensure!(
+        host == "127.0.0.1",
+        "--host-managed binds 127.0.0.1 only (got --host {host})"
+    );
+    eyre::ensure!(
+        *mode == crate::config::DeploymentMode::Local,
+        "--host-managed requires a Local deployment"
+    );
+    let host_token = host_token
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| eyre::eyre!("--host-managed requires {HOST_TOKEN_ENV}"))?;
+    let external_token = external_token.filter(|token| !token.is_empty());
+    // Same validation HostManaged::new applies, early and without a port.
+    crate::api::host_managed::HostManaged::new(host_token.clone(), external_token.clone(), 1)
+        .wrap_err_with(|| format!("invalid {HOST_TOKEN_ENV} or {EXTERNAL_TOKEN_ENV}"))?;
+    Ok((host_token, external_token))
 }
 
 /// How long the serve keeps draining in-flight connections after the stop
@@ -769,16 +856,28 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
 
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Serve runs agent turns, skill actions and profile bootstraps on
+            // its workers; give them the same 8 MiB the chat/acp/mcp runtimes
+            // use for deep agent futures (debug builds overflowed 2 MiB).
+            .thread_stack_size(8 * 1024 * 1024)
             .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+            .wrap_err("failed to create tokio runtime")?;
+        let result = runtime.block_on(self.run_async());
+        // Background tasks (including blocking stdin watchers) must not hold
+        // the CLI open after gateway cleanup. Return to main so its tracing
+        // guard flushes shutdown records before the process exits.
+        runtime.shutdown_background();
+        result
     }
 }
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
+        if self.shared && self.host != "127.0.0.1" {
+            eyre::bail!("--shared requires --host 127.0.0.1");
+        }
         let cwd = match &self.cwd {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
@@ -1012,7 +1111,50 @@ impl ServeCommand {
 
         // Security: warn if binding to non-localhost without auth token
         // Precedence: CLI arg, then OCTOS_AUTH_TOKEN env var, then config
-        let auth_token = if let Some((token, source)) = resolve_auth_token(
+        // `--host-managed`: validate the mode before anything binds, spawns
+        // or opens stores. The host token comes from the environment only.
+        let host_managed_tokens = if self.host_managed {
+            // Linux/Android: SIGTERM when the host dies (a no-op elsewhere).
+            crate::api::host_managed::bind_to_parent()?;
+            // The tokens arrive on stdin, never in the environment, which any
+            // process of this user (on Android: this app's own tools) can
+            // read from /proc/<pid>/environ.
+            for name in [
+                crate::api::host_managed::HOST_TOKEN_ENV,
+                crate::api::host_managed::EXTERNAL_TOKEN_ENV,
+            ] {
+                eyre::ensure!(
+                    std::env::var_os(name).is_none(),
+                    "--host-managed reads its tokens from stdin; unset {name}"
+                );
+            }
+            let (host_token, external_token) = crate::api::host_managed::read_tokens_from_stdin(
+                std::io::stdin(),
+                std::time::Duration::from_secs(60),
+            )?;
+            Some(host_managed_preflight(
+                &self.host,
+                &config.mode,
+                host_token,
+                external_token,
+            )?)
+        } else {
+            None
+        };
+
+        let auth_token = if self.shared {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            Some(format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>()
+            ))
+        } else if let Some((host_token, _)) = &host_managed_tokens {
+            Some(host_token.clone())
+        } else if let Some((token, source)) = resolve_auth_token(
             self.auth_token.clone(),
             std::env::var("OCTOS_AUTH_TOKEN").ok(),
             config.auth_token.as_deref(),
@@ -1093,15 +1235,6 @@ impl ServeCommand {
                 "bundled skill binaries missing beside the octos executable — this looks like a bare-binary install; app-skill tools (get_weather, etc.) will NOT register. Deploy the full bundle (scripts/build-local-bundle.sh / scripts/install.sh), not just the octos binary."
             );
         }
-        // Gap 4.1: bundle generic pipelines (deep_research) into the
-        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline`
-        // always discovers them even when the `mofa-research` skill carrying
-        // `deep_research.dot` has drifted off a profile. Per-profile
-        // `RunPipelineTool`s register that dir as the LOWEST-precedence
-        // search path via `with_octos_home` (bootstrap-dir == search-dir).
-        // Installed pipelines of the same name always win (no clobber).
-        octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
-
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
         // call `ProfileRuntime::bootstrap` and stash the resulting
@@ -1247,7 +1380,7 @@ impl ServeCommand {
                         // in (the closure needs the whole config; the pool only
                         // needs the bool).
                         let repo_git_write_supported =
-                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                            fleet_sandbox_supports_worktree(&sandbox_cfg);
                         // The SandboxFactory folds the per-attempt SandboxGrant
                         // (derived from the task's WorkerGrant) onto the base
                         // network-isolated sandbox: `allow_network` from the
@@ -1328,9 +1461,10 @@ impl ServeCommand {
                             keeper_profile_id: rt.profile_id.clone(),
                             // §5 gate condition 3: only take the worktree flow when
                             // the resolved backend supports full-FS write (bwrap /
-                            // full-read macOS). Otherwise every task falls back to a
-                            // scratch workspace so a non-supporting backend never
-                            // loses a deliverable.
+                            // full-read macOS) AND runs the POSIX sh the worker-side
+                            // commands are written in (#2707). Otherwise every task
+                            // falls back to a scratch workspace so a non-supporting
+                            // backend never loses a deliverable.
                             repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(
@@ -1421,33 +1555,81 @@ impl ServeCommand {
         }
 
         let session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+            crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
                 .with_sessions_in_cwd(config.appui.sessions_in_cwd),
         );
 
-        let (http_listener, effective_serve_port) =
-            bind_http_listener(self.stdio, &self.host, self.port).await?;
+        let (http_listener, effective_serve_port) = match self.listen_fd {
+            Some(fd) => {
+                let listener = crate::api::host_managed::adopt_listener_fd(fd)?;
+                let port = listener
+                    .local_addr()
+                    .wrap_err("failed to inspect the inherited listener")?
+                    .port();
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .wrap_err("failed to adopt the inherited listener")?;
+                (Some(listener), port)
+            }
+            None => bind_http_listener(self.stdio, &self.host, self.port).await?,
+        };
+        let host_managed = match host_managed_tokens {
+            Some((host_token, external_token)) => {
+                Some(Arc::new(crate::api::host_managed::HostManaged::new(
+                    host_token,
+                    external_token,
+                    effective_serve_port,
+                )?))
+            }
+            None => None,
+        };
 
         // WEB-PAIRING-CONTRACT-5100 — mint ONE pairing code per process
         // start, against the REAL bound port (so `--port 0` pairs too). Only
         // for an HTTP serve: `--stdio` binds no listener, so it exposes no
         // `/pair/*` surface and the state stays `None`. The code lives in
         // memory for this process only and is NEVER handed to `tracing`.
-        let pairing = (!self.stdio).then(|| {
+        // A host-managed server mints none at startup: its host enables a
+        // code for the EXTERNAL token on demand (`/api/admin/host/pairing`).
+        let pairing = (!self.stdio && !self.host_managed).then(|| {
             Arc::new(crate::api::pairing::PairingState::mint(
                 format!("http://127.0.0.1:{effective_serve_port}"),
                 auth_token.clone(),
             ))
         });
 
+        // Solo AppUI sessions use this serve process's ProfileRuntime. A
+        // gateway for the same profile would open its episodes.redb again and
+        // lock session/open out of the profile after onboarding. Stdio serve
+        // already has no gateway auto-start; keep HTTP solo consistent.
+        //
+        // `--host-managed` never enables solo login (not even through
+        // `OCTOS_SOLO_LOGIN`) but also runs its profiles in this process.
+        let solo_login_enabled_flag = !self.host_managed
+            && (self.solo
+                || std::env::var("OCTOS_SOLO_LOGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false));
+        let solo_in_process = (solo_login_enabled_flag || self.host_managed)
+            && config.mode == crate::config::DeploymentMode::Local;
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
+                .with_solo_in_process(solo_in_process)
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(effective_serve_port, auth_token.clone())
+                // Host-managed: gateways never start, and the host token
+                // stays out of every child's reach.
+                .with_serve_config(
+                    effective_serve_port,
+                    if self.host_managed {
+                        None
+                    } else {
+                        auth_token.clone()
+                    },
+                )
                 // Section B (codex review round-5 P1.2): every spawned
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
@@ -1611,10 +1793,6 @@ impl ServeCommand {
             crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
         );
 
-        let solo_login_enabled_flag = self.solo
-            || std::env::var("OCTOS_SOLO_LOGIN")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
         let dangerous_default_permissions_flag = self.danger_full_access
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1658,16 +1836,23 @@ impl ServeCommand {
                 eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
             }
         };
+        // A host-managed server trusts only the configured origins: not even
+        // this listener's own loopback origins (it serves no host UI pages).
         let appui_allowed_origins = resolve_appui_allowed_origins(
             &config.appui.allowed_origins,
             appui_allowed_origins_env.as_deref(),
-            effective_serve_port,
+            if self.host_managed {
+                0
+            } else {
+                effective_serve_port
+            },
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
         // The stop switch exists before AppState so the `server/shutdown`
         // method and the signal watcher (installed further down) share it.
         let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
+        let shared_token = self.shared.then(|| auth_token.clone()).flatten();
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -1724,11 +1909,12 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            host_managed: host_managed.clone(),
             // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
             serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
-            llm_compaction: self.llm_compaction,
+            llm_compaction: self.llm_compaction && !self.no_llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
@@ -1747,15 +1933,10 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // HTTP/gateway serve: session actors live in gateway
-            // processes, so `task_query_store` stays `None` and the
-            // cancel/restart handlers proxy via `resolve_api_port` (the
-            // gateway runtime sets its own store on the embedded api
-            // channel). `--stdio` runs actors in-process with no gateway,
-            // so it wires an empty store the per-turn supervisor
-            // self-registers into — letting AppUI `task/cancel` reach live
-            // `spawn_only` tasks. See `stdio_task_query_store`.
-            task_query_store: stdio_task_query_store(self.stdio),
+            // Stdio and local solo HTTP run session actors in-process, so
+            // their supervisors self-register here. Non-solo HTTP keeps
+            // proxying task commands to each profile gateway.
+            task_query_store: in_process_task_query_store(self.stdio || solo_in_process),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -1780,6 +1961,17 @@ impl ServeCommand {
             // path.
             preview_sweeper: Some(preview_sweeper),
         });
+        tracing::info!(
+            llm_compaction = state.llm_compaction,
+            compaction_default = if state.llm_compaction {
+                "llm"
+            } else {
+                "heuristic"
+            },
+            scope = "AppUI turns/manual compaction",
+            session_open_mode = "heuristic",
+            "compaction default configured; per-session mode overrides take precedence"
+        );
 
         // mini5 soak gap #1 / #1973 fix E: drain queued master continuations
         // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
@@ -1808,6 +2000,16 @@ impl ServeCommand {
         // it changes nothing about how or when the model is woken.
         crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
+        // #2080 — install the `monitor/expired` sink: the expiry transitions
+        // (reconcile sweep + watcher deadline) are connection-independent, so
+        // the sink and its ledger drain live here next to the human sink, for
+        // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
+        // could expire a monitor is only reachable from the global drain
+        // spawned above, whose first tick is skipped — a boot-time reconcile
+        // before this install would drop frames (best-effort tap, trace-log
+        // only). Keep this install ahead of any future eager boot reconcile.
+        crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
@@ -1823,6 +2025,14 @@ impl ServeCommand {
         // returns before this point and keeps its existing behavior — it
         // spawns no gateways, so there is nothing to orphan.
         let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
+        // `--host-managed`: the host owns the lifecycle. Its end of stdin
+        // closing (orderly stop, crash, kill) stops the server through the
+        // same drain path; `server/shutdown` is never offered to clients.
+        if self.host_managed {
+            crate::api::host_managed::spawn_stdin_eof_watcher(serve_shutdown_tx.clone());
+        }
+
+        let gateway_auto_start_enabled = !solo_in_process;
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
@@ -1832,7 +2042,7 @@ impl ServeCommand {
             enabled = enabled_count,
             "loaded profiles"
         );
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
                     if !p.config.has_llm_selection() {
@@ -1865,7 +2075,7 @@ impl ServeCommand {
         }
 
         // Profile file watcher: auto-restart gateways when profile JSON changes.
-        {
+        if gateway_auto_start_enabled {
             let ps = profile_store.clone();
             let pm = process_manager.clone();
             tokio::spawn(async move {
@@ -2068,6 +2278,19 @@ impl ServeCommand {
         // (#1973 fix E — the global master-continuation drain used to be
         // spawned HERE, after the stdio early-return; it now spawns right
         // before that branch so stdio serves share the safety net.)
+        let _shared_publication = if let Some(token) = shared_token.as_deref() {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (publication, identity) =
+                shared_instance::publish(&data_dir, &cwd, effective_serve_port, token, &identity)?;
+            let _ = state.ui_protocol.shared_instance.set(identity);
+            let _ = state
+                .ui_protocol
+                .shared_instance_token
+                .set(token.to_owned());
+            Some(publication)
+        } else {
+            None
+        };
         let app = build_router(state);
         let listener =
             http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
@@ -2079,7 +2302,7 @@ impl ServeCommand {
         tracing::info!(address = %addr, "octos API server starting");
         tracing::info!(app = %format!("http://{}/app/", addr), "web app available");
         tracing::info!(dashboard = %format!("http://{}/admin/", addr), "admin dashboard available");
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
@@ -2092,7 +2315,7 @@ impl ServeCommand {
             "Admin dashboard".green(),
             addr
         ));
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             let _ = serve_console::print_stdout(&format!(
                 "{}: {} profiles auto-started",
                 "Gateways".green(),
@@ -2126,7 +2349,7 @@ impl ServeCommand {
 
         // Cap the drain: after the stop signal axum waits for in-flight
         // connections, and an SSE stream never closes on its own. Past the
-        // cap we proceed to stop_all() + exit(0) anyway — better to cut a
+        // cap we proceed to stop_all() + runtime shutdown anyway — better to cut a
         // long-lived stream than to let the supervisor SIGKILL us with the
         // gateways still running (#2086).
         // Both arms funnel into the gateway cleanup below: a serve-loop
@@ -2161,9 +2384,10 @@ impl ServeCommand {
             let _ = serve_console::print_stdout(&format!("  stopped {} gateway(s)", stopped));
         }
 
-        // Force exit — background tokio tasks (profile watcher, auth cleanup,
-        // admin bot) have no shutdown signal and would hang indefinitely.
-        std::process::exit(if serve_result.is_ok() { 0 } else { 1 });
+        // execute() shuts the runtime down without waiting for background
+        // tasks. Returning lets main drop the asynchronous log writer's
+        // guard; process::exit would discard the queued cleanup records.
+        serve_result.wrap_err("HTTP serve loop failed")
     }
 
     /// F-010: construct an `Option<Arc<SwarmState>>` from the
@@ -2335,6 +2559,115 @@ mod tests {
     }
 
     #[test]
+    fn should_require_loopback_local_mode_and_a_host_token_when_host_managed() {
+        use crate::config::DeploymentMode;
+        let host = "h".repeat(40);
+        let external = "e".repeat(40);
+        let ok = host_managed_preflight(
+            "127.0.0.1",
+            &DeploymentMode::Local,
+            Some(host.clone()),
+            Some(external.clone()),
+        )
+        .unwrap();
+        assert_eq!(ok, (host.clone(), Some(external)));
+        // No external token: host-only (external clients disabled).
+        assert_eq!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(String::new())
+            )
+            .unwrap()
+            .1,
+            None
+        );
+        for bad_host in ["0.0.0.0", "::1", "localhost", "192.168.1.2"] {
+            assert!(
+                host_managed_preflight(bad_host, &DeploymentMode::Local, Some(host.clone()), None)
+                    .is_err(),
+                "{bad_host}"
+            );
+        }
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Cloud,
+                Some(host.clone()),
+                None
+            )
+            .is_err()
+        );
+        assert!(host_managed_preflight("127.0.0.1", &DeploymentMode::Local, None, None).is_err());
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some("short".into()),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(host)
+            )
+            .is_err(),
+            "the two credentials must differ"
+        );
+    }
+
+    #[test]
+    fn should_default_llm_compaction_on_and_allow_explicit_opt_out() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        let default = Cli::try_parse_from(["octos"]).unwrap();
+        assert!(default.serve.llm_compaction && !default.serve.no_llm_compaction);
+        let explicit = Cli::try_parse_from(["octos", "--llm-compaction"]).unwrap();
+        assert!(explicit.serve.llm_compaction);
+        let off = Cli::try_parse_from(["octos", "--no-llm-compaction"]).unwrap();
+        assert!(off.serve.no_llm_compaction);
+        let off_value = Cli::try_parse_from(["octos", "--llm-compaction=false"]).unwrap();
+        assert!(!off_value.serve.llm_compaction);
+        assert!(Cli::try_parse_from(["octos", "--llm-compaction", "--no-llm-compaction"]).is_err());
+    }
+
+    #[test]
+    fn should_refuse_host_managed_with_stdio_solo_or_an_argv_token() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        for extra in [
+            &["--stdio"][..],
+            &["--solo"],
+            &["--auth-token", "x"],
+            &["--danger-full-access"],
+        ] {
+            let mut argv = vec!["octos", "--host-managed"];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{extra:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["octos", "--listen-fd", "3"]).is_err(),
+            "--listen-fd needs --host-managed"
+        );
+        let parsed = Cli::try_parse_from(["octos", "--host-managed", "--listen-fd", "3"]).unwrap();
+        assert!(parsed.serve.host_managed);
+        assert_eq!(parsed.serve.listen_fd, Some(3));
+    }
+
+    #[test]
     fn should_fall_back_to_env_then_config_auth_token() {
         assert_eq!(
             resolve_auth_token(None, Some("env-token".to_string()), Some("config-token")),
@@ -2432,6 +2765,7 @@ mod tests {
             "install.sh",
             "install.ps1",
             "local-tenant-deploy.sh",
+            "frp/bootstrap-tenant.sh",
             "deploy.ps1",
         ] {
             let body = std::fs::read_to_string(scripts.join(name))
@@ -2462,7 +2796,7 @@ mod tests {
         // task commands fail `runtime_unavailable` and octoscode Esc/`x`
         // cannot cancel a spawned background task (the reported bug).
         assert!(
-            stdio_task_query_store(true).is_some(),
+            in_process_task_query_store(true).is_some(),
             "stdio serve must wire a task_query_store"
         );
     }
@@ -2518,11 +2852,11 @@ mod tests {
     }
 
     #[test]
-    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
-        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+    fn gateway_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // Non-solo HTTP serve must leave it `None` so `handle_task_cancel`
         // takes the gateway-proxy path; a non-`None` store would skip it.
         assert!(
-            stdio_task_query_store(false).is_none(),
+            in_process_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
     }

@@ -1,14 +1,7 @@
 //! Site-delivery workflow definition.
 //!
-//! Pipeline-contract enforcement (coding-blue FA-7): the
-//! `workspace_policy_for_template_kind` helper below returns a typed
-//! [`WorkspacePolicy`] with `validation.on_completion` declaring the
-//! built `index.html` as a required artifact. When the session's
-//! working directory is initialised with `write_workspace_policy`,
-//! [`octos_pipeline::RunPipelineTool::build_workspace_context`] reads
-//! that policy on every `run_pipeline` invocation and propagates the
-//! validator block to the pipeline executor. Pipeline completion fails
-//! if the built site entrypoint is missing — no new opt-in needed.
+//! Declares the expected workspace artifacts and completion validators for
+//! the native delivery workflow. DOT execution is not part of this runtime.
 use crate::workflow_runtime::workflow_families::SiteTemplate;
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
@@ -187,6 +180,53 @@ mod tests {
                 .get("entrypoint")
                 .map(String::as_str),
             Some("out/index.html")
+        );
+    }
+
+    #[test]
+    fn workspace_policy_completion_validators_cover_every_template() {
+        for (slug, output_dir) in [
+            ("astro-site", "dist"),
+            ("nextjs-app", "out"),
+            ("react-vite", "dist"),
+            ("quarto-lesson", "docs"),
+        ] {
+            let policy = workspace_policy_for_template(slug);
+            assert_eq!(
+                policy.validation.on_completion,
+                vec![format!("file_exists:{output_dir}/index.html")],
+                "slug: {slug}"
+            );
+            let entrypoint = format!("{output_dir}/index.html");
+            assert_eq!(
+                policy.artifacts.entries.get("entrypoint"),
+                Some(&entrypoint),
+                "slug: {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_policy_declares_site_workspace_contract() {
+        let policy = workspace_policy_for_template_kind(SiteTemplate::AstroSite);
+        assert!(matches!(policy.workspace.kind, WorkspacePolicyKind::Sites));
+        assert_eq!(
+            policy.version_control.provider,
+            WorkspaceVersionControlProvider::Git
+        );
+        assert!(policy.version_control.auto_init);
+        assert!(matches!(
+            policy.version_control.trigger,
+            WorkspaceSnapshotTrigger::TurnEnd
+        ));
+        assert!(policy.version_control.fail_on_error);
+        assert_eq!(
+            policy.validation.on_turn_end,
+            vec![
+                "file_exists:mofa-site-session.json".to_string(),
+                "file_exists:site-plan.json".to_string(),
+                "file_exists:optimized-prompt.md".to_string(),
+            ]
         );
     }
 }

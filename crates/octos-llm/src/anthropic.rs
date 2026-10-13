@@ -187,13 +187,26 @@ impl AnthropicProvider {
         // "none"` on summarization requests).
         let cache = (self.prompt_caching && config.cache_retention != crate::CacheRetention::None)
             .then_some(EPHEMERAL_CACHE_CONTROL);
-        let mut api_messages = build_anthropic_messages(messages);
+        let mut api_messages =
+            build_anthropic_messages(messages, config.media_scope_root.as_deref());
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
-        let thinking = config
-            .reasoning_effort
-            .and_then(|effort| build_anthropic_thinking(effort, max_tokens));
+        // GLM enables reasoning when this field is absent. An explicit fast
+        // mode must reach its compatible endpoint, rather than inheriting that
+        // default. Preserve the existing request shape for other models.
+        let thinking = if self.model.to_ascii_lowercase().starts_with("glm-")
+            && config.reasoning_effort == Some(ReasoningEffort::Disabled)
+        {
+            Some(AnthropicThinking {
+                r#type: "disabled",
+                budget_tokens: 0,
+            })
+        } else {
+            config
+                .reasoning_effort
+                .and_then(|effort| build_anthropic_thinking(effort, max_tokens))
+        };
         let (temperature, top_p, top_k) = self.sampling_fields(config);
         AnthropicRequest {
             model: &self.model,
@@ -682,7 +695,12 @@ struct AnthropicRequest<'a> {
 #[derive(Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "is_zero_budget")]
     budget_tokens: u32,
+}
+
+fn is_zero_budget(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
@@ -760,10 +778,21 @@ enum AnthropicContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: AnthropicToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+/// A `tool_result`'s content: plain text, or blocks when the tool handed
+/// the model an image — the Messages protocol takes image blocks inside
+/// the tool_result, and nowhere else after a tool_use, since roles must
+/// alternate and a second user message would be rejected.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicContentBlock>),
 }
 
 /// Place the rolling-history breakpoint: `cache_control` on the last content
@@ -853,7 +882,10 @@ struct AnthropicImageSource {
 ///   every `tool_use` id from the assistant turn to be answered in the
 ///   immediately-following message, so parallel tool results split across
 ///   two user messages would 400.
-fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'static>> {
+fn build_anthropic_messages(
+    messages: &[Message],
+    scope_root: Option<&std::path::Path>,
+) -> Vec<AnthropicMessage<'static>> {
     let mut out: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
     // True while `out.last()` is the user-role message accumulating the
     // current run of consecutive tool_result blocks.
@@ -867,10 +899,10 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
     let mut pending_tool_use_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    for m in messages
-        .iter()
-        .filter(|m| m.role != octos_core::MessageRole::System)
-    {
+    for (index, m) in messages.iter().enumerate() {
+        if m.role == octos_core::MessageRole::System {
+            continue;
+        }
         match m.role {
             octos_core::MessageRole::Assistant => {
                 merging_tool_results = false;
@@ -897,7 +929,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                     .tool_call_id
                     .as_deref()
                     .filter(|id| pending_tool_use_ids.contains(*id))
-                    .and_then(|_| anthropic_tool_result_block(m));
+                    .and_then(|_| anthropic_tool_result_block(messages, index, scope_root));
                 match block {
                     Some(block) => {
                         // Consume the id: a duplicate result for the same
@@ -929,7 +961,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                         pending_tool_use_ids.clear();
                         out.push(AnthropicMessage {
                             role: "user",
-                            content: build_anthropic_content(m),
+                            content: build_anthropic_content(m, scope_root),
                         });
                     }
                 }
@@ -939,7 +971,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                 pending_tool_use_ids.clear();
                 out.push(AnthropicMessage {
                     role: "user",
-                    content: build_anthropic_content(m),
+                    content: build_anthropic_content(m, scope_root),
                 });
             }
         }
@@ -994,16 +1026,58 @@ fn build_assistant_anthropic_content(msg: &Message) -> Option<AnthropicContent> 
 /// Build the `tool_result` block for a Tool-role message. Returns `None`
 /// when `tool_call_id` is missing/empty (ID-less providers) — an empty
 /// `tool_use_id` would 400, so the caller falls back to plain user text.
-fn anthropic_tool_result_block(msg: &Message) -> Option<AnthropicContentBlock> {
+fn anthropic_tool_result_block(
+    messages: &[Message],
+    index: usize,
+    scope_root: Option<&std::path::Path>,
+) -> Option<AnthropicContentBlock> {
+    let msg = &messages[index];
     let tool_use_id = msg.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
+    // Images a tool handed the model go inside this block; the protocol
+    // has no video block, so a video is named in a note.
+    let shown = crate::tool_media::for_tool_row(messages, index, false, true);
+    let mut text = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
+    let mut blocks = Vec::new();
+    for path in &shown.images {
+        match vision::encode_image(path, scope_root) {
+            Ok((mime, data)) => blocks.push(AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    r#type: "base64".into(),
+                    media_type: mime,
+                    data,
+                },
+                cache_control: None,
+            }),
+            Err(_) => {
+                text = crate::tool_media::with_note(
+                    &text,
+                    Some(&crate::tool_media::unreadable_note(path)),
+                )
+            }
+        }
+    }
+    let content = if blocks.is_empty() {
+        AnthropicToolResultContent::Text(text)
+    } else {
+        if !text.is_empty() {
+            blocks.push(AnthropicContentBlock::Text {
+                text,
+                cache_control: None,
+            });
+        }
+        AnthropicToolResultContent::Blocks(blocks)
+    };
     Some(AnthropicContentBlock::ToolResult {
         tool_use_id: tool_use_id.to_string(),
-        content: msg.content.clone(),
+        content,
         cache_control: None,
     })
 }
 
-fn build_anthropic_content(msg: &Message) -> AnthropicContent {
+fn build_anthropic_content(
+    msg: &Message,
+    scope_root: Option<&std::path::Path>,
+) -> AnthropicContent {
     // Mirror openai.rs: only inline vision content on USER messages.
     // Assistant/Tool media is prior-turn tool output (e.g.
     // send_file(skill-output/slides/<slug>/output/slide-NN.png)) and
@@ -1015,10 +1089,39 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
     };
 
     if images.is_empty() {
-        // Include non-image file paths so the agent can use read_file
-        let non_image: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
-        if non_image.is_empty() {
+        // Include non-image file paths so the agent can use read_file. A
+        // video is named separately: the Messages protocol has no video
+        // block, and `read_file` on an MP4 helps nobody, so the model is
+        // told it cannot watch it rather than sent to read the bytes.
+        let videos: Vec<_> = msg.media.iter().filter(|p| vision::is_video(p)).collect();
+        let non_image: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p) && !vision::is_video(p))
+            .collect();
+        if non_image.is_empty() && videos.is_empty() {
             return AnthropicContent::Text(msg.content.clone());
+        }
+        if non_image.is_empty() {
+            let names: Vec<String> = videos
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| (*p).clone())
+                })
+                .collect();
+            let note = format!(
+                "[video attachments this model cannot view: {}. Say so if asked about them; do not guess their contents.]",
+                names.join(", ")
+            );
+            let text = if msg.content.is_empty() {
+                note
+            } else {
+                format!("{}\n{note}", msg.content)
+            };
+            return AnthropicContent::Text(text);
         }
         // Mini5 2026-05-12: the prior note ("Use read_file to access them.")
         // caused DeepSeek/Anthropic to refuse paths under /private/var/...
@@ -1046,7 +1149,7 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(AnthropicContentBlock::Image {
                 source: AnthropicImageSource {
                     r#type: "base64".into(),
@@ -1373,7 +1476,7 @@ mod tests {
     #[test]
     fn test_build_content_text_only() {
         let m = msg(MessageRole::User, "hello");
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("expected Text variant"),
@@ -1394,7 +1497,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         // Non-image media should include file paths for read_file
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => {
                 assert!(t.contains("check this"));
@@ -1414,6 +1517,120 @@ mod tests {
             name: name.to_string(),
             arguments: args,
             metadata: None,
+        }
+    }
+
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    /// The same loop continued: the model answered, the user asked again,
+    /// and a second call ran — the first row's image is now an old batch.
+    fn media_loop_continued(dir: &std::path::Path) -> Vec<Message> {
+        let (mut msgs, _) = media_loop(dir);
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        msgs.push(mk(MessageRole::Assistant, "a red circle"));
+        msgs.push(mk(MessageRole::User, "and the size?"));
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"cmd": "file grab.png"}),
+            metadata: None,
+        }]);
+        msgs.push(assistant);
+        let mut tool = mk(MessageRole::Tool, "PNG 480x320");
+        tool.tool_call_id = Some("call_2".into());
+        msgs.push(tool);
+        msgs
+    }
+
+    #[test]
+    fn should_put_tool_media_inside_the_tool_result_and_keep_roles_alternating() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let body = serde_json::to_value(provider.build_request(&msgs, &[], &ChatConfig::default()))
+            .unwrap();
+        let out = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "no second user message: {body}"
+        );
+        let result = &out[2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "call_1");
+        let content = result["content"]
+            .as_array()
+            .expect("blocks inside the tool_result");
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["type"], "text");
+        assert!(content[1]["text"].as_str().unwrap().contains("png"));
+    }
+
+    #[test]
+    fn should_not_resend_an_older_batch_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = media_loop_continued(dir.path());
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let body = serde_json::to_value(provider.build_request(&msgs, &[], &ChatConfig::default()))
+            .unwrap();
+        let text = body.to_string();
+        assert!(
+            !text.contains("\"type\":\"image\""),
+            "old image must not be re-sent: {text}"
+        );
+        assert!(text.contains("shown to you when it ran"), "{text}");
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        for w in roles.windows(2) {
+            assert_ne!(w[0], w[1], "roles must alternate: {roles:?}");
         }
     }
 
@@ -1716,6 +1933,23 @@ mod tests {
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn glm_fast_mode_explicitly_disables_provider_default_thinking() {
+        let provider = AnthropicProvider::new("test-key", "glm-5.3-flash")
+            .with_base_url("https://api.z.ai/api/anthropic");
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..ChatConfig::default()
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &[msg(MessageRole::User, "weather")],
+            &[],
+            &config,
+        ))
+        .unwrap();
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
     }
 
     #[test]

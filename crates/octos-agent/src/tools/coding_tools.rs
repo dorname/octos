@@ -288,6 +288,8 @@ async fn request_command_approval(
                     body: format!("Run command: {command}"),
                     command: Some(command.to_owned()),
                     cwd: Some(cwd.to_string_lossy().into_owned()),
+                    once_only: false,
+                    host_tool: None,
                 })
                 .await;
             if matches!(decision, ToolApprovalDecision::Deny) {
@@ -2734,9 +2736,12 @@ struct ViewImageInput {
 /// Reads an image file from the workspace (respecting `FilesystemScope` and
 /// `FileAccessMode`), detects the format from the magic header bytes, and
 /// returns a structured metadata envelope the AppUI image-view flow can render
-/// without re-reading the file. The tool intentionally does NOT inline the raw
-/// image bytes — the host UI fetches them through the workspace artifact
-/// channel.
+/// without re-reading the file. The tool output stays text — the bytes are
+/// not inlined there, the host UI fetches them through the workspace artifact
+/// channel — but a raster image the provider can accept is handed back as
+/// `model_media`, so the model that asked actually gets to look at it. A
+/// vision-capable model that could only learn "png, 2.1 MB" from its own
+/// screenshot had to wait for a person to attach it.
 pub struct ViewImageTool {
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
@@ -2922,14 +2927,43 @@ impl Tool for ViewImageTool {
                 });
             }
         };
+        // Shown to the model when the provider can take it: a raster format
+        // every vision API accepts, under the smallest common size ceiling,
+        // and with an extension the providers' image detection recognises
+        // (they key on the path, not the bytes). Otherwise the model gets
+        // the metadata and a reason, never a silent nothing.
+        let shown = if !VISION_FORMATS.contains(&format) {
+            Err(format!(
+                "{format} is not a format the model can view; convert it to PNG or JPEG"
+            ))
+        } else if byte_length > MAX_MODEL_IMAGE_BYTES {
+            Err(format!(
+                "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
+            ))
+        } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
+            Err("the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model".to_string())
+        } else {
+            Ok(())
+        };
+        let mut payload = json!({
+            "path": path,
+            "format": format,
+            "mime_type": mime,
+            "byte_length": byte_length,
+        });
+        let model_media = match &shown {
+            Ok(()) => {
+                payload["shown_to_model"] = json!(true);
+                vec![resolved.clone()]
+            }
+            Err(reason) => {
+                payload["shown_to_model"] = json!(false);
+                payload["not_shown_because"] = json!(reason);
+                Vec::new()
+            }
+        };
         Ok(ToolResult {
-            output: json!({
-                "path": path,
-                "format": format,
-                "mime_type": mime,
-                "byte_length": byte_length,
-            })
-            .to_string(),
+            output: payload.to_string(),
             success: true,
             structured_metadata: Some(json!({
                 "codex_tool": "view_image",
@@ -2937,11 +2971,224 @@ impl Tool for ViewImageTool {
                 "format": format,
                 "mime_type": mime,
                 "byte_length": byte_length,
+                "shown_to_model": shown.is_ok(),
             })),
+            model_media,
             ..Default::default()
         })
     }
 }
+
+/// `view_video`: the video counterpart of [`ViewImageTool`].
+///
+/// Same workspace scope and symlink rules, same contract: the tool output is
+/// metadata, and a container the multimodal endpoints take inline (MP4, MOV,
+/// MKV, WebM, under the size ceiling) comes back as `model_media` so the
+/// model that asked gets to watch it. Which endpoints can is decided on the
+/// wire: GLM's coding endpoint and Kimi take a `video_url` part, DeepSeek
+/// refuses one and the provider's retry tells the model it could not watch
+/// the file, Anthropic's protocol has no video at all.
+pub struct ViewVideoTool {
+    base_dir: PathBuf,
+    filesystem_scope: FilesystemScope,
+}
+
+impl ViewVideoTool {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
+        }
+    }
+
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
+    }
+}
+
+/// Container detected from the header bytes: ISO BMFF (`ftyp` at offset 4:
+/// MP4, M4V, MOV) or EBML (MKV, WebM). Returned as (format, mime).
+fn detect_video_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        return Some(if brand == b"qt  " {
+            ("mov", "video/quicktime")
+        } else {
+            ("mp4", "video/mp4")
+        });
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        // EBML: WebM and Matroska share the header; the DocType string
+        // inside the first bytes tells them apart.
+        let head = &bytes[..bytes.len().min(64)];
+        return Some(if head.windows(4).any(|w| w == b"webm") {
+            ("webm", "video/webm")
+        } else {
+            ("mkv", "video/x-matroska")
+        });
+    }
+    None
+}
+
+#[async_trait]
+impl Tool for ViewVideoTool {
+    fn name(&self) -> &str {
+        "view_video"
+    }
+
+    fn description(&self) -> &str {
+        "Watch a local video file (MP4 / MOV / MKV / WebM) in the workspace. The video is shown to you when the model can take video; otherwise you get its format and size and a reason."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path to the video"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, _ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let input: ViewImageInput =
+            serde_json::from_value(args.clone()).wrap_err("invalid view_video input")?;
+        let Some(path) = input
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "view_video requires `path`".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let resolved =
+            match super::resolve_path_with_scope(&self.base_dir, path, self.filesystem_scope) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "view_video: path outside allowed filesystem scope: {path}"
+                        ),
+                        success: false,
+                        structured_metadata: Some(json!({
+                            "codex_tool": "view_video",
+                            "error_kind": "coding_tool_denied",
+                            "path": path,
+                        })),
+                        ..Default::default()
+                    });
+                }
+            };
+        let ancestor_stop: Option<&std::path::Path> = match self.filesystem_scope {
+            FilesystemScope::Workspace => Some(self.base_dir.as_path()),
+            FilesystemScope::Host => None,
+        };
+        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, ancestor_stop) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Ok(ToolResult {
+                    output: format!("view_video: failed to read {path}: {error}"),
+                    success: false,
+                    structured_metadata: Some(json!({
+                        "codex_tool": "view_video",
+                        "error_kind": "coding_tool_missing",
+                        "path": path,
+                    })),
+                    ..Default::default()
+                });
+            }
+        };
+        let Some((format, mime)) = detect_video_format(&bytes) else {
+            return Ok(ToolResult {
+                output: format!(
+                    "view_video: {path} does not match a recognised video container (MP4 / MOV / MKV / WebM)"
+                ),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "view_video",
+                    "error_kind": "coding_tool_denied",
+                    "reason": "unrecognised_video_format",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        };
+        let shown = if byte_length > MAX_MODEL_VIDEO_BYTES {
+            Err(format!(
+                "{byte_length} bytes is over the {MAX_MODEL_VIDEO_BYTES}-byte limit for showing a video to the model; trim or downscale it"
+            ))
+        } else if !octos_llm::vision::is_video(&resolved.to_string_lossy()) {
+            Err("the file needs a .mp4, .m4v, .mov, .mkv or .webm extension to be shown to the model".to_string())
+        } else {
+            Ok(())
+        };
+        let mut payload = json!({
+            "path": path,
+            "format": format,
+            "mime_type": mime,
+            "byte_length": byte_length,
+        });
+        let model_media = match &shown {
+            Ok(()) => {
+                payload["shown_to_model"] = json!(true);
+                payload["note"] = json!(
+                    "Shown when the model takes video; a model that does not is told it could not watch the file."
+                );
+                vec![resolved.clone()]
+            }
+            Err(reason) => {
+                payload["shown_to_model"] = json!(false);
+                payload["not_shown_because"] = json!(reason);
+                Vec::new()
+            }
+        };
+        Ok(ToolResult {
+            output: payload.to_string(),
+            success: true,
+            structured_metadata: Some(json!({
+                "codex_tool": "view_video",
+                "path": path,
+                "format": format,
+                "mime_type": mime,
+                "byte_length": byte_length,
+                "shown_to_model": shown.is_ok(),
+            })),
+            model_media,
+            ..Default::default()
+        })
+    }
+}
+
+/// Base64 in a JSON body grows a file by a third and the endpoints that take
+/// inline video cap requests in the tens of megabytes; 20 MB keeps the
+/// request under those limits.
+const MAX_MODEL_VIDEO_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Formats every vision API takes inline. SVG and BMP are recognised by
+/// [`detect_image_format`] for the UI's sake but no provider renders them,
+/// and GIF is refused by Gemini, so it is metadata-only too.
+const VISION_FORMATS: &[&str] = &["png", "jpeg", "webp"];
+
+/// The smallest per-image ceiling among the providers (Anthropic's 5 MB);
+/// above it the request would be rejected, so the model gets a reason
+/// instead of a failed turn.
+const MAX_MODEL_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// #1148 codex P2: bounded-read helper for `view_image` that refuses
 /// to follow symlinks. Reads only the first 512 bytes for magic-byte
@@ -3004,7 +3251,10 @@ fn read_image_header_no_follow(
     // so a host symlink like `C:\tmp\link.png -> C:\secret\real.png`
     // doesn't quietly follow on Windows.
     match workspace_root {
-        Some(root) => reject_symlink_ancestors(resolved, root)?,
+        // The walk lives in `octos_llm::vision` (#2480): the request build
+        // re-runs the exact same walk on the same paths, so it must have one
+        // canonical implementation.
+        Some(root) => octos_llm::vision::reject_symlink_ancestors(resolved, root)?,
         None => reject_leaf_symlink(resolved)?,
     }
 
@@ -3048,57 +3298,6 @@ fn reject_leaf_symlink(resolved: &std::path::Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// Walk every ancestor of `resolved` (including `resolved` itself)
-/// and refuse if any one is a symlink or Windows reparse point.
-/// Stops at `workspace_root` (inclusive) so we never recurse into
-/// system roots. Returns `Ok(())` when none of the inspected entries
-/// are symlinks; returns `PermissionDenied` with a descriptive
-/// message when any are.
-///
-/// Safety properties:
-///
-/// * Uses `symlink_metadata`, which does NOT follow the link, so a
-///   symlinked ancestor is correctly classified.
-/// * Terminates at the workspace root even if `resolved` does not
-///   actually live under it (in which case the walk runs out of
-///   ancestors and returns `Ok(())` — containment was already
-///   checked by `resolve_path_with_scope`).
-/// * Hard-bounded by `Path::ancestors`, which is finite.
-fn reject_symlink_ancestors(
-    resolved: &std::path::Path,
-    workspace_root: &std::path::Path,
-) -> std::io::Result<()> {
-    for ancestor in resolved.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "refusing to follow symlink ancestor: {}",
-                            ancestor.display()
-                        ),
-                    ));
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // The leaf may not exist yet — keep walking up so a
-                // symlinked PARENT still gets caught. The actual
-                // open below will surface NotFound for the leaf.
-            }
-            Err(err) => return Err(err),
-        }
-        // Stop walking once we hit (and have inspected) the
-        // configured workspace root. Going further would inspect
-        // system directories that the caller has no jurisdiction
-        // over.
-        if ancestor == workspace_root {
-            break;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,7 +18,7 @@ Octos supports 17 LLM providers out of the box. Each provider needs an API key s
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI-compatible | -- |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | -- |
@@ -58,12 +58,11 @@ octos chat --provider deepseek --model deepseek-chat
 octos chat --model gpt-4o
 
 # Custom endpoint — name the real vendor, pick the wire protocol explicitly
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --api-type openai \
+  --base-url https://api.z.ai/api/paas/v4 --model glm-5.2
 
 # Full autonomy (bypass approvals + sandbox) alongside model selection
-octos chat --yolo --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --yolo --provider zai --model glm-5.2
 ```
 
 | Flag | Meaning |
@@ -77,6 +76,30 @@ octos chat --yolo --provider zai --api-type anthropic \
 CLI flags override config, which overrides the built-in default. The **API key is not a CLI flag** — it comes from the auth store, config, or an environment variable (see [Providing the API Key](#providing-the-api-key)).
 
 ### Auth Store
+
+Native deep research uses the Rust `search` app skill (including OctoScript
+metasearch engines) and `deep_crawl` for rendered site crawling. Deploy the
+`deep-search` and `deep_crawl` executables beside `octos` so startup can install
+these bundled tools. It does not require a DOT graph or `run_pipeline`.
+The host injects the saved `strong` lane into native research's synthesis;
+without that lane it uses the chat provider. Search engines and crawling do
+not need a separate LLM lane. `run_pipeline` and DOT execution are removed
+from the CLI/server runtime, including child agents. Existing graph files on
+disk are not loaded or executed.
+
+Native research synthesis can use the named `strong` entry in `sub_providers`. In the server and gateway, leave a research lane's `api_key_env`,
+`base_url`, and `api_type` unset to reuse the matching provider in the profile's
+chat configuration (primary or fallback). An exact model match takes precedence
+when multiple saved routes use the same provider. Explicit lane overrides still
+win; a different endpoint does not inherit a saved route's custom credential.
+An unmatched provider uses its own defaults, never another provider's key.
+
+The credentials remain in the shared profile environment/auth store. Updating
+the saved provider credential therefore applies to both chat and research when
+the profile runtime reloads. Separate model lanes retain independent runtime
+state; sharing a credential does not switch the active chat model. A rejected
+credential still needs replacement: HTTP 401 is an authentication failure, not
+a missing research tool or a reason to repeatedly retry the same key.
 
 Instead of environment variables, you can store API keys through the auth CLI:
 
@@ -111,8 +134,7 @@ There is **no `--api-key` flag** — the key is resolved, in order:
 ```bash
 # Quickest — export the provider's env var, then run
 export ZAI_API_KEY=<your-key>
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --model glm-5.2
 
 # Or log in once (no env var afterward)
 octos auth login --provider zai      # prompts: "Paste your API key:"
@@ -126,8 +148,8 @@ Or bake it into `config.json` so nothing is needed at runtime:
 {
   "provider": "zai",
   "model": "glm-5.2",
-  "base_url": "https://api.z.ai/api/anthropic",
-  "api_type": "anthropic",
+  "base_url": "https://api.z.ai/api/paas/v4",
+  "api_type": "openai",
   "env_vars": { "ZAI_API_KEY": "<your-key>" }
 }
 ```
@@ -206,8 +228,8 @@ octos chat --provider zai --api-type anthropic \
   --base-url https://api.z.ai/api/anthropic --model glm-5.2
 ```
 
-- `"openai"` -- OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies, e.g. z.ai/GLM)
+- `"openai"` -- OpenAI Chat Completions format (default for most providers, including `zai` / `zai-coding`)
+- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies). A `zai` / `zai-coding` route with `api_type: "anthropic"` and no `base_url` targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`); that root reports no prompt-cache hits, so the default OpenAI-compatible lane is cheaper for long sessions
 - `"responses"` -- OpenAI Responses API format
 
 ## Fallback Chains
@@ -250,7 +272,7 @@ When multiple fallback models are configured, adaptive routing dynamically selec
   "adaptive_routing": {
     "mode": "hedge",
     "qos_ranking": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -294,7 +316,7 @@ Each provider is scored on 4 factors (lower score = better). All weights are con
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `latency_threshold_ms` | 30000 | Providers with average latency above this are penalized |
+| `latency_threshold_ms` | 10000 | Providers with average latency above this are penalized |
 | `error_rate_threshold` | 0.3 | Providers with error rates above 30% are deprioritized |
 | `probe_probability` | 0.1 | Fraction of requests sent to non-primary providers as health probes |
 | `probe_interval_secs` | 60 | Minimum seconds between probes to the same provider |

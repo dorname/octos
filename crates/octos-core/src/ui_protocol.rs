@@ -106,7 +106,7 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
 
-/// Feature flag for UPCR-2026-022 per-session sandbox narrowing requests.
+/// Feature flag for UPCR-2026-043 per-session sandbox narrowing requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1: &str = "session.sandbox.v1";
 
 /// Feature flag for harness task registry/control commands.
@@ -221,6 +221,17 @@ pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1
 /// those additive fields as opaque/absent.
 pub const UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1: &str = "context.semantic_cache.v1";
 
+/// Live context fullness during a turn. When negotiated (alongside the
+/// parent context lifecycle capability) the server pushes
+/// `context/state_reported` with a fresh [`UiContextState`] as the agent
+/// loop's prompt grows between compactions, so a client's context gauge
+/// tracks the real estimate instead of the value from session open or the
+/// last compaction. Field report 21 Sep 2026: a 300-iteration single turn
+/// showed `ctx 0K/1M` the whole way because nothing carried the estimate to
+/// the client mid-turn. Strictly opt-in: older clients cannot decode the
+/// notification kind.
+pub const UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1: &str = "context.state.v1";
+
 /// #965 / UPCR-2026-019 — spec-canonical feature name for the
 /// supervised-task inspection surface (`task/list`, `task/updated`,
 /// `task/output/read`, `agent/list`, `agent/status/read`, `agent/output/read`,
@@ -317,6 +328,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
@@ -325,6 +337,44 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+];
+
+/// The features an `octos serve --stdio` connection has without negotiating.
+///
+/// A host that moves a native client from the stdio pipe to the WebSocket of
+/// `octos serve --host-managed` sends exactly these in `X-Octos-Ui-Features`
+/// to keep that client's contract. `voice.asr_admission.v1`,
+/// `skill.actions.v1` and `skill.action_jobs.v1` are server-local AppUI
+/// features without an entry in [`UI_PROTOCOL_KNOWN_FEATURES`]. octos-cli
+/// tests that this list and its stdio defaults stay equal.
+pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
+    "voice.asr_admission.v1",
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    "skill.actions.v1",
+    "skill.action_jobs.v1",
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -410,6 +460,9 @@ pub mod approval_kinds {
     pub const FILESYSTEM: &str = "filesystem";
     pub const NETWORK: &str = "network";
     pub const SANDBOX_ESCALATION: &str = "sandbox_escalation";
+    /// UPCR-2026-035: a host-routed app tool's call. The host renders the
+    /// sheet from `typed_details.host_tool`.
+    pub const HOST_TOOL: &str = "host_tool";
 }
 
 pub mod approval_scopes {
@@ -502,7 +555,7 @@ pub mod rpc_error_codes {
     /// Server-defined slot for a known method this runtime slice doesn't implement.
     pub const METHOD_NOT_SUPPORTED: i64 = -32004;
 
-    /// Spec §10 `APPROVAL_NOT_PENDING`: `respond` against a non-pending approval.
+    /// Spec §10 `approval_not_pending`: `respond` against a non-pending approval.
     /// Spec pins this at `-32011`; recorded decision rides in `error.data`.
     pub const APPROVAL_NOT_PENDING: i64 = -32011;
 
@@ -595,6 +648,9 @@ pub mod autonomy_error_kinds {
     pub const MONITOR_INVALID_SPEC: &str = "monitor_invalid_spec";
     pub const MONITOR_POLICY_DENIED: &str = "monitor_policy_denied";
     pub const MONITOR_FLOODED: &str = "monitor_flooded";
+    // #2367 — a control request against a terminal monitor state (resume
+    // of a monitor whose deadline has passed), mirroring `goal_invalid_state`.
+    pub const MONITOR_INVALID_STATE: &str = "monitor_invalid_state";
     pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
@@ -887,7 +943,7 @@ impl RpcError {
         Self::new(rpc_error_codes::PERMISSION_DENIED, message)
     }
 
-    /// Spec §10 `APPROVAL_NOT_PENDING` (`-32011`). Carries the recorded
+    /// Spec §10 `approval_not_pending` (`-32011`). Carries the recorded
     /// decision in `data.recorded_decision` (snake-case form).
     pub fn approval_not_pending(decision: ApprovalDecision) -> Self {
         let recorded =
@@ -1024,6 +1080,11 @@ where
 }
 
 pub mod methods {
+    // Raw AppUI workspace-team methods; advertised through APPUI_EXTRA_METHODS.
+    pub const SERVER_INSTANCE_GET: &str = "server/instance.get";
+    pub const PEER_TEAM_LIST: &str = "peer/team/list";
+    pub const PEER_TEAM_LEADER_SET: &str = "peer/team/leader/set";
+    pub const PEER_TEAM_MESSAGE: &str = "peer/team/message";
     pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
     pub const SESSION_STATUS_READ: &str = "session/status/read";
     pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
@@ -1182,7 +1243,7 @@ pub mod methods {
     /// playing — it must NOT navigate before the reply audio drains. Ungated;
     /// emitted on the same ledger-backed live path as `file/attached`.
     pub const VOICE_EXIT: &str = "voice/exit";
-    /// UPCR-2026-027 `skill/action/job/updated` — latest persisted snapshot
+    /// UPCR-2026-045 `skill/action/job/updated` — latest persisted snapshot
     /// for a manifest-declared background skill action job.
     pub const SKILL_ACTION_JOB_UPDATED: &str = "skill/action/job/updated";
     /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
@@ -1299,7 +1360,6 @@ pub mod methods {
     /// UPCR-2026-021 M15 loop runtime notifications.
     pub const LOOP_UPDATED: &str = "loop/updated";
     pub const LOOP_FIRED: &str = "loop/fired";
-    pub const LOOP_COMPLETED: &str = "loop/completed";
     /// #1977 monitor runtime notifications, mirroring `loop/*`.
     pub const MONITOR_FIRED: &str = "monitor/fired";
     pub const MONITOR_UPDATED: &str = "monitor/updated";
@@ -1309,6 +1369,8 @@ pub mod methods {
     pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+    /// Live context fullness mid-turn (`context.state.v1`).
+    pub const CONTEXT_STATE_REPORTED: &str = "context/state_reported";
     /// Session-level whole-job orchestration status notification.
     pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
     /// #2019 `background/activity` — the HUMAN sink over background events
@@ -1330,6 +1392,21 @@ pub mod methods {
     /// [`PEER_STAGED`]: `session_id` is the ORIGINATING session; durable so
     /// reconnect replay redelivers it, and clients dedup by the closed peer.
     pub const PEER_CLOSED: &str = "peer/closed";
+    /// UPCR-2026-035 `peer/tool/call` — the kernel asks the HOST to run one
+    /// app tool of a host-owned app peer. Sent only to the connection that
+    /// registered the peer's tools with `peer/tools/register`; the host
+    /// answers with `peer/tool/result`. Ephemeral: a host that is gone makes
+    /// the call fail (`host_unavailable`), it is never replayed.
+    pub const PEER_TOOL_CALL: &str = "peer/tool/call";
+    /// UPCR-2026-035 `peer/tool/cancel` — the kernel stopped waiting for a
+    /// `peer/tool/call` (`reason`: `timeout` or `cancelled`).
+    pub const PEER_TOOL_CANCEL: &str = "peer/tool/cancel";
+    /// UPCR-2026-035 `peer/input` — the system agent's `peer_send_input` to a
+    /// host-owned app peer, delivered to the peer's host connection instead
+    /// of running as a kernel-internal turn. The host starts the peer's turn
+    /// itself (`turn/start` on the given `session_id`, ideally with the given
+    /// `turn_id`). Ephemeral: with no host connected the send fails.
+    pub const PEER_INPUT: &str = "peer/input";
 
     // ---- Smart-home bridge integration ----
     // Device control/state moved server-side from octos-web's client-only
@@ -1440,6 +1517,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_STARTED,
     methods::TURN_COMPLETED,
     methods::TURN_ERROR,
+    methods::TURN_STEER_DROPPED,
     methods::MESSAGE_DELTA,
     methods::MESSAGE_REASONING_DELTA,
     methods::TOOL_STARTED,
@@ -1476,16 +1554,20 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::SESSION_GOAL_CLEARED,
     methods::LOOP_UPDATED,
     methods::LOOP_FIRED,
-    methods::LOOP_COMPLETED,
     methods::MONITOR_FIRED,
     methods::MONITOR_UPDATED,
     methods::MONITOR_EXPIRED,
     methods::CONTEXT_COMPACTION_COMPLETED,
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
+    methods::CONTEXT_STATE_REPORTED,
+    methods::SESSION_ORCHESTRATION,
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
     methods::BACKGROUND_ACTIVITY,
+    methods::PEER_TOOL_CALL,
+    methods::PEER_TOOL_CANCEL,
+    methods::PEER_INPUT,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -1641,6 +1723,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
@@ -1666,7 +1749,10 @@ impl UiProtocolCapabilities {
                 .iter()
                 .copied()
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
+                // `context.state.v1` adds a notification kind legacy clients
+                // cannot decode, so it is never claimed without a request.
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -2003,6 +2089,21 @@ pub struct SessionOpenParams {
     pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+    /// Slash commands this client handles itself (UPCR-2026-037). The server
+    /// lists them in the session's system prompt so the agent can point the
+    /// user to them.
+    ///
+    /// The declaration is per-open, not sticky: every `session/open` replaces
+    /// the session's previous one, so omitting the field declares none, and
+    /// the server releases it when the declaring connection closes.
+    ///
+    /// Names are filtered server-side (leading `/` optional): only ASCII
+    /// alphanumerics, `-` and `_`, at most 32 characters, deduplicated, first
+    /// 64 valid names kept. Commands that act on gateway server state
+    /// (`/adaptive`, `/router`, `/queue`, `/reset`) are dropped. The names
+    /// that survive come back in `SessionOpened::accepted_client_commands`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_commands: Option<Vec<String>>,
 }
 
 /// Optional session-scoped sandbox narrowing requested by `session/open`.
@@ -2074,6 +2175,50 @@ pub struct TurnStartParams {
     /// types. Defaults false; omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_video: bool,
+    /// Who is speaking in this turn of a host-owned app peer's shared
+    /// conversation (`<originator base>#peer-<slug>`), or of a request
+    /// context opened with `share_history` (the person's lane, where
+    /// `person` is the default). Only the peer's host connection may set
+    /// it, and never to `system_agent`: the kernel labels a turn started for
+    /// its own `peer/input` itself. The kernel records it in the transcript
+    /// as a stable prefix of the prompt (`[from the person] …`). Refused on
+    /// every other session. Omitted on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TurnOrigin>,
+}
+
+/// Who speaks in one turn of a host-owned app peer's shared conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnOrigin {
+    pub kind: TurnOriginKind,
+    /// Optional display label, e.g. the person's name or the app card. One
+    /// line, at most 64 bytes; the kernel strips brackets and control
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The speaker of a host-owned app peer's turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOriginKind {
+    /// The person, chatting through the host (the app's UI or its cards).
+    Person,
+    /// The owning system agent (`peer_send_input` → `peer/input`).
+    SystemAgent,
+    /// The app itself (e.g. a background run the host starts).
+    App,
+}
+
+impl TurnOriginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::SystemAgent => "system_agent",
+            Self::App => "app",
+        }
+    }
 }
 
 /// Reasoning/thinking effort level carried on the wire (octos-core cannot depend
@@ -2897,6 +3042,33 @@ pub struct HydratedMessage {
     /// running older protocol versions see the same shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
+    /// UPCR-2026-039: on a tool-result row (`role: "tool"`), the id of the
+    /// assistant tool call it answers, as stored with the row. Absent on
+    /// other rows. Ungated and additive, like `media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// UPCR-2026-039: on a tool-result row, the name of the tool its call
+    /// ran (the `tool_name` of `tool/started`). The stored row has only the
+    /// call id; the name comes from the nearest earlier row whose
+    /// `tool_calls` hold that id (the assistant row that made the call),
+    /// looked up in the whole transcript, not only the rows after `after`.
+    /// Absent when the transcript no longer holds that call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// UPCR-2026-039: on an assistant row that called tools, each call's id
+    /// and tool name, in call order. Arguments are not included. Omitted
+    /// when the row made no tool call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<HydratedToolCall>,
+}
+
+/// One tool call made by an assistant row, in `HydratedMessage.tool_calls`
+/// (UPCR-2026-039). A tool-result row answering it carries the same
+/// `tool_call_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
 }
 
 /// Lifecycle state strings for a thread in `ThreadGraphEntry.status` and the
@@ -3176,6 +3348,15 @@ pub struct SessionListParams {
     /// per-profile/global listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Optional profile whose per-project store to list. Only meaningful
+    /// together with `cwd`: the listing reads `<cwd>/.octos/<profile_id>`.
+    /// A connection authenticated as a user is frozen to its own profile
+    /// and may only restate it; an admin/token connection (no connection
+    /// profile) uses it to name the profile it opens sessions under, the
+    /// same way `session/open` accepts `profile_id`. Absent → the
+    /// connection's profile, then the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
@@ -3184,6 +3365,18 @@ pub struct SessionListParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionListResult {
     pub sessions: Value,
+    /// Present only when the server actually scoped the listing to a
+    /// project store: the canonical workspace root whose
+    /// `<root>/.octos/<profile_id>` it read. A `{cwd}` request to a server
+    /// with `appui.sessions_in_cwd` off (or one that predates it) gets the
+    /// legacy global listing with this absent, so a client must not place
+    /// rows under a workspace unless this attests the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    /// The profile whose project store was read. Present exactly when
+    /// `workspace_root` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 // ----- Smart-home bridge integration -----
@@ -3810,7 +4003,8 @@ pub struct TurnSpawnCompleteEvent {
 
 // ----- UPCR-2026-014 M9-γ projection envelope -----
 
-/// Token usage carried on `turn_completed` projection envelopes.
+/// Token usage carried on canonical v2 `turn_terminal` projection envelopes
+/// and historical v1 `turn_completed` envelopes.
 ///
 /// Mirrors [`crate::TokenUsage`] but is wire-stable for the M9-γ
 /// projection: all fields default to zero, and the field set is frozen
@@ -3842,8 +4036,8 @@ fn is_zero_u64(value: &u64) -> bool {
 /// wall-clock commit timestamp clients use for ordering displays.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// Server-assigned UUID of the durable row (mirrors
-    /// `MessageMeta.message_id`). Stable across replays.
+    /// Opaque server-assigned identity of the durable row (mirrors
+    /// `MessageMeta.message_id`). Stable across replays; not necessarily a UUID.
     pub message_id: String,
     /// RFC 3339 wall-clock time the row committed.
     pub persisted_at: DateTime<Utc>,
@@ -4540,6 +4734,16 @@ pub struct SessionOpened {
     /// field, and older serialized payloads decode it as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// The `SessionOpenParams::client_commands` names the server accepted for
+    /// this open (UPCR-2026-038), each as `/name`, in declaration order. A
+    /// client learns what was dropped by comparing against what it declared.
+    ///
+    /// `Some(vec![])` means every declared name was dropped. `None` (omitted
+    /// on the wire) means this open declared none, which leaves the session
+    /// with no client commands. Additive + backward-compatible: older clients
+    /// ignore the field, and older serialized payloads decode it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_client_commands: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5380,6 +5584,40 @@ pub struct ApprovalSandboxEscalationDetails {
     pub suggested_prefix_rule: Vec<String>,
 }
 
+/// UPCR-2026-035: what a host-routed app tool's approval is about, for the
+/// host to render its own approval sheet: the app that owns the tool, the
+/// tool, the exact arguments, and who is calling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalHostToolDetails {
+    /// The app that owns the tool (the declaration's `app`).
+    pub app: String,
+    /// The declared tool name (`<app>.<tool>`).
+    pub tool: String,
+    /// The exact arguments the call will run with.
+    pub args: serde_json::Value,
+    /// `read` | `act` | `destructive`.
+    pub risk: String,
+    #[serde(default)]
+    pub outward: bool,
+    /// `app_peer` (an app peer's session makes the call) or `system` (a
+    /// host session that is not a peer, e.g. the system agent's).
+    #[serde(default)]
+    pub calling_kind: String,
+    /// The calling app peer's slug (the peer whose session makes the call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calling_peer: Option<String>,
+    /// The calling session.
+    pub calling_session_id: String,
+    /// The calling request context, when the call comes from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The same call ran before and its outcome is unknown.
+    #[serde(default)]
+    pub outcome_unknown_before: bool,
+}
+
 /// UPCR-2026-001 typed approval payload. `kind` is intentionally a string
 /// registry so unknown future values can fall back to generic approval text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5397,6 +5635,9 @@ pub struct ApprovalTypedDetails {
     pub network: Option<ApprovalNetworkDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_escalation: Option<ApprovalSandboxEscalationDetails>,
+    /// UPCR-2026-035 `kind: "host_tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_tool: Option<ApprovalHostToolDetails>,
 }
 
 impl ApprovalTypedDetails {
@@ -5412,6 +5653,21 @@ impl ApprovalTypedDetails {
             filesystem: None,
             network: None,
             sandbox_escalation: None,
+            host_tool: None,
+        }
+    }
+
+    /// A host-routed app tool's approval (UPCR-2026-035).
+    pub fn host_tool(details: ApprovalHostToolDetails) -> Self {
+        Self {
+            kind: approval_kinds::HOST_TOOL.to_owned(),
+            command: None,
+            sandbox: None,
+            diff: None,
+            filesystem: None,
+            network: None,
+            sandbox_escalation: None,
+            host_tool: Some(details),
         }
     }
 }
@@ -6014,24 +6270,6 @@ pub struct LoopFiredEvent {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LoopCompletedEvent {
-    pub session_id: SessionKey,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    pub loop_id: String,
-    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
-    pub loop_state: Option<UiLoopRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// #1977 — one monitor's client-visible state, mirroring [`UiLoopRecord`].
 /// `argv` is the sandboxed probe command; `mode` is `"poll"` or `"stream"`;
 /// `status` is `active` / `paused` / `expired` / `deleted` with an optional
@@ -6103,7 +6341,7 @@ pub struct MonitorFiredEvent {
 }
 
 /// #1977 — a non-persistent monitor reached its timeout (or its stream
-/// process exited) and expired, mirroring [`LoopCompletedEvent`].
+/// process exited) and expired.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorExpiredEvent {
     pub session_id: SessionKey,
@@ -6221,6 +6459,32 @@ pub struct ContextNormalizationReportedEvent {
     pub normalization: UiContextNormalizationReport,
 }
 
+/// `context/state_reported` (`context.state.v1`): the live context state of
+/// a session while a turn is running, pushed as the prompt grows between
+/// compactions. Carries no compaction record; it exists so a client gauge
+/// can show the current `token_estimate` against `threshold_tokens` without
+/// waiting for the next compaction or a session re-hydrate. Emitted at most
+/// once per agent-loop iteration and only when the estimate moved enough to
+/// matter, so it never becomes a per-token stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStateReportedEvent {
+    pub session_id: SessionKey,
+    /// The session's context state with `token_estimate` set to the size
+    /// of the prompt projection the model is about to receive (capped tool
+    /// outputs included as the model sees them), which is what a fullness
+    /// gauge should show; the compaction events carry the transcript
+    /// estimate instead.
+    pub context_state: UiContextState,
+    /// The token threshold at which the server will compact this session's
+    /// context (context-window derived); lets a client render an honest
+    /// fullness fraction with the same denominator the server uses.
+    pub threshold_tokens: usize,
+    /// Agent-loop iteration within the current turn that produced this
+    /// estimate (0 = turn start).
+    #[serde(default)]
+    pub iteration: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WarningEvent {
     pub session_id: SessionKey,
@@ -6250,6 +6514,12 @@ pub struct TurnCompletedEvent {
     /// `session_result` frame's role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_result: Option<TurnSessionResult>,
+    /// Exact usage of this completed turn as the provider reported it,
+    /// keeping reasoning, cache-read and cache-write tokens distinct. Absent
+    /// when the producer has no typed total (legacy rows, non-LLM paths);
+    /// consumers then fall back to `tokens_in` / `tokens_out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<EnvelopeTokenUsage>,
 }
 
 /// UPCR-2026-014 (M9-α-9) `turn/completed.session_result` payload.
@@ -6442,7 +6712,7 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
-/// UPCR-2026-027 — latest background skill action job snapshot.
+/// UPCR-2026-045 — latest background skill action job snapshot.
 ///
 /// `job` is intentionally a generic JSON object at the core protocol layer so
 /// octos-core does not depend on a specific host-side job store type.
@@ -6579,7 +6849,7 @@ pub enum UiNotification {
     /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
     /// goodbye / mute intent; the client returns home after the farewell audio.
     VoiceExit(VoiceExitEvent),
-    /// UPCR-2026-027: latest background skill action job snapshot.
+    /// UPCR-2026-045: latest background skill action job snapshot.
     SkillActionJobUpdated(SkillActionJobUpdatedEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
@@ -6640,8 +6910,6 @@ pub enum UiNotification {
     LoopUpdated(LoopUpdatedEvent),
     /// UPCR-2026-021 M15: loop fired and queued/attempted a continuation.
     LoopFired(LoopFiredEvent),
-    /// UPCR-2026-021 M15: loop iteration reached a terminal result.
-    LoopCompleted(LoopCompletedEvent),
     /// #1977: monitor metadata changed (create / pause / resume / delete).
     MonitorUpdated(MonitorUpdatedEvent),
     /// #1977: a monitor's filtered event batch queued a master wake.
@@ -6653,6 +6921,8 @@ pub enum UiNotification {
     ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// `context.state.v1`: live context fullness mid-turn.
+    ContextStateReported(ContextStateReportedEvent),
     /// Session-level whole-job orchestration status. Emitted when the session's
     /// orchestration state changes (turn active / sub-agents running / master
     /// continuation pending), so a client can render a job indicator that stays
@@ -6730,13 +7000,13 @@ impl UiNotification {
             Self::SessionGoalCleared(_) => methods::SESSION_GOAL_CLEARED,
             Self::LoopUpdated(_) => methods::LOOP_UPDATED,
             Self::LoopFired(_) => methods::LOOP_FIRED,
-            Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::MonitorUpdated(_) => methods::MONITOR_UPDATED,
             Self::MonitorFired(_) => methods::MONITOR_FIRED,
             Self::MonitorExpired(_) => methods::MONITOR_EXPIRED,
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
             Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::ContextStateReported(_) => methods::CONTEXT_STATE_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
@@ -6787,13 +7057,13 @@ impl UiNotification {
             Self::SessionGoalCleared(event) => &event.session_id,
             Self::LoopUpdated(event) => &event.session_id,
             Self::LoopFired(event) => &event.session_id,
-            Self::LoopCompleted(event) => &event.session_id,
             Self::MonitorUpdated(event) => &event.session_id,
             Self::MonitorFired(event) => &event.session_id,
             Self::MonitorExpired(event) => &event.session_id,
             Self::ContextCompactionCompleted(event) => &event.session_id,
             Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::ContextStateReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
@@ -6951,13 +7221,13 @@ impl UiNotification {
             Self::SessionGoalCleared(params) => serde_json::to_value(params),
             Self::LoopUpdated(params) => serde_json::to_value(params),
             Self::LoopFired(params) => serde_json::to_value(params),
-            Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::MonitorUpdated(params) => serde_json::to_value(params),
             Self::MonitorFired(params) => serde_json::to_value(params),
             Self::MonitorExpired(params) => serde_json::to_value(params),
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
+            Self::ContextStateReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
             // #1801 v3: `topic` on the payload is the staged PEER's topic
             // (`peer-<slug>`), NOT this notification's routing topic — the
@@ -7096,7 +7366,6 @@ impl UiNotification {
             }
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
-            methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
             methods::MONITOR_UPDATED => Ok(Self::MonitorUpdated(decode_params(method, params)?)),
             methods::MONITOR_FIRED => Ok(Self::MonitorFired(decode_params(method, params)?)),
             methods::MONITOR_EXPIRED => Ok(Self::MonitorExpired(decode_params(method, params)?)),
@@ -7109,6 +7378,9 @@ impl UiNotification {
             methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
                 decode_params(method, params)?,
             )),
+            methods::CONTEXT_STATE_REPORTED => {
+                Ok(Self::ContextStateReported(decode_params(method, params)?))
+            }
             methods::SESSION_ORCHESTRATION => {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }

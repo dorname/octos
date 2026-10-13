@@ -63,6 +63,9 @@ pub struct PeerHandoffRequest {
     /// Optional TASK ID within the goal. When set, the peer's work is tracked
     /// as part of this specific task.
     pub task_id: Option<String>,
+    /// Optional cumulative token limit for this peer's turns. Omit when the
+    /// user did not specify a budget.
+    pub token_budget: Option<u64>,
 }
 
 /// Staged-peer facts the host callback returns on success.
@@ -84,6 +87,8 @@ pub struct PeerHandoffStaged {
     /// peer falls back to the primary model). `None` when no lane was
     /// requested or the requested lane resolved cleanly.
     pub model_note: Option<String>,
+    /// Cumulative peer token limit written at staging, if requested.
+    pub token_budget: Option<u64>,
 }
 
 /// Host staging callback. Synchronous by design: the tool needs the staged
@@ -118,6 +123,8 @@ struct Input {
     goal_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    token_budget: Option<u64>,
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -135,20 +142,13 @@ impl Tool for PeerHandoffTool {
     }
 
     fn description(&self) -> &str {
-        "Hand a SELF-CONTAINED piece of work to a sovereign peer session with its \
-         own durable brief, workspace, and lifecycle, and keep working yourself. \
-         Give the peer a short, unique NAME — it is the peer's primary address \
-         (\"let Edison do X\"); you reach it later by name with peer_send_input / \
-         peer_close / peer_gather. Use when the work outlives this turn, needs its \
-         own workspace or safety envelope, or the user may steer it separately. \
-         You will NOT receive the result in this turn — the peer reports to the \
-         user's session strip and the shared blackboard. Handing work off does NOT \
-         end your turn: delegating is what lets you make progress on your own \
-         remaining work in parallel, so continue it immediately unless the peer \
-         took over everything you had left. For work whose result THIS turn needs \
-         to continue reasoning, use spawn instead. The brief is a complete task \
-         contract: include all context the peer needs (it cannot see this \
-         conversation)."
+        "Hand self-contained work to a durable peer session with its own workspace and \
+         lifecycle; keep working yourself. Use for work that outlives this turn, needs \
+         separate permissions, or needs independent user steering. Give it a short unique \
+         name and a complete brief: it cannot see this conversation. Address it later with \
+         peer_send_input, peer_close or peer_gather. Results go to the session strip and \
+         blackboard, not this turn; use spawn if you need the result this turn. Handoff \
+         does NOT end your turn: continue remaining work unless the peer took over all of it."
     }
 
     fn tags(&self) -> &[&str] {
@@ -187,6 +187,11 @@ impl Tool for PeerHandoffTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model lane for this peer — the KEY of a sub_provider configured in your profile (e.g. \"cheap\", \"strong\"). Omit to use the profile's primary model."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional cumulative token budget for this peer. Set only when the user requested a token limit; the peer stops accepting new turns after the limit is reached."
                 }
             }
         })
@@ -227,6 +232,9 @@ impl Tool for PeerHandoffTool {
                  contract; keep the payload in the workspace and reference it by path."
             )));
         }
+        if input.token_budget == Some(0) {
+            return Ok(failure("token_budget must be a positive integer"));
+        }
         // Normalize the optional model lane: trim and drop an empty/whitespace
         // value to `None` so the host only ever sees a real lane key.
         let model = input
@@ -242,6 +250,7 @@ impl Tool for PeerHandoffTool {
             model,
             goal_id: input.goal_id,
             task_id: input.task_id,
+            token_budget: input.token_budget,
         };
         match (self.stage)(request) {
             Ok(staged) => {
@@ -266,6 +275,9 @@ impl Tool for PeerHandoffTool {
                 if let Some(note) = &staged.model_note {
                     output.push(' ');
                     output.push_str(note);
+                }
+                if let Some(limit) = staged.token_budget {
+                    output.push_str(&format!(" Peer token budget: {limit}."));
                 }
                 Ok(ToolResult {
                     output,
@@ -300,6 +312,7 @@ mod tests {
                     .unwrap_or(false)
                     .then(|| "peer/ci-fix".to_owned()),
                 model_note: None,
+                token_budget: request.token_budget,
             })
         }));
         (tool, seen)
@@ -444,6 +457,7 @@ mod tests {
                 "brief": "  Fix the flaky bus test; repro in crates/octos-bus.  ",
                 "name": "  CI Fix  ",
                 "worktree": true,
+                "token_budget": 12_345,
             }))
             .await
             .unwrap();
@@ -460,9 +474,11 @@ mod tests {
                 model: None,
                 goal_id: None,
                 task_id: None,
+                token_budget: Some(12_345),
             },
             "brief/name are trimmed, worktree passes through"
         );
+        assert!(result.output.contains("Peer token budget: 12345"));
 
         // The result addresses the peer by NAME and teaches the fire-and-forget
         // contract (the recorder maps it to slug `ci-fix`).
@@ -542,6 +558,7 @@ mod tests {
                 model: None,
                 goal_id: None,
                 task_id: None,
+                token_budget: None,
             }
         );
     }
@@ -605,6 +622,7 @@ mod tests {
                 cwd: "/work".to_owned(),
                 worktree_branch: None,
                 model_note: note,
+                token_budget: request.token_budget,
             })
         }));
 

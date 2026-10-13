@@ -321,7 +321,13 @@ pub async fn run_attempt(
     // `.git` write). A worktree worker under such a sandbox would fail its git
     // ops and lose the deliverable. Verify the RESOLVED sandbox actually supports
     // it (mirrors the PR 5a per-attempt network check) and fail closed otherwise.
-    let worktree_backend_ok = worktree.is_none() || sandbox.supports_repo_git_write();
+    // #2707 — the same verification must also cover the SHELL the flow feeds the
+    // worker: `worktree_populate_command` / `deliverable_commit_command` are
+    // POSIX sh strings `cmd /C` cannot run, so a full-FS backend wrapping the
+    // Windows shell would run the attempt and degrade it into empty-branch
+    // rejections far from the gate.
+    let worktree_backend_ok =
+        worktree.is_none() || (sandbox.supports_repo_git_write() && sandbox.runs_posix_sh());
 
     let computed = if sandbox.is_noop() {
         tracing::error!(
@@ -341,10 +347,12 @@ pub async fn run_attempt(
         tracing::error!(
             %fleet_id, %task_id, %attempt_id,
             "fleet worker: worktree attempt but the resolved sandbox no longer supports full-FS \
-             write (backend degraded since boot); terminating rather than losing the deliverable",
+             write or POSIX sh (backend degraded since boot); terminating rather than losing \
+             the deliverable",
         );
         Computed::terminated(
-            "worktree attempt: resolved sandbox no longer supports full-FS write".to_string(),
+            "worktree attempt: resolved sandbox no longer supports full-FS write or POSIX sh"
+                .to_string(),
         )
     } else if let Some(reason) = populate_worktree(worktree, &sandbox, working_dir, deadline).await
     {
@@ -1575,6 +1583,11 @@ mod tests {
             || NOW,
         )
         .await;
+        // Platform-true verdict pin: on Unix the CommandExit validator runs and
+        // must accept; on Windows a real sandbox fails command validators closed
+        // (#1607), so the same run must end Rejected. The factory-once pin below
+        // is platform-independent.
+        #[cfg(unix)]
         assert!(
             matches!(
                 outcome,
@@ -1583,6 +1596,16 @@ mod tests {
                 }
             ),
             "CommandExit `true` must be accepted, got {outcome:?}",
+        );
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Rejected { .. }
+                }
+            ),
+            "a real sandbox must fail the CommandExit validator closed on Windows (#1607), got {outcome:?}",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1736,6 +1759,10 @@ mod tests {
         assert_eq!(child.status, ChildStatus::Failed);
     }
 
+    // POSIX premise (`sleep` is a Unix command); a Windows real sandbox also
+    // fails command validators closed (#1607) — pinned in octos-agent's
+    // validator_runner tests.
+    #[cfg(unix)]
     #[tokio::test]
     async fn acceptance_command_terminates_past_deadline() {
         // P1-5b: a CommandExit validator that sleeps past the remaining

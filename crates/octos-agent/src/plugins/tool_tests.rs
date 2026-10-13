@@ -1734,6 +1734,59 @@ async fn execute_fallback_skips_missing_generated_pptx() {
     assert!(result.files_to_send.is_empty());
 }
 
+/// procps-ng `kill` reads `kill -9 -12345` as `kill(-1, SIGKILL)` (only the
+/// first digit of a bare negative pid survives), which kills every process
+/// the user owns — on CI that was the GitHub runner agent itself. The group
+/// must come after `--`.
+#[test]
+#[cfg(unix)]
+fn should_put_the_group_after_double_dash_when_building_group_kill_args() {
+    for pgid in [1_u32, 7, 12_345, 4_194_303] {
+        let args = sigkill_process_group_args(pgid);
+        assert_eq!(args, ["-9", "--", &format!("-{pgid}")], "pgid {pgid}");
+    }
+}
+
+/// Every group kill in this crate goes through `kill(1)` with the group after
+/// `--`. A bare `kill -9 -<pgid>` passes review and most local runs, then
+/// kills the whole user session when the pgid happens to start with `1`, so
+/// scan the source rather than trust each call site.
+#[test]
+#[cfg(unix)]
+fn should_pass_double_dash_when_any_kill_targets_a_negative_pid() {
+    fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                visit(&path, offenders);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                for (index, line) in text.lines().enumerate() {
+                    let negative_pid_arg = line.contains(".args([")
+                        && (line.contains("format!(\"-{") || line.contains("&group"));
+                    if negative_pid_arg && !line.contains("\"--\"") {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            index + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    visit(&src, &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "negative-pid kill without `--` (procps kill turns `-12345` into `-1`, killing \
+         every process the user owns):\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
 async fn execute_timeout_returns_error() {
@@ -4422,4 +4475,33 @@ fn plugin_accepts_input_path_inside_real_skill_dir_under_canonical_classify() {
         path_in.starts_with(&*canonical_skill_dir.to_string_lossy()),
         "accepted path must remain inside the canonical skill_dir: {path_in}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn strict_env_allowlist_rejects_octos_secret_extra_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        r#"#!/bin/sh
+read INPUT || true
+if [ -n "${OCTOS_AUTH_TOKEN:-}" ] || [ -n "${OCTOS_ADMIN_TOKEN:-}" ]; then
+  echo '{"output":"secret present","success":false}'
+else
+  echo '{"output":"secret absent","success":true}'
+fi
+"#,
+    );
+    let mut def = make_tool_def("strict_secret", "test env isolation");
+    def.env.push("OCTOS_PROFILE_ID".into());
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_extra_env(vec![
+            ("OCTOS_AUTH_TOKEN".into(), "fixture".into()),
+            ("OCTOS_ADMIN_TOKEN".into(), "fixture".into()),
+        ])
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let result = tool.execute(&json!({})).await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.output, "secret absent");
 }

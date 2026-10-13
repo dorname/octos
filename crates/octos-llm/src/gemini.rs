@@ -233,7 +233,11 @@ impl GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<GeminiRequest> {
-        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
+        let (contents, system_instruction) = build_gemini_contents_for_model(
+            messages,
+            &self.model,
+            config.media_scope_root.as_deref(),
+        );
         Ok(GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
@@ -519,6 +523,17 @@ enum GeminiPart {
 struct GeminiFunctionResponse {
     name: String,
     response: serde_json::Value,
+    /// Media the tool handed the model, as the v1beta multimodal function
+    /// response carries it: inline data parts on the response itself, so
+    /// the user content stays a pure functionResponse turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parts: Option<Vec<GeminiFunctionResponsePart>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiFunctionResponsePart {
+    #[serde(rename = "inlineData")]
+    inline_data: GeminiInlineData,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -587,19 +602,25 @@ fn build_gemini_generation_config(
 /// - Consecutive same-role messages are merged (Gemini rejects adjacent same-role turns)
 #[cfg(test)]
 fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<String>) {
-    build_gemini_contents_with_signature_fallback(messages, false)
+    build_gemini_contents_with_signature_fallback(messages, false, None)
 }
 
 fn build_gemini_contents_for_model(
     messages: &[Message],
     model: &str,
+    scope_root: Option<&std::path::Path>,
 ) -> (Vec<GeminiContent>, Option<String>) {
-    build_gemini_contents_with_signature_fallback(messages, model.starts_with("gemini-3"))
+    build_gemini_contents_with_signature_fallback(
+        messages,
+        model.starts_with("gemini-3"),
+        scope_root,
+    )
 }
 
 fn build_gemini_contents_with_signature_fallback(
     messages: &[Message],
     synthesize_missing_thought_signature: bool,
+    scope_root: Option<&std::path::Path>,
 ) -> (Vec<GeminiContent>, Option<String>) {
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut system_instruction: Option<String> = None;
@@ -627,7 +648,7 @@ fn build_gemini_contents_with_signature_fallback(
                 }
             },
             octos_core::MessageRole::User => {
-                let parts = build_user_parts(msg);
+                let parts = build_user_parts(msg, scope_root);
                 push_or_merge(&mut contents, "user", parts);
             }
             octos_core::MessageRole::Assistant => {
@@ -687,10 +708,39 @@ fn build_gemini_contents_with_signature_fallback(
                     .cloned()
                     .unwrap_or_else(|| "unknown".to_string());
 
+                let shown = crate::tool_media::for_tool_row(messages, message_index, false, false);
+                let mut content = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
+                let mut media_parts = Vec::new();
+                for path in shown.images.iter().chain(shown.videos.iter()) {
+                    let encoded = if vision::is_video(path) {
+                        vision::encode_video(path, scope_root)
+                    } else {
+                        vision::encode_image(path, scope_root)
+                    };
+                    match encoded {
+                        Ok((mime, data)) => media_parts.push(GeminiFunctionResponsePart {
+                            inline_data: GeminiInlineData {
+                                mime_type: mime,
+                                data,
+                            },
+                        }),
+                        Err(_) => {
+                            content = crate::tool_media::with_note(
+                                &content,
+                                Some(&crate::tool_media::unreadable_note(path)),
+                            )
+                        }
+                    }
+                }
                 let part = GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
                         name,
-                        response: serde_json::json!({ "content": msg.content }),
+                        response: serde_json::json!({ "content": content }),
+                        parts: if media_parts.is_empty() {
+                            None
+                        } else {
+                            Some(media_parts)
+                        },
                     },
                 };
                 push_or_merge(&mut contents, "user", vec![part]);
@@ -738,10 +788,13 @@ fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
     !((existing_has_func_response && new_has_text) || (existing_has_text && new_has_func_response))
 }
 
-fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
+fn build_user_parts(msg: &Message, scope_root: Option<&std::path::Path>) -> Vec<GeminiPart> {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+    // Gemini takes video the same way it takes images: inline data with
+    // the container's MIME type.
+    let videos: Vec<_> = msg.media.iter().filter(|p| vision::is_video(p)).collect();
 
-    if images.is_empty() {
+    if images.is_empty() && videos.is_empty() {
         return vec![GeminiPart::Text {
             text: msg.content.clone(),
             thought: None,
@@ -750,7 +803,17 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
+            parts.push(GeminiPart::InlineData {
+                inline_data: GeminiInlineData {
+                    mime_type: mime,
+                    data,
+                },
+            });
+        }
+    }
+    for path in videos {
+        if let Ok((mime, data)) = vision::encode_video(path, scope_root) {
             parts.push(GeminiPart::InlineData {
                 inline_data: GeminiInlineData {
                     mime_type: mime,
@@ -1679,7 +1742,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert_eq!(
@@ -1711,7 +1774,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert_eq!(serialized["parts"][0]["thoughtSignature"], "real-signature");
@@ -1753,7 +1816,7 @@ mod tests {
             tool_call("tc2", "current_call"),
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let old_step = serde_json::to_value(&contents[1]).expect("serialize old model step");
         let current_step =
             serde_json::to_value(&contents[4]).expect("serialize current model step");
@@ -1787,7 +1850,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-2.5-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-2.5-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert!(serialized["parts"][0].get("thoughtSignature").is_none());
@@ -1805,6 +1868,62 @@ mod tests {
         assert_eq!(contents[0].parts.len(), 2);
     }
 
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    #[test]
+    fn should_carry_tool_media_as_function_response_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let (contents, _) = build_gemini_contents(&msgs);
+        let v = serde_json::to_value(&contents).unwrap();
+        let roles: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "model", "user"],
+            "no extra user content: {v}"
+        );
+        let fr = &v[2]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "view_image");
+        assert_eq!(fr["parts"][0]["inlineData"]["mimeType"], "image/png");
+        assert!(fr["parts"][0]["inlineData"]["data"].as_str().unwrap().len() > 4);
+    }
+
     #[test]
     fn test_parts_compatible_blocks_mixed_types() {
         let text = vec![GeminiPart::Text {
@@ -1815,6 +1934,7 @@ mod tests {
             function_response: GeminiFunctionResponse {
                 name: "test".into(),
                 response: serde_json::json!({"content": "ok"}),
+                parts: None,
             },
         }];
         assert!(!parts_compatible(&text, &func_resp));

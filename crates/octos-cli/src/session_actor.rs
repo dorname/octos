@@ -538,7 +538,10 @@ fn reset_context_manager_from_history(
     data_dir: &Path,
     messages: &[Message],
 ) {
-    let rebuilt = context_manager_from_history(session_key, messages);
+    let mut rebuilt = context_manager_from_history(session_key, messages);
+    // The canonical rollback/reset already committed; this deliberately
+    // starts a new context lineage rather than overwriting from a stale clone.
+    rebuilt.mark_ledger_rebuilt();
     let state = rebuilt.state();
     let mut manager = context_manager.lock().unwrap_or_else(|e| e.into_inner());
     *manager = rebuilt;
@@ -679,6 +682,7 @@ impl SessionActorPromptContextBridge {
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
+            redact_memory_events: false,
         }
     }
 }
@@ -5033,6 +5037,7 @@ impl SessionActor {
                 self.agent.provider_name(),
                 self.agent.model_id()
             ),
+            redact_memory_events: false,
         }
     }
 
@@ -7600,6 +7605,22 @@ impl SessionActor {
     /// arrives, the new message gets a quick LLM response via the adaptive
     /// router (no tools, lightweight) while the original call continues.
     /// Both results are delivered to the user.
+    /// #2605 (UPCR-2026-035 "Durable host session tool list"): narrow the
+    /// actor's shared registry to the host's durable, exact kernel tool list
+    /// for this session, re-read at every turn start so a change applies from
+    /// the next turn. No list: the roster stays as the profile policy built
+    /// it; an unreadable list keeps no tools (fail closed). It never widens.
+    fn apply_host_session_tool_list(&self) {
+        let allowed = crate::peers::session_tool_list::read_session_tool_list(
+            &self.data_dir,
+            &self.session_key,
+        )
+        .allowed();
+        self.agent
+            .tool_registry()
+            .set_host_tool_allowlist(allowed.as_deref());
+    }
+
     async fn process_inbound_speculative(
         &mut self,
         inbound: InboundMessage,
@@ -7607,6 +7628,8 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // #2605: every turn follows the host's durable kernel tool list.
+        self.apply_host_session_tool_list();
         // Reset overflow cancellation from any prior command handling (#21).
         self.overflow_cancelled.store(false, Ordering::Release);
 
@@ -9450,6 +9473,8 @@ impl SessionActor {
         attachment_media: Vec<String>,
         attachment_prompt: Option<String>,
     ) {
+        // #2605: every turn follows the host's durable kernel tool list.
+        self.apply_host_session_tool_list();
         // Reset per-turn token accounting so a turn that fails / produces no
         // response charges 0 to the goal budget (set to the real usage below
         // once the LLM response is in hand).
